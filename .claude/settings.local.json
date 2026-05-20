@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir \"C:\\\\Users\\\\moham\\\\VS Code\\\\OSP Enrichement Tool\")",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\moham\\\\VS Code\\\\OSP Enrichement Tool\" -Recurse -File)",
+      "Bash(Select-Object FullName)",
+      "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\moham\\\\VS Code\\\\OSP Enrichement Tool\" -Recurse -File | Select-Object -First 50 | ForEach-Object { $_.FullName })",
+      "Bash(sqlite3 sdr.db \".tables\")",
+      "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\moham\\\\VS Code\\\\OSP Enrichement Tool\\\\logs\" -File | ForEach-Object { $_.FullName })",
+      "Bash(python -c ' *)",
+      "Bash(python -m pytest tests/test_enrichment.py::test_linkedin_post_coerces_list_payload_to_count -xvs)",
+      "Bash(python -m pytest tests/test_enrichment.py -x)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\moham\\\\VS Code\\\\OSP Enrichement Tool\" -Recurse -Filter \"*.py\")",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(Sort-Object)",
+      "Bash(findstr /i data)"
+    ]
+  }
+}

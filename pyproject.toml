@@ -1,0 +1,11 @@
+[project]
+name = "sdr-enablement"
+version = "0.1.0"
+description = "Outbound SDR enablement pipeline: enrich -> score -> generate -> deliver -> learn"
+requires-python = ">=3.11"
+readme = "README.md"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]

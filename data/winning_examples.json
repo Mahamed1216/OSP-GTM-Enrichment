@@ -1,0 +1,68 @@
+[
+  {
+    "id": "seed_001",
+    "lead_context": {
+      "title": "VP of Revenue Operations",
+      "industry": "B2B SaaS",
+      "signal": "Recent LinkedIn post about CRM data hygiene across 3 tools"
+    },
+    "subject": "About that CRM data hygiene post",
+    "body": "Sarah,\n\nSaw your post last week about the tax that fragmented CRM data is putting on your team — five hours a week per rep just reconciling fields between Salesforce, Outreach, and Gong.\n\nThat exact pain is what pulled three of your peers (Notion, Vanta, Linear) into a 30-min conversation with us last quarter. We don't replace any of those tools — we sit on top and cut the reconciliation time by ~80%.\n\nWorth 15 mins next week to see if the math checks out for your team?\n\n— [Sender]",
+    "reply_rate": 0.42,
+    "manually_flagged": true,
+    "notes": "Cited a specific LinkedIn post, named peers, ended with a low-friction ask",
+    "content_type": "email",
+    "source": "seed",
+    "score": 0.42,
+    "added_at": "2026-05-09T19:28:49Z",
+    "content": {
+      "subject": "About that CRM data hygiene post",
+      "body": "Sarah,\n\nSaw your post last week about the tax that fragmented CRM data is putting on your team — five hours a week per rep just reconciling fields between Salesforce, Outreach, and Gong.\n\nThat exact pain is what pulled three of your peers (Notion, Vanta, Linear) into a 30-min conversation with us last quarter. We don't replace any of those tools — we sit on top and cut the reconciliation time by ~80%.\n\nWorth 15 mins next week to see if the math checks out for your team?\n\n— [Sender]"
+    },
+    "is_active": true
+  },
+  {
+    "id": "seed_002",
+    "lead_context": {
+      "title": "Director of Sales",
+      "industry": "Data Analytics",
+      "signal": "Series B funding announced 2 weeks ago"
+    },
+    "subject": "Quick congrats + a question about scaling outbound",
+    "body": "Marcus,\n\nCongrats on the Series B — saw the announcement land. The hiring plan you mentioned in the Forbes piece (doubling AE headcount by Q3) is the part that caught my eye.\n\nThe pattern we see at that stage: ramp time stretches from 60 to 120 days because new reps inherit a messy, unprioritized lead list. We solve specifically for that.\n\nOpen to a 15-min call next week to compare notes? Worst case you walk away with a benchmark.\n\n— [Sender]",
+    "reply_rate": 0.38,
+    "manually_flagged": true,
+    "notes": "Tied to a public funding signal, named a specific operational pain at that stage",
+    "content_type": "email",
+    "source": "seed",
+    "score": 0.38,
+    "added_at": "2026-05-09T19:28:49Z",
+    "content": {
+      "subject": "Quick congrats + a question about scaling outbound",
+      "body": "Marcus,\n\nCongrats on the Series B — saw the announcement land. The hiring plan you mentioned in the Forbes piece (doubling AE headcount by Q3) is the part that caught my eye.\n\nThe pattern we see at that stage: ramp time stretches from 60 to 120 days because new reps inherit a messy, unprioritized lead list. We solve specifically for that.\n\nOpen to a 15-min call next week to compare notes? Worst case you walk away with a benchmark.\n\n— [Sender]"
+    },
+    "is_active": true
+  },
+  {
+    "id": "seed_003",
+    "lead_context": {
+      "title": "Head of Growth",
+      "industry": "Cloud Infrastructure",
+      "signal": "Company recently hired a new CFO from a public company"
+    },
+    "subject": "On the new CFO hire — outbound efficiency angle",
+    "body": "Priya,\n\nNoticed your company just brought on a new CFO from a public-market background. In our experience, the first 90 days under a CFO like that at growth-stage companies usually means one thing for sales: tighter pipeline-to-CAC scrutiny.\n\nWe help growth teams get ahead of that conversation by surfacing which outbound segments are actually paying back and which are bleeding cash. Three of your direct competitors run on this stack already.\n\nWorth 15 mins to walk through what their dashboards look like?\n\n— [Sender]",
+    "reply_rate": 0.35,
+    "manually_flagged": true,
+    "notes": "Hooked into a hire signal, framed value in CFO-conscious language",
+    "content_type": "email",
+    "source": "seed",
+    "score": 0.35,
+    "added_at": "2026-05-09T19:28:49Z",
+    "content": {
+      "subject": "On the new CFO hire — outbound efficiency angle",
+      "body": "Priya,\n\nNoticed your company just brought on a new CFO from a public-market background. In our experience, the first 90 days under a CFO like that at growth-stage companies usually means one thing for sales: tighter pipeline-to-CAC scrutiny.\n\nWe help growth teams get ahead of that conversation by surfacing which outbound segments are actually paying back and which are bleeding cash. Three of your direct competitors run on this stack already.\n\nWorth 15 mins to walk through what their dashboards look like?\n\n— [Sender]"
+    },
+    "is_active": true
+  }
+]

@@ -1,0 +1,9 @@
+first_name,last_name,email,title,company,company_domain,linkedin_url,company_linkedin_url,industry
+Sarah,Chen,sarah.chen@northstarlabs.io,VP of Revenue Operations,Northstar Labs,northstarlabs.io,https://www.linkedin.com/in/sarah-chen-revops,https://www.linkedin.com/company/northstar-labs,B2B SaaS
+Marcus,Rivera,m.rivera@helixanalytics.com,Director of Sales,Helix Analytics,helixanalytics.com,https://www.linkedin.com/in/marcus-rivera-sales,https://www.linkedin.com/company/helix-analytics,Data Analytics
+Priya,Patel,priya@bridgepointcloud.com,Head of Growth,Bridgepoint Cloud,bridgepointcloud.com,https://www.linkedin.com/in/priya-patel-growth,https://www.linkedin.com/company/bridgepoint-cloud,Cloud Infrastructure
+James,Okafor,james.okafor@vellumhealth.com,Chief Revenue Officer,Vellum Health,vellumhealth.com,https://www.linkedin.com/in/james-okafor-cro,https://www.linkedin.com/company/vellum-health,Healthtech
+Emma,Lindqvist,emma.lindqvist@cobaltforge.io,Sr. Manager Sales Enablement,Cobalt Forge,cobaltforge.io,https://www.linkedin.com/in/emma-lindqvist,https://www.linkedin.com/company/cobalt-forge,DevTools
+David,Nakamura,d.nakamura@pivotalmind.ai,VP of Sales,Pivotal Mind AI,pivotalmind.ai,https://www.linkedin.com/in/david-nakamura,https://www.linkedin.com/company/pivotal-mind-ai,AI/ML Platform
+Olivia,Brennan,olivia@strataledger.com,Head of Sales Development,Strata Ledger,strataledger.com,https://www.linkedin.com/in/olivia-brennan,https://www.linkedin.com/company/strata-ledger,Fintech
+Tomas,Garcia,tomas.garcia@quantarispace.com,Director Revenue Operations,Quantaris,quantarispace.com,https://www.linkedin.com/in/tomas-garcia-revops,https://www.linkedin.com/company/quantaris,Logistics SaaS
