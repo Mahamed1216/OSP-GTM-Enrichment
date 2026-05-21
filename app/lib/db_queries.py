@@ -71,15 +71,158 @@ def kpi_counts() -> dict[str, int]:
 
 
 def tier_distribution() -> dict[str, int]:
+    """Counts per tier including unscored.
+
+    Returns A/B/C/D plus an "—" bucket for leads that have no Score row yet.
+    Keyed with the dash so consumers can iterate in order and render the
+    "no-tier" group as a neutral track.
+    """
     with session_scope() as session:
         rows = session.execute(
             select(Score.tier, func.count(Score.id)).group_by(Score.tier)
         ).all()
-    out = {"A": 0, "B": 0, "C": 0}
+        leads_total = session.execute(select(func.count(Lead.id))).scalar() or 0
+    out: dict[str, int] = {"A": 0, "B": 0, "C": 0, "D": 0}
     for tier, count in rows:
-        if tier in out:
-            out[tier] = int(count)
+        if tier and tier.upper() in out:
+            out[tier.upper()] = int(count)
+    scored_total = sum(out.values())
+    out["—"] = max(0, int(leads_total) - scored_total)
     return out
+
+
+def recent_activity(limit: int = 8) -> list[dict[str, Any]]:
+    """Most-recent events across enrich/gen/send/reply/rate, newest first.
+
+    Pulls up to `limit` events from each source then merges + truncates so a
+    burst of one event type can't crowd out the rest. Each entry is a plain
+    dict: {kind, text, when}.
+    """
+    from src.models import ContentRating
+
+    events: list[dict[str, Any]] = []
+
+    with session_scope() as session:
+        enrichments = session.execute(
+            select(
+                Enrichment.enriched_at,
+                Lead.first_name,
+                Lead.last_name,
+                Lead.company,
+            )
+            .join(Lead, Lead.id == Enrichment.lead_id)
+            .order_by(Enrichment.enriched_at.desc())
+            .limit(limit)
+        ).all()
+        for r in enrichments:
+            name = f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip() or "(no name)"
+            company = (r.company or "").strip()
+            text = f"Enriched {name}" + (f" at {company}" if company else "")
+            events.append({"kind": "enrich", "text": text, "when": r.enriched_at})
+
+        gens = session.execute(
+            select(
+                GeneratedContent.created_at,
+                GeneratedContent.kind,
+                Lead.first_name,
+                Lead.last_name,
+            )
+            .join(Lead, Lead.id == GeneratedContent.lead_id)
+            .where(GeneratedContent.superseded_by_id.is_(None))
+            .order_by(GeneratedContent.created_at.desc())
+            .limit(limit)
+        ).all()
+        kind_label = {"email": "email", "call_script": "call script", "linkedin_msg": "LinkedIn DM"}
+        for r in gens:
+            name = f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip() or "(no name)"
+            events.append({
+                "kind": "gen",
+                "text": f"Generated {kind_label.get(r.kind, r.kind)} for {name}",
+                "when": r.created_at,
+            })
+
+        sends = session.execute(
+            select(
+                GeneratedContent.delivered_at,
+                Lead.first_name,
+                Lead.last_name,
+            )
+            .join(Lead, Lead.id == GeneratedContent.lead_id)
+            .where(GeneratedContent.delivered_at.is_not(None))
+            .order_by(GeneratedContent.delivered_at.desc())
+            .limit(limit)
+        ).all()
+        for r in sends:
+            name = f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip() or "(no name)"
+            events.append({
+                "kind": "send",
+                "text": f"Pushed email for {name} to Instantly",
+                "when": r.delivered_at,
+            })
+
+        replies = session.execute(
+            select(
+                Engagement.synced_at,
+                Lead.first_name,
+                Lead.last_name,
+                Lead.company,
+            )
+            .join(GeneratedContent, Engagement.content_id == GeneratedContent.id)
+            .join(Lead, Lead.id == GeneratedContent.lead_id)
+            .where(Engagement.replied.is_(True))
+            .order_by(Engagement.synced_at.desc())
+            .limit(limit)
+        ).all()
+        for r in replies:
+            name = f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip() or "(no name)"
+            company = (r.company or "").strip()
+            text = f"Reply from {name}" + (f" at {company}" if company else "")
+            events.append({"kind": "reply", "text": text, "when": r.synced_at})
+
+        ratings = session.execute(
+            select(
+                ContentRating.rated_at,
+                ContentRating.rating,
+                Lead.first_name,
+                Lead.last_name,
+            )
+            .join(GeneratedContent, GeneratedContent.id == ContentRating.content_id)
+            .join(Lead, Lead.id == GeneratedContent.lead_id)
+            .order_by(ContentRating.rated_at.desc())
+            .limit(limit)
+        ).all()
+        for r in ratings:
+            name = f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip() or "(no name)"
+            verb = "Thumbs-up" if r.rating == "up" else "Thumbs-down"
+            tail = " — redo" if r.rating == "down" else ""
+            events.append({
+                "kind": "rate",
+                "text": f"{verb} on {name}{tail}",
+                "when": r.rated_at,
+            })
+
+    events.sort(key=lambda e: e["when"] or datetime.min, reverse=True)
+    return events[:limit]
+
+
+def ready_to_send_count() -> int:
+    """Leads with active email content that hasn't been delivered yet.
+
+    Used to drive the Dashboard promo CTA. Counts distinct leads with at
+    least one active (non-superseded) email GeneratedContent whose
+    delivered_at is null AND delivery_status is not 'in_progress'/'error'.
+    """
+    with session_scope() as session:
+        stmt = (
+            select(func.count(func.distinct(GeneratedContent.lead_id)))
+            .where(
+                GeneratedContent.kind == "email",
+                GeneratedContent.superseded_by_id.is_(None),
+                GeneratedContent.delivered_at.is_(None),
+                func.coalesce(GeneratedContent.delivery_status, "") != "in_progress",
+            )
+        )
+        return int(session.execute(stmt).scalar() or 0)
 
 
 def list_leads() -> pd.DataFrame:

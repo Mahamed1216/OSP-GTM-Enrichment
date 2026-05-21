@@ -8,6 +8,7 @@ venv/
 *.sqlite3
 .streamlit/secrets.toml
 logs/
+streamlit_*.log
 .pytest_cache/
 .mypy_cache/
 *.egg-info/

@@ -11,15 +11,22 @@ if str(_PROJECT_ROOT) not in sys.path:
 import pandas as pd
 import streamlit as st
 
-from app.lib.components import kpi_card
+from app.lib.components import (
+    activity_feed,
+    activity_row,
+    kpi_card,
+    leads_by_tier_chart,
+    promo_block,
+)
 from app.lib.db_queries import (
     kpi_counts,
     list_unrated_content,
     rating_summary_per_content_type,
+    ready_to_send_count,
+    recent_activity,
     tier_distribution,
 )
-from app.lib.formatters import fmt_duration_ms, fmt_timestamp
-from app.lib.log_reader import parse_recent_pipeline_events
+from app.lib.formatters import fmt_timestamp
 from app.styles import inject_styles
 
 inject_styles()
@@ -36,8 +43,13 @@ def _tier_distribution_cached() -> dict:
 
 
 @st.cache_data(ttl=30)
-def _recent_events_cached(limit: int = 10) -> list[dict]:
-    return parse_recent_pipeline_events(limit=limit)
+def _recent_activity_cached(limit: int = 8) -> list[dict]:
+    return recent_activity(limit=limit)
+
+
+@st.cache_data(ttl=30)
+def _ready_to_send_cached() -> int:
+    return ready_to_send_count()
 
 
 @st.cache_data(ttl=30)
@@ -53,79 +65,134 @@ def _rating_trends_cached(days: int = 30) -> pd.DataFrame:
     return rating_summary_per_content_type(days=days)
 
 
-st.title("Dashboard")
-st.caption("SDR Enablement Pipeline — at a glance")
+st.markdown(
+    '<div class="hero-block">'
+    '<h1 class="hero-headline">Outbound that lands.</h1>'
+    '<p class="hero-sublabel">Lead enrichment, scoring, and personalized outreach '
+    'for SDR teams. Every signal cited.</p>'
+    '</div>',
+    unsafe_allow_html=True,
+)
 
 # ----- KPIs -----
 try:
     kpis = _kpi_counts_cached()
 except Exception as exc:
     st.error(f"Could not load KPIs: {exc}")
-    kpis = {"leads_total": 0, "enriched": 0, "scored": 0, "sent": 0, "replied": 0}
+    kpis = {
+        "leads_total": 0, "enriched": 0, "scored": 0,
+        "sent": 0, "replied": 0,
+    }
 
-reply_rate_str = (
-    f"{(kpis['replied'] / kpis['sent']) * 100:.1f}%" if kpis["sent"] else "—"
-)
+verified_emails = kpis["enriched"]  # enrichment success implies verified email
+try:
+    ready_n = _ready_to_send_cached()
+except Exception:
+    ready_n = max(0, kpis.get("scored", 0) - kpis.get("sent", 0))
 
-c1, c2, c3, c4, c5 = st.columns(5)
+c1, c2, c3, c4 = st.columns(4)
 with c1:
-    kpi_card("Total leads", f"{kpis['leads_total']:,}")
+    kpi_card(
+        "Leads enriched",
+        f"{kpis['enriched']:,}",
+        meta=f"of {kpis['leads_total']:,} total",
+        icon="ti-target",
+        state="primary",
+    )
 with c2:
-    kpi_card("Enriched", f"{kpis['enriched']:,}")
+    kpi_card(
+        "Verified emails",
+        f"{verified_emails:,}",
+        meta="ready for outreach",
+        icon="ti-mail-check",
+        state="success",
+    )
 with c3:
-    kpi_card("Scored", f"{kpis['scored']:,}")
+    kpi_card(
+        "Ready to send",
+        f"{ready_n:,}",
+        meta="content drafted, not yet pushed",
+        icon="ti-send",
+        state="warning",
+    )
 with c4:
-    kpi_card("Sent", f"{kpis['sent']:,}")
-with c5:
-    kpi_card("Reply rate", reply_rate_str, numeric_font="serif")
+    kpi_card(
+        "Already replied",
+        f"{kpis.get('replied', 0):,}",
+        meta=f"{(kpis['replied'] / kpis['sent']) * 100:.1f}% reply rate"
+        if kpis.get("sent") else "no sends yet",
+        icon="ti-message-2",
+        state="success",
+    )
 
-st.divider()
-
-# ----- Tier distribution + Recent events side by side -----
-col_left, col_right = st.columns([1, 2])
+# ----- Two-column: tier chart + activity feed -----
+col_left, col_right = st.columns([1, 1])
 
 with col_left:
-    st.subheader("Tier distribution")
     try:
         dist = _tier_distribution_cached()
-        if sum(dist.values()) == 0:
-            st.info("No scored leads yet. Run the pipeline to see tier breakdown.")
-        else:
-            df_dist = pd.DataFrame(
-                {"tier": list(dist.keys()), "count": list(dist.values())}
-            ).set_index("tier")
-            st.bar_chart(df_dist, height=240)
     except Exception as exc:
         st.error(f"Could not load tier distribution: {exc}")
+        dist = {}
+    if dist:
+        st.markdown(leads_by_tier_chart(dist), unsafe_allow_html=True)
+    else:
+        st.info("No leads yet — ingest a CSV to see tier distribution.")
 
 with col_right:
-    st.subheader("Recent pipeline events")
     try:
-        events = _recent_events_cached(limit=10)
-        if not events:
-            st.info(
-                "No pipeline runs logged yet. Use the Run Pipeline page to kick one off."
-            )
-        else:
-            rows = []
-            for e in events:
-                rows.append(
-                    {
-                        "When": fmt_timestamp(e.get("ts")),
-                        "Lead": e.get("lead_id"),
-                        "Tier": e.get("tier") or "—",
-                        "OK": "✅" if e.get("ok") else "❌",
-                        "Duration": fmt_duration_ms(e.get("duration_ms")),
-                    }
-                )
-            st.dataframe(
-                pd.DataFrame(rows),
-                hide_index=True,
-                use_container_width=True,
-                key="dashboard_recent_events",
-            )
+        feed_events = _recent_activity_cached(limit=8)
     except Exception as exc:
-        st.error(f"Could not parse logs: {exc}")
+        st.error(f"Could not load activity: {exc}")
+        feed_events = []
+    rows_html = [
+        activity_row(e["kind"], e["text"], fmt_timestamp(e["when"]))
+        for e in feed_events
+    ]
+    st.markdown(activity_feed(rows_html), unsafe_allow_html=True)
+
+# ----- Cobalt promo / CTA -----
+if ready_n > 0:
+    promo_block(
+        headline=f"Ready to push {ready_n} leads to Instantly.",
+        body=(
+            "These leads have verified emails and personalized content drafted. "
+            "Push the batch in one click — every signal cited."
+        ),
+        cta_label="Push to Instantly →",
+        cta_target_page="pages/2_leads.py",
+    )
+elif kpis["leads_total"] > kpis["enriched"]:
+    waiting = kpis["leads_total"] - kpis["enriched"]
+    promo_block(
+        headline=f"{waiting} leads waiting for enrichment.",
+        body=(
+            "Run the pipeline to enrich, score, and generate outreach in one pass. "
+            "Sources are cited per lead so SDRs can verify every claim."
+        ),
+        cta_label="Run pipeline →",
+        cta_target_page="pages/4_run_pipeline.py",
+    )
+elif kpis["leads_total"] == 0:
+    promo_block(
+        headline="No leads ingested yet.",
+        body=(
+            "Upload a CSV to ingest your first batch. The pipeline will enrich, "
+            "score, and draft personalized outreach in one pass."
+        ),
+        cta_label="Run pipeline →",
+        cta_target_page="pages/4_run_pipeline.py",
+    )
+else:
+    promo_block(
+        headline="Pipeline caught up.",
+        body=(
+            "All current leads are enriched and processed. Sync engagement to see "
+            "the latest replies, or open Leads to drill into individual performance."
+        ),
+        cta_label="View leads →",
+        cta_target_page="pages/2_leads.py",
+    )
 
 st.divider()
 

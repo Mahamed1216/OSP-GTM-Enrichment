@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from app.lib.async_runner import run_async
+from app.lib.badges import STATUS_DATAFRAME_BADGE
 from app.lib.db_queries import list_leads
 from app.styles import inject_styles
 from src.config import settings
@@ -38,6 +39,21 @@ def _format_tier(t: str) -> str:
     if not t:
         return "—"
     return _TIER_EMOJI.get(t.upper(), t)
+
+
+def _row_status(row: pd.Series) -> str:
+    """Pick the dominant delivery state for the Status pill.
+
+    Replied dominates Sent (any reply implies a send); Sent dominates the
+    default Pending. Bounced is surfaced when the engagement flag is set
+    on the existing list_leads frame — currently we don't carry bounced
+    into the leads frame, so this collapses to {replied, sent, pending}.
+    """
+    if bool(row.get("Replied")):
+        return STATUS_DATAFRAME_BADGE["replied"]
+    if bool(row.get("Sent")):
+        return STATUS_DATAFRAME_BADGE["sent"]
+    return STATUS_DATAFRAME_BADGE["pending"]
 
 
 st.title("Leads")
@@ -79,6 +95,7 @@ if enriched_only:
 # Pretty tier emoji column for display only — keep the original for filtering above
 display_df = filtered.copy()
 display_df["Tier"] = display_df["Tier"].apply(_format_tier)
+display_df["Status"] = filtered.apply(_row_status, axis=1)
 
 if filtered.empty:
     st.info("No leads match the current filters.")
@@ -92,12 +109,14 @@ selection = st.dataframe(
     use_container_width=True,
     on_select="rerun",
     selection_mode="multi-row",
+    column_order=["id", "Name", "Company", "Title", "Tier", "Score", "Enriched", "Status"],
     column_config={
         "id": st.column_config.NumberColumn("ID", width="small"),
         "Score": st.column_config.NumberColumn("Score", format="%d"),
         "Enriched": st.column_config.CheckboxColumn("Enriched"),
-        "Sent": st.column_config.CheckboxColumn("Sent"),
-        "Replied": st.column_config.CheckboxColumn("Replied"),
+        "Sent": None,       # hidden — Status column subsumes
+        "Replied": None,    # hidden — Status column subsumes
+        "Status": st.column_config.TextColumn("Status"),
     },
     key="leads_table",
 )

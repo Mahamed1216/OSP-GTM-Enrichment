@@ -12,6 +12,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 import streamlit as st
 
 from app.lib.badges import pill, status_badge, tier_badge
+from app.lib.components import fit_score_viz
 from app.lib.db_queries import get_lead_full
 from app.lib.formatters import fmt_duration_ms, fmt_timestamp, source_status_display
 from app.lib.rating_runner import delete_lead_sync, record_rating_sync, regenerate_sync
@@ -275,11 +276,13 @@ with tab_score:
     if score is None:
         st.info("This lead has not been scored yet.")
     else:
-        h1, h2, h3 = st.columns([1, 1, 4])
-        h1.markdown(f"**Tier**  {tier_badge(score['tier'])}")
-        h2.markdown(f"**Score**  {score['score']}")
-        h3.caption(f"Model: `{score['model']}`  ·  Scored at: {fmt_timestamp(score['scored_at'])}")
-        st.divider()
+        st.markdown(
+            fit_score_viz(score=score["score"], tier=score["tier"]),
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            f"Model: `{score['model']}`  ·  Scored at: {fmt_timestamp(score['scored_at'])}"
+        )
         st.subheader("Rationale")
         st.write(score["rationale"])
         st.subheader("Signals used")
