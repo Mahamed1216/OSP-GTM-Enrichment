@@ -47,8 +47,13 @@ def _row_status(row: pd.Series) -> str:
     return status_pill("pending")
 
 
-st.title("Leads")
-st.caption("Click a row to open full lead detail.")
+st.markdown(
+    '<div style="margin-bottom: 3rem;">'
+    '<h1 class="hero-headline" style="font-size: 72px;">Leads.</h1>'
+    '<p class="hero-sublabel">Every prospect, scored. Ready to push.</p>'
+    '</div>',
+    unsafe_allow_html=True,
+)
 
 try:
     df = _list_leads_cached()
@@ -61,6 +66,11 @@ if df.empty:
     st.stop()
 
 # ---------- Filters ----------
+# Wrapper is a presentational marker — Streamlit places its native widgets
+# in their own DOM tree, so this div mostly serves as visual scaffolding and
+# may not wrap the widgets at the DOM level. Kept for parity with the rest
+# of the design system (see .filter-row in app/styles.py).
+st.markdown('<div class="filter-row">', unsafe_allow_html=True)
 fc1, fc2, fc3, _ = st.columns([2, 1, 1, 3])
 with fc1:
     tier_filter = st.multiselect(
@@ -74,6 +84,7 @@ with fc2:
     sent_only = st.checkbox("Sent only", key="leads_filter_sent")
 with fc3:
     enriched_only = st.checkbox("Has enrichment", key="leads_filter_enriched")
+st.markdown('</div>', unsafe_allow_html=True)
 
 filtered = df.copy()
 if tier_filter:

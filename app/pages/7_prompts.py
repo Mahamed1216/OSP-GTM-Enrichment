@@ -131,12 +131,12 @@ def _render_channel(channel: str, label: str, default_body: str) -> None:
                     st.rerun()
 
 
-st.title("Prompts")
-st.caption(
-    "Edit the system prompts for each content channel. Changes take effect "
-    "on the next generation. Be careful: removing structural instructions "
-    "like JSON output format will break content generation. Use "
-    "\"Reset to default\" to recover."
+st.markdown(
+    '<div style="margin-bottom: 3rem;">'
+    '<h1 class="hero-headline" style="font-size: 72px;">Prompts.</h1>'
+    '<p class="hero-sublabel">Edit the brain. Save, regenerate, test.</p>'
+    '</div>',
+    unsafe_allow_html=True,
 )
 st.write(_last_saved_caption())
 

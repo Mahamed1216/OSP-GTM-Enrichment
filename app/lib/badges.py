@@ -12,27 +12,28 @@ For non-dataframe contexts where HTML is acceptable (e.g. inside
 from __future__ import annotations
 
 _TIER_BADGE: dict[str, str] = {
-    "A": ":blue-background[**A**]",
-    "B": ":orange-background[**B**]",
-    "C": ":gray-background[**C**]",
-    "D": ":gray-background[**D**]",
+    "A": "🟦 A",
+    "B": "🟧 B",
+    "C": "⬜ C",
+    "D": "⬛ D",
 }
 
 _STATUS_BADGE: dict[str, str] = {
-    "sent":    ":blue-background[**Sent**]",
-    "replied": ":green-background[**Replied**]",
-    "opened":  ":orange-background[**Opened**]",
-    "bounced": ":red-background[**Bounced**]",
-    "pending": ":gray-background[**Pending**]",
+    "sent":    "🟦 Sent",
+    "replied": "🟩 Replied",
+    "opened":  "🟧 Opened",
+    "bounced": "🟥 Bounced",
+    "pending": "⬜ Pending",
 }
 
 
 def tier_badge(tier: str | None) -> str:
-    """Streamlit color-background markdown for tier badges in dataframes.
+    """Tier badge for st.dataframe cells. Colored unicode square + letter.
 
-    Streamlit's built-in palette is limited; the mapping picks the nearest
-    semantic equivalent (A=blue ≈ cobalt primary, B=orange ≈ warm gold,
-    C/D=gray). Not pixel-perfect to the design tokens, but consistent.
+    st.dataframe cells render plain text — they don't parse Streamlit's
+    `:color-background[]` markdown shorthand and they don't render HTML.
+    Coloured unicode squares are the only reliable way to get visible
+    colour into a dataframe cell.
     """
     if not tier:
         return "—"
@@ -40,7 +41,7 @@ def tier_badge(tier: str | None) -> str:
 
 
 def status_pill(state: str) -> str:
-    """Streamlit color-background markdown for delivery-state badges."""
+    """Delivery-state badge for st.dataframe cells. Colored unicode square + label."""
     return _STATUS_BADGE.get(state, "—")
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import time
+from html import escape
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -158,17 +159,19 @@ contents = bundle["contents"]
 engagements = bundle["engagements"]
 
 # ---------- Header ----------
-back_col, title_col = st.columns([1, 9])
-with back_col:
-    if st.button("← Back", key="ld_back_btn"):
-        st.switch_page("pages/2_leads.py")
+if st.button("← Back", key="ld_back_btn"):
+    st.switch_page("pages/2_leads.py")
 
-with title_col:
-    name = f"{lead['first_name']} {lead['last_name']}".strip()
-    st.title(name or "Lead")
-    company_line = lead.get("company") or "—"
-    title_line = lead.get("title") or "—"
-    st.caption(f"{title_line} @ {company_line}")
+name = f"{lead['first_name']} {lead['last_name']}".strip() or "Lead"
+company_line = lead.get("company") or "—"
+title_line = lead.get("title") or "—"
+st.markdown(
+    f'<div style="margin-bottom: 3rem;">'
+    f'<h1 class="hero-headline" style="font-size: 64px;">{escape(name)}.</h1>'
+    f'<p class="hero-sublabel">{escape(title_line)} at {escape(company_line)}</p>'
+    f'</div>',
+    unsafe_allow_html=True,
+)
 
 m1, m2, m3 = st.columns([1, 1, 4])
 with m1:

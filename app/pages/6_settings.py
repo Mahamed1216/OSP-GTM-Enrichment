@@ -54,10 +54,12 @@ def _last_saved_caption(path: Path) -> str:
     return f":gray[Last saved: {ts.strftime('%Y-%m-%d %H:%M:%S')}]"
 
 
-st.title("Settings")
-st.caption(
-    "ICP configuration drives the scoring rubric, content prompts, and "
-    "Tavily news queries. Edits take effect on the next pipeline run."
+st.markdown(
+    '<div style="margin-bottom: 3rem;">'
+    '<h1 class="hero-headline" style="font-size: 72px;">Settings.</h1>'
+    '<p class="hero-sublabel">ICP, send rules, demo toggles. Under the hood.</p>'
+    '</div>',
+    unsafe_allow_html=True,
 )
 st.write(_last_saved_caption(CONFIG_PATH))
 

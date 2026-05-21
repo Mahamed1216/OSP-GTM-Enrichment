@@ -133,10 +133,12 @@ def _format_timestamp(ts: datetime | None) -> str:
     return ts.strftime("%Y-%m-%d %H:%M:%S")
 
 
-st.title("Engagement")
-st.caption(
-    "Inbox replies, opens, and bounces from Instantly, plus the few-shot "
-    "library that downstream content generation pulls from."
+st.markdown(
+    '<div style="margin-bottom: 3rem;">'
+    '<h1 class="hero-headline" style="font-size: 72px;">Engagement.</h1>'
+    '<p class="hero-sublabel">Replies, opens, bounces, sends. The loop closing.</p>'
+    '</div>',
+    unsafe_allow_html=True,
 )
 
 # ---------- Sync controls ----------

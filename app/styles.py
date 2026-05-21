@@ -1063,6 +1063,18 @@ div[data-testid="stAlert"]:has(svg[data-testid="stIconError"]) {
 }
 
 /* ============================================================ */
+/* 17g. Filter row card (Phase 8g)                               */
+/* ============================================================ */
+.filter-row {
+  background: var(--paper);
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  padding: var(--space-6) var(--space-8);
+  margin-bottom: var(--space-6);
+  box-shadow: inset 0 0 0 0.5px rgba(15, 14, 12, 0.04);
+}
+
+/* ============================================================ */
 /* 17f. Status pill (Phase 8f)                                   */
 /* ============================================================ */
 .status-pill {

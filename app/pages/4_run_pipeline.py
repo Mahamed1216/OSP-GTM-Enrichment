@@ -51,7 +51,13 @@ _SKIP_LABEL = "— Skip —"
 _TARGET_OPTIONS = [_SKIP_LABEL] + REQUIRED_FIELDS + OPTIONAL_FIELDS
 
 
-st.title("Run Pipeline")
+st.markdown(
+    '<div style="margin-bottom: 3rem;">'
+    '<h1 class="hero-headline" style="font-size: 72px;">Pipeline.</h1>'
+    '<p class="hero-sublabel">Ingest, enrich, score, generate, deliver.</p>'
+    '</div>',
+    unsafe_allow_html=True,
+)
 
 # =========================================================
 # Section A — CSV ingest
