@@ -186,7 +186,7 @@ def recent_activity(limit: int = 8) -> list[dict[str, Any]]:
                 Lead.first_name,
                 Lead.last_name,
             )
-            .join(GeneratedContent, GeneratedContent.id == ContentRating.content_id)
+            .join(GeneratedContent, GeneratedContent.id == ContentRating.generated_content_id)
             .join(Lead, Lead.id == GeneratedContent.lead_id)
             .order_by(ContentRating.rated_at.desc())
             .limit(limit)

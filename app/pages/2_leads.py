@@ -13,7 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from app.lib.async_runner import run_async
-from app.lib.badges import STATUS_DATAFRAME_BADGE
+from app.lib.badges import status_pill, tier_badge
 from app.lib.db_queries import list_leads
 from app.styles import inject_styles
 from src.config import settings
@@ -27,18 +27,9 @@ inject_styles()
 _CONFIRM_TTL = 5.0  # seconds for two-click confirm window
 _BULK_PUSH_HARD_LIMIT = 10  # over this requires "I understand" checkbox
 
-_TIER_EMOJI = {"A": "🟢 A", "B": "🟡 B", "C": "⚫ C"}
-
-
 @st.cache_data(ttl=30)
 def _list_leads_cached() -> pd.DataFrame:
     return list_leads()
-
-
-def _format_tier(t: str) -> str:
-    if not t:
-        return "—"
-    return _TIER_EMOJI.get(t.upper(), t)
 
 
 def _row_status(row: pd.Series) -> str:
@@ -50,10 +41,10 @@ def _row_status(row: pd.Series) -> str:
     into the leads frame, so this collapses to {replied, sent, pending}.
     """
     if bool(row.get("Replied")):
-        return STATUS_DATAFRAME_BADGE["replied"]
+        return status_pill("replied")
     if bool(row.get("Sent")):
-        return STATUS_DATAFRAME_BADGE["sent"]
-    return STATUS_DATAFRAME_BADGE["pending"]
+        return status_pill("sent")
+    return status_pill("pending")
 
 
 st.title("Leads")
@@ -92,9 +83,13 @@ if sent_only:
 if enriched_only:
     filtered = filtered[filtered["Enriched"]]
 
-# Pretty tier emoji column for display only — keep the original for filtering above
+# Markdown-rendered Tier + Status columns for display; keep the original Tier
+# (single-letter) for filtering above. Streamlit's :color-background[] shorthand
+# is rendered natively in dataframe string cells when no explicit column type
+# overrides it — we leave Tier and Status without an explicit column_config so
+# they auto-render as pills.
 display_df = filtered.copy()
-display_df["Tier"] = display_df["Tier"].apply(_format_tier)
+display_df["Tier"] = display_df["Tier"].apply(tier_badge)
 display_df["Status"] = filtered.apply(_row_status, axis=1)
 
 if filtered.empty:
@@ -116,7 +111,8 @@ selection = st.dataframe(
         "Enriched": st.column_config.CheckboxColumn("Enriched"),
         "Sent": None,       # hidden — Status column subsumes
         "Replied": None,    # hidden — Status column subsumes
-        "Status": st.column_config.TextColumn("Status"),
+        # Tier + Status: no explicit type → Streamlit renders the
+        # :color-background[] markdown shorthand as colored pills.
     },
     key="leads_table",
 )
