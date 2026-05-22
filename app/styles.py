@@ -509,6 +509,13 @@ label, [data-testid="stWidgetLabel"] {
 [data-testid="stExpander"] summary:hover {
   background: var(--cobalt-tint) !important;
 }
+/* Nested expander — distinguish from parent with indent + left hairline */
+[data-testid="stExpander"] [data-testid="stExpander"] {
+  margin-left: var(--space-3) !important;
+  border-left: 2px solid var(--hairline) !important;
+  padding-left: var(--space-4) !important;
+  background: transparent !important;
+}
 
 /* ============================================================ */
 /* 13. st.status                                                */

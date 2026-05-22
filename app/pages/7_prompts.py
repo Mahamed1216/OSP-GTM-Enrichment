@@ -12,6 +12,7 @@ confirm for destructive actions, and a bordered red "Danger zone" block.
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -40,6 +41,39 @@ CHANNELS = [
     ("linkedin_msg", "LinkedIn DM", DEFAULT_LINKEDIN_MSG_PROMPT_BODY),
     ("call_script", "Call Script", DEFAULT_CALL_SCRIPT_PROMPT_BODY),
 ]
+
+
+def parse_prompt_sections(prompt: str) -> list[tuple[str, str]]:
+    """Split a prompt into (header, body) pairs by H1 markdown headers.
+
+    Preserves order. Body is everything until the next H1. Content before
+    the first `# ` header is returned under the synthetic header
+    "Preamble" so it round-trips through `recombine_sections` cleanly.
+    """
+    if not prompt or not prompt.strip():
+        return [("Full prompt", prompt or "")]
+    parts = re.split(r"^# ", prompt, flags=re.MULTILINE)
+    preamble = parts[0].strip()
+    sections: list[tuple[str, str]] = []
+    if preamble:
+        sections.append(("Preamble", preamble))
+    for part in parts[1:]:
+        lines = part.split("\n", 1)
+        header = lines[0].strip()
+        body = lines[1].strip() if len(lines) > 1 else ""
+        sections.append((header, body))
+    return sections
+
+
+def recombine_sections(sections: list[tuple[str, str]]) -> str:
+    """Reverse of `parse_prompt_sections`."""
+    parts: list[str] = []
+    for header, body in sections:
+        if header == "Preamble" or header == "Full prompt":
+            parts.append(body)
+        else:
+            parts.append(f"# {header}\n{body}")
+    return "\n\n".join(parts).strip() + "\n"
 
 
 def _last_saved_caption() -> str:
@@ -131,6 +165,94 @@ def _render_channel(channel: str, label: str, default_body: str) -> None:
                     st.rerun()
 
 
+def _render_email_channel_sectioned(channel: str, label: str, default_body: str) -> None:
+    """Email-only variant: split the body into per-H1 sub-expanders.
+
+    Each section gets its own textarea so edits stay scoped to one block
+    of the prompt. On save the sections are recombined in order back into
+    a single string and written via the same `save_overlay` path the
+    other channels use.
+    """
+    with st.expander(label, expanded=False):
+        current = get_effective_prompt(channel, default_body)
+        sections = parse_prompt_sections(current)
+
+        st.caption(
+            f"Edit any section independently. Click 'Save {label} prompt' to commit."
+        )
+
+        edited_sections: list[tuple[str, str]] = []
+        for i, (header, body) in enumerate(sections):
+            is_goal = "GOAL" in header.upper()
+            with st.expander(header, expanded=is_goal):
+                edited_body = st.text_area(
+                    label=header,
+                    value=body,
+                    height=200,
+                    key=f"prompt_text_{channel}_section_{i}",
+                    label_visibility="collapsed",
+                )
+                edited_sections.append((header, edited_body))
+
+        save_col, reset_col = st.columns([1, 1])
+        with save_col:
+            save_clicked = st.button(
+                f"Save {label} prompt",
+                type="primary",
+                key=f"prompt_save_{channel}",
+            )
+
+        pending_key = f"prompt_reset_pending_{channel}"
+        pending = bool(st.session_state.get(pending_key, False))
+
+        with reset_col:
+            if not pending:
+                if st.button(
+                    f"Reset {label} to default",
+                    type="secondary",
+                    key=f"prompt_reset_init_{channel}",
+                ):
+                    st.session_state[pending_key] = True
+                    st.rerun()
+
+        if save_clicked:
+            new_prompt = recombine_sections(edited_sections)
+            if len(new_prompt.strip()) < 100:
+                st.error(
+                    "Combined prompt is under 100 characters. Add more "
+                    "content before saving."
+                )
+            else:
+                try:
+                    save_overlay(channel, new_prompt)
+                except (OSError, ValueError) as exc:
+                    st.error(f"Failed to save {label} prompt: {exc}")
+                else:
+                    st.toast(f"{label} prompt saved.", icon="✅")
+                    st.rerun()
+
+        if pending:
+            st.warning(
+                f"This will discard the saved {label} overlay and revert to "
+                "the built-in default. Continue?"
+            )
+            if _render_confirm_pair(
+                pending_key=pending_key,
+                confirm_label="Confirm reset",
+                cancel_key=f"prompt_reset_cancel_{channel}",
+                confirm_key=f"prompt_reset_confirm_{channel}",
+            ):
+                try:
+                    reset_overlay(channel)
+                except OSError as exc:
+                    st.error(f"Reset failed: {exc}")
+                    st.session_state.pop(pending_key, None)
+                else:
+                    st.session_state.pop(pending_key, None)
+                    st.toast(f"{label} prompt reset to default.", icon="↩️")
+                    st.rerun()
+
+
 st.markdown(
     '<div style="margin-bottom: 3rem;">'
     '<h1 class="hero-headline" style="font-size: 72px;">Prompts.</h1>'
@@ -141,7 +263,10 @@ st.markdown(
 st.write(_last_saved_caption())
 
 for channel, label, default_body in CHANNELS:
-    _render_channel(channel, label, default_body)
+    if channel == "email":
+        _render_email_channel_sectioned(channel, label, default_body)
+    else:
+        _render_channel(channel, label, default_body)
 
 # ---------- Danger zone ----------
 st.divider()
