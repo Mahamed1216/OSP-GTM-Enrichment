@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from app.lib.db_queries import (
+    get_all_lead_ids,
     get_content_lead_ids,
     get_leads_with_content_by_tier,
     get_scored_lead_ids,
@@ -217,6 +218,12 @@ if st.button(
     disabled=uploaded is None or not ingest_ready or saved_csv_path is None,
     key="ingest_btn",
 ):
+    # Snapshot existing IDs so we can diff and surface newly-inserted ones.
+    try:
+        existing_ids_before = set(get_all_lead_ids())
+    except Exception:
+        existing_ids_before = set()
+
     try:
         with st.spinner("Running scripts/ingest_leads.py …"):
             result: IngestResult = run_ingest_subprocess(
@@ -238,6 +245,15 @@ if st.button(
                 )
                 st.caption(f"Skip reasons: {breakdown}")
             st.cache_data.clear()
+
+            try:
+                all_ids_after = set(get_all_lead_ids())
+            except Exception:
+                all_ids_after = set()
+            new_ids = sorted(all_ids_after - existing_ids_before)
+            if new_ids:
+                st.session_state["just_ingested_ids"] = new_ids
+                st.session_state["just_ingested_count"] = len(new_ids)
         else:
             st.error(f"Ingest subprocess exited with code {result.returncode}")
 
@@ -246,6 +262,41 @@ if st.button(
                 st.code(result.stdout, language="text")
             if result.stderr:
                 st.code(result.stderr, language="text")
+
+# Post-ingest CTA: surface the freshly-inserted IDs and offer a one-click
+# hand-off into section 2's lead-IDs field.
+_just_ids = st.session_state.get("just_ingested_ids")
+if _just_ids:
+    _just_n = st.session_state.get("just_ingested_count", len(_just_ids))
+    st.markdown(
+        '<div style="background:var(--cobalt);border-radius:8px;'
+        'padding:20px 24px;margin:16px 0;">'
+        '<div style="font-family:\'Fraunces\',serif;font-size:24px;'
+        'font-weight:400;color:white;margin-bottom:6px;">'
+        f'{_just_n} new leads ready to enrich.'
+        '</div>'
+        '<div style="font-size:14px;color:rgba(255,255,255,0.8);">'
+        'These leads were just ingested and have no enrichment yet.'
+        '</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    cta_col, dismiss_col = st.columns([1, 3])
+    with cta_col:
+        if st.button(
+            f"Enrich {_just_n} new leads →",
+            type="primary",
+            key="enrich_new_leads",
+        ):
+            st.session_state["lead_ids_input"] = ", ".join(str(i) for i in _just_ids)
+            st.session_state.pop("just_ingested_ids", None)
+            st.session_state.pop("just_ingested_count", None)
+            st.rerun()
+    with dismiss_col:
+        if st.button("Dismiss", key="dismiss_ingest_banner"):
+            st.session_state.pop("just_ingested_ids", None)
+            st.session_state.pop("just_ingested_count", None)
+            st.rerun()
 
 st.divider()
 

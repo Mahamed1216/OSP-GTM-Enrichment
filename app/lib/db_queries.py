@@ -306,6 +306,17 @@ def get_scored_lead_ids(lead_ids: list[int]) -> set[int]:
     return {r[0] for r in rows}
 
 
+def get_all_lead_ids() -> list[int]:
+    """Return every lead ID currently in the database, ordered ascending.
+
+    Used by the Run Pipeline page to snapshot the lead set before and after
+    a CSV ingest so newly-inserted IDs can be identified by set diff.
+    """
+    with session_scope() as session:
+        rows = session.execute(select(Lead.id).order_by(Lead.id.asc())).all()
+    return [r[0] for r in rows]
+
+
 def get_unenriched_lead_ids() -> list[int]:
     """Return IDs of all leads with no Enrichment row, ordered by id."""
     enriched_subq = select(Enrichment.lead_id).subquery()
