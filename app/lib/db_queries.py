@@ -306,6 +306,18 @@ def get_scored_lead_ids(lead_ids: list[int]) -> set[int]:
     return {r[0] for r in rows}
 
 
+def get_unenriched_lead_ids() -> list[int]:
+    """Return IDs of all leads with no Enrichment row, ordered by id."""
+    enriched_subq = select(Enrichment.lead_id).subquery()
+    with session_scope() as session:
+        rows = session.execute(
+            select(Lead.id)
+            .where(Lead.id.notin_(select(enriched_subq.c.lead_id)))
+            .order_by(Lead.id.asc())
+        ).all()
+    return [r[0] for r in rows]
+
+
 def get_leads_with_content_by_tier(tiers: list[str]) -> list[int]:
     """Return lead IDs whose Score.tier is in `tiers` AND that have at least
     one active (non-superseded) GeneratedContent row. Used by the bulk

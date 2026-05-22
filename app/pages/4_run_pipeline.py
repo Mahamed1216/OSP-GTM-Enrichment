@@ -1,6 +1,7 @@
 """Run Pipeline — CSV ingest + four-phase pipeline run with live st.status."""
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from app.lib.db_queries import (
     get_content_lead_ids,
     get_leads_with_content_by_tier,
     get_scored_lead_ids,
+    get_unenriched_lead_ids,
     kpi_counts,
     list_leads,
 )
@@ -49,6 +51,27 @@ _PHASE_LABELS = {
 
 _SKIP_LABEL = "— Skip —"
 _TARGET_OPTIONS = [_SKIP_LABEL] + REQUIRED_FIELDS + OPTIONAL_FIELDS
+
+
+def parse_lead_ids(raw: str) -> list[int]:
+    """Parse comma-separated IDs or a range like '177-203'."""
+    raw = raw.strip()
+    if not raw:
+        return []
+    range_match = re.match(r"^(\d+)-(\d+)$", raw)
+    if range_match:
+        start, end = int(range_match.group(1)), int(range_match.group(2))
+        if start > end:
+            raise ValueError("Range start must be less than or equal to end.")
+        if end - start > 500:
+            raise ValueError("Range too large (max 500 leads at once).")
+        return list(range(start, end + 1))
+    try:
+        return [int(x.strip()) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        raise ValueError(
+            "Invalid format: use integers separated by commas, or a range like '177-203'."
+        )
 
 
 st.markdown(
@@ -246,10 +269,24 @@ if total_leads == 0:
 
 specific_ids_input = st.text_input(
     "Process specific lead IDs (optional, overrides count limit)",
-    placeholder="e.g., 100 or 100, 102, 103",
-    key="run_specific_ids",
-    help="Comma-separated lead IDs. Leave empty to use the count limit below.",
+    placeholder="e.g., 100 or 100, 102, 103 or 177-203",
+    key="lead_ids_input",
+    help="Comma-separated lead IDs or a range like 177-203. Leave empty to use the count limit below.",
 )
+
+try:
+    _unenriched_ids = get_unenriched_lead_ids()
+except Exception:
+    _unenriched_ids = []
+_unenriched_count = len(_unenriched_ids)
+if _unenriched_count > 0:
+    if st.button(
+        f"Set to unenriched leads ({_unenriched_count})",
+        key="set_unenriched",
+        help="Fills the lead IDs field with every lead that has no enrichment row yet.",
+    ):
+        st.session_state["lead_ids_input"] = ", ".join(str(i) for i in _unenriched_ids)
+        st.rerun()
 
 c1, c2 = st.columns(2)
 with c1:
@@ -316,14 +353,14 @@ selected_ids: list[int] | None = None
 if run_clicked:
     raw_ids = (specific_ids_input or "").strip()
     if raw_ids:
-        # Parse the comma-separated list. Bail on any non-integer token; warn
-        # on (but proceed past) IDs that don't exist in the DB.
-        tokens = [t.strip() for t in raw_ids.split(",") if t.strip()]
+        # Accept comma-separated IDs or a range like '177-203'. Warn on (but
+        # proceed past) IDs that don't exist in the DB.
         try:
-            requested = [int(t) for t in tokens]
-        except ValueError:
+            requested = parse_lead_ids(raw_ids)
+        except ValueError as exc:
             st.error(
-                "Invalid lead ID format: must be integers separated by commas"
+                f"{exc} Use comma-separated IDs (e.g. 177, 178, 179) or a "
+                "range (e.g. 177-203)."
             )
             st.stop()
         existing = set(leads_df["id"].astype(int).tolist())
