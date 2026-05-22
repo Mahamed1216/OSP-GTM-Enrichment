@@ -320,6 +320,9 @@ if total_leads == 0:
     st.info("No leads to run. Ingest a CSV first.")
     st.stop()
 
+if "_staged_ids" in st.session_state:
+    st.session_state["lead_ids_input"] = st.session_state.pop("_staged_ids")
+
 specific_ids_input = st.text_input(
     "Process specific lead IDs (optional, overrides count limit)",
     placeholder="e.g., 100 or 100, 102, 103 or 177-203",
@@ -348,7 +351,7 @@ with qs1:
         help="Lead IDs with no enrichment row yet.",
         disabled=not _unenriched_ids,
     ):
-        st.session_state["lead_ids_input"] = ", ".join(str(i) for i in _unenriched_ids)
+        st.session_state["_staged_ids"] = ", ".join(str(i) for i in _unenriched_ids)
         st.rerun()
 with qs2:
     if st.button(
@@ -357,7 +360,7 @@ with qs2:
         help="Leads that are enriched but have no Score row yet.",
         disabled=not _unscored_ids,
     ):
-        st.session_state["lead_ids_input"] = ", ".join(str(i) for i in _unscored_ids)
+        st.session_state["_staged_ids"] = ", ".join(str(i) for i in _unscored_ids)
         st.rerun()
 with qs3:
     if st.button(
@@ -366,7 +369,7 @@ with qs3:
         help="Leads with a Score but no GeneratedContent row yet.",
         disabled=not _content_pending_ids,
     ):
-        st.session_state["lead_ids_input"] = ", ".join(str(i) for i in _content_pending_ids)
+        st.session_state["_staged_ids"] = ", ".join(str(i) for i in _content_pending_ids)
         st.rerun()
 
 c1, c2 = st.columns(2)
