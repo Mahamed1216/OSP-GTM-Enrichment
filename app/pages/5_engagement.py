@@ -142,8 +142,15 @@ st.markdown(
 )
 
 # ---------- Sync controls ----------
-last_sync = _last_sync_cached()
-st.markdown(f":gray[Last synced: **{_format_timestamp(last_sync)}**]")
+_sync_file = Path("data/last_engagement_sync.txt")
+if _sync_file.exists():
+    st.caption(f"Last synced: {_sync_file.read_text().strip()}")
+else:
+    last_sync = _last_sync_cached()
+    if last_sync is not None:
+        st.caption(f"Last synced: {_format_timestamp(last_sync)}")
+    else:
+        st.caption("Not yet synced — sync runs weekdays at 8 AM ET.")
 
 sync_col, promote_col = st.columns(2)
 with sync_col:
