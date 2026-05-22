@@ -15,9 +15,11 @@ import streamlit as st
 from app.lib.db_queries import (
     get_all_lead_ids,
     get_content_lead_ids,
+    get_content_pending_lead_ids,
     get_leads_with_content_by_tier,
     get_scored_lead_ids,
     get_unenriched_lead_ids,
+    get_unscored_lead_ids,
     kpi_counts,
     list_leads,
 )
@@ -329,14 +331,42 @@ try:
     _unenriched_ids = get_unenriched_lead_ids()
 except Exception:
     _unenriched_ids = []
-_unenriched_count = len(_unenriched_ids)
-if _unenriched_count > 0:
+try:
+    _unscored_ids = get_unscored_lead_ids()
+except Exception:
+    _unscored_ids = []
+try:
+    _content_pending_ids = get_content_pending_lead_ids()
+except Exception:
+    _content_pending_ids = []
+
+qs1, qs2, qs3 = st.columns(3)
+with qs1:
     if st.button(
-        f"Set to unenriched leads ({_unenriched_count})",
+        f"Set to unenriched ({len(_unenriched_ids)})",
         key="set_unenriched",
-        help="Fills the lead IDs field with every lead that has no enrichment row yet.",
+        help="Lead IDs with no enrichment row yet.",
+        disabled=not _unenriched_ids,
     ):
         st.session_state["lead_ids_input"] = ", ".join(str(i) for i in _unenriched_ids)
+        st.rerun()
+with qs2:
+    if st.button(
+        f"Set to unscored ({len(_unscored_ids)})",
+        key="set_unscored",
+        help="Leads that are enriched but have no Score row yet.",
+        disabled=not _unscored_ids,
+    ):
+        st.session_state["lead_ids_input"] = ", ".join(str(i) for i in _unscored_ids)
+        st.rerun()
+with qs3:
+    if st.button(
+        f"Set to content-pending ({len(_content_pending_ids)})",
+        key="set_content_pending",
+        help="Leads with a Score but no GeneratedContent row yet.",
+        disabled=not _content_pending_ids,
+    ):
+        st.session_state["lead_ids_input"] = ", ".join(str(i) for i in _content_pending_ids)
         st.rerun()
 
 c1, c2 = st.columns(2)
@@ -374,6 +404,20 @@ st.caption(
     "content-all → deliver-all). For per-lead end-to-end traversal, use "
     "`scripts/run_pipeline.py`. Same DB writes either way."
 )
+
+st.markdown("**Steps to run:**")
+sc1, sc2, sc3 = st.columns(3)
+with sc1:
+    run_enrichment = st.checkbox("Enrich", value=True, key="run_enrich")
+with sc2:
+    run_scoring = st.checkbox("Score", value=True, key="run_score")
+with sc3:
+    run_content = st.checkbox(
+        "Generate content",
+        value=True,
+        key="run_content",
+        help="Also gates delivery — when unchecked, neither content nor delivery runs.",
+    )
 
 running = bool(st.session_state.get("pipeline_running"))
 
@@ -458,22 +502,35 @@ if selected_ids:
     st.session_state["pipeline_running"] = True
     st.write(f"Processing {len(selected_ids)} lead(s) — IDs: `{selected_ids}`")
 
-    # One status block per phase. We pre-open them so the user sees the full
-    # roadmap, and update each as the corresponding phase fires.
-    status_blocks = {
-        phase: st.status(label, expanded=True, state="running" if i == 0 else "complete")
-        for i, (phase, label) in enumerate(_PHASE_LABELS.items())
-    }
-    # All non-current phases start collapsed/idle. Reopen properly.
-    for phase, block in status_blocks.items():
-        block.update(state="running" if phase == "enrichment" else "complete")
+    # Active phases come from the step-selection checkboxes. Delivery rides
+    # with content (gated together in run_phased_pipeline).
+    active_phases: list[str] = []
+    if run_enrichment:
+        active_phases.append("enrichment")
+    if run_scoring:
+        active_phases.append("scoring")
+    if run_content:
+        active_phases.extend(["content", "delivery"])
 
-    # Stats accumulators per phase
-    seen: dict[str, int] = {p: 0 for p in _PHASE_LABELS}
+    # One status block per active phase. The first one starts in `running`,
+    # the rest in `complete` (idle).
+    status_blocks = {
+        phase: st.status(
+            _PHASE_LABELS[phase],
+            expanded=True,
+            state="running" if i == 0 else "complete",
+        )
+        for i, phase in enumerate(active_phases)
+    }
+
+    # Stats accumulators per active phase
+    seen: dict[str, int] = {p: 0 for p in active_phases}
     errs: list[dict] = []
 
     def on_update(u: PhaseUpdate) -> None:
-        block = status_blocks[u.phase]
+        block = status_blocks.get(u.phase)
+        if block is None:
+            return
         seen[u.phase] = u.idx
         new_label = f"{_PHASE_LABELS[u.phase]}  ({u.idx}/{u.total})"
         block.update(label=new_label, state="running")
@@ -501,6 +558,9 @@ if selected_ids:
             selected_ids,
             dry_run=bool(dry_run),
             on_update=on_update,
+            run_enrichment=bool(run_enrichment),
+            run_scoring=bool(run_scoring),
+            run_content=bool(run_content),
         )
         # Mark each phase complete
         for phase, block in status_blocks.items():

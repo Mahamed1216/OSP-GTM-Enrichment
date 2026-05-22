@@ -329,6 +329,38 @@ def get_unenriched_lead_ids() -> list[int]:
     return [r[0] for r in rows]
 
 
+def get_unscored_lead_ids() -> list[int]:
+    """Return IDs of leads that have enrichment but no Score row yet."""
+    enriched_subq = select(Enrichment.lead_id).subquery()
+    scored_subq = select(Score.lead_id).subquery()
+    with session_scope() as session:
+        rows = session.execute(
+            select(Lead.id)
+            .where(
+                Lead.id.in_(select(enriched_subq.c.lead_id)),
+                Lead.id.notin_(select(scored_subq.c.lead_id)),
+            )
+            .order_by(Lead.id.asc())
+        ).all()
+    return [r[0] for r in rows]
+
+
+def get_content_pending_lead_ids() -> list[int]:
+    """Return IDs of leads that have a Score but no GeneratedContent row yet."""
+    scored_subq = select(Score.lead_id).subquery()
+    content_subq = select(GeneratedContent.lead_id).subquery()
+    with session_scope() as session:
+        rows = session.execute(
+            select(Lead.id)
+            .where(
+                Lead.id.in_(select(scored_subq.c.lead_id)),
+                Lead.id.notin_(select(content_subq.c.lead_id)),
+            )
+            .order_by(Lead.id.asc())
+        ).all()
+    return [r[0] for r in rows]
+
+
 def get_leads_with_content_by_tier(tiers: list[str]) -> list[int]:
     """Return lead IDs whose Score.tier is in `tiers` AND that have at least
     one active (non-superseded) GeneratedContent row. Used by the bulk

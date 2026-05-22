@@ -284,28 +284,37 @@ def run_phased_pipeline(
     *,
     dry_run: bool,
     on_update: Callable[[PhaseUpdate], None] | None = None,
+    run_enrichment: bool = True,
+    run_scoring: bool = True,
+    run_content: bool = True,
 ) -> dict[str, Any]:
     """Run the four phases for the given lead ids and return a summary dict.
 
     The Streamlit page is responsible for opening one st.status block per phase
     and using `on_update` to render per-lead progress inside each block.
+
+    The three ``run_*`` flags gate individual phases so callers can re-run
+    only the steps that need to happen (e.g. score + content on leads that
+    are already enriched). Delivery is gated on ``run_content`` — when
+    content is skipped, delivery is skipped too.
     """
     if not lead_ids:
         return {"enriched": 0, "scored": 0, "content": 0, "delivered": 0, "skipped": 0}
 
     # Phase 1
-    run_async(_phase_enrich(lead_ids, on_update))
+    if run_enrichment:
+        run_async(_phase_enrich(lead_ids, on_update))
 
     # Phase 2
-    run_async(_phase_score(lead_ids, on_update))
+    if run_scoring:
+        run_async(_phase_score(lead_ids, on_update))
 
-    # Phase 3 — only send-eligible tiers
-    eligible = _send_eligible_lead_ids(lead_ids)
-    run_async(_phase_content(eligible, on_update))
-
-    # Phase 4 — only those that actually have email content
-    have_email = _has_email_content_lead_ids(eligible)
-    run_async(_phase_deliver(have_email, dry_run=dry_run, on_update=on_update))
+    # Phases 3 + 4 — content gen and delivery share the eligibility filter
+    if run_content:
+        eligible = _send_eligible_lead_ids(lead_ids)
+        run_async(_phase_content(eligible, on_update))
+        have_email = _has_email_content_lead_ids(eligible)
+        run_async(_phase_deliver(have_email, dry_run=dry_run, on_update=on_update))
 
     # Summary from DB
     return _summary(lead_ids)
