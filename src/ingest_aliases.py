@@ -22,7 +22,7 @@ CANONICAL_ALIASES: dict[str, list[str]] = {
         "employer",
         "company_name_for_emails",
     ],
-    "company_domain": ["company_domain", "website", "domain", "company_website"],
+    "company_domain": ["company_domain", "website", "domain", "company_website", "website_domain"],
     "industry": ["industry", "company_industry", "sector"],
     "linkedin_url": [
         "linkedin_url",
