@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import re
 import sys
+import threading
+import time
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -32,8 +34,9 @@ from app.lib.ingest_runner import (
 from app.lib.pipeline_runner import (
     PhaseUpdate,
     _send_eligible_lead_ids,
+    _summary,
     bulk_regenerate_content,
-    run_phased_pipeline,
+    process_single_lead,
 )
 from app.styles import inject_styles
 from src.ingest_aliases import (
@@ -75,6 +78,61 @@ def parse_lead_ids(raw: str) -> list[int]:
         raise ValueError(
             "Invalid format: use integers separated by commas, or a range like '177-203'."
         )
+
+
+def _run_pipeline_thread(
+    lead_ids: list[int],
+    dry_run: bool,
+    run_enrichment: bool,
+    run_scoring: bool,
+    run_content: bool,
+    progress_dict: dict,
+) -> None:
+    """Background-thread driver: walks lead_ids and updates a shared dict.
+
+    Mutates ``progress_dict`` in place — the main Streamlit thread polls
+    that dict on each rerun. We never touch ``st.session_state`` from
+    here (no ScriptRunContext is attached to this thread).
+
+    ``on_update`` is intentionally ``None`` because the Streamlit status
+    callbacks aren't safe across thread boundaries either; per-lead
+    progress flows through ``progress_dict['current']`` instead.
+    """
+    def _collect(u: PhaseUpdate) -> None:
+        # Mutates the shared dict — safe because we never call any
+        # Streamlit API from here, just a regular list.append().
+        if not u.ok:
+            progress_dict["errors"].append(
+                f"Lead {u.lead_id} ({u.phase}): {u.error}"
+            )
+
+    try:
+        total = len(lead_ids)
+        progress_dict["total"] = total
+        for i, lead_id in enumerate(lead_ids):
+            progress_dict["current"] = i + 1
+            progress_dict["current_lead"] = str(lead_id)
+            try:
+                process_single_lead(
+                    lead_id,
+                    dry_run=dry_run,
+                    run_enrichment=run_enrichment,
+                    run_scoring=run_scoring,
+                    run_content=run_content,
+                    on_update=_collect,
+                )
+            except Exception as exc:
+                progress_dict["errors"].append(
+                    f"Lead {lead_id}: {type(exc).__name__}: {exc}"
+                )
+        try:
+            progress_dict["summary"] = _summary(lead_ids)
+        except Exception as exc:
+            progress_dict["errors"].append(f"Summary failed: {exc}")
+    except Exception as exc:
+        progress_dict["errors"].append(f"Pipeline failed: {exc}")
+    finally:
+        progress_dict["done"] = True
 
 
 st.markdown(
@@ -403,9 +461,9 @@ with c2:
             st.rerun()
 
 st.caption(
-    "**Note**: this UI runs phases across the full batch (enrich-all → score-all → "
-    "content-all → deliver-all). For per-lead end-to-end traversal, use "
-    "`scripts/run_pipeline.py`. Same DB writes either way."
+    "**Note**: this UI runs per-lead in a background thread (enrich → score → "
+    "content → deliver, one lead at a time). The progress bar polls every 2s. "
+    "Same DB writes as `scripts/run_pipeline.py`."
 )
 
 st.markdown("**Steps to run:**")
@@ -501,106 +559,89 @@ elif resume_clicked:
         st.info(f"Resuming {len(resume_ids)} incomplete lead(s).")
         selected_ids = resume_ids
 
-if selected_ids:
-    st.session_state["pipeline_running"] = True
-    st.write(f"Processing {len(selected_ids)} lead(s) — IDs: `{selected_ids}`")
-
-    # Active phases come from the step-selection checkboxes. Delivery rides
-    # with content (gated together in run_phased_pipeline).
-    active_phases: list[str] = []
-    if run_enrichment:
-        active_phases.append("enrichment")
-    if run_scoring:
-        active_phases.append("scoring")
-    if run_content:
-        active_phases.extend(["content", "delivery"])
-
-    # One status block per active phase. The first one starts in `running`,
-    # the rest in `complete` (idle).
-    status_blocks = {
-        phase: st.status(
-            _PHASE_LABELS[phase],
-            expanded=True,
-            state="running" if i == 0 else "complete",
-        )
-        for i, phase in enumerate(active_phases)
+if selected_ids and not running:
+    # Kick off the background pipeline. We mutate a plain dict (held in
+    # session_state) from the thread — never st.session_state itself,
+    # because a thread spawned outside Streamlit has no ScriptRunContext.
+    progress: dict = {
+        "current": 0,
+        "total": len(selected_ids),
+        "current_lead": "",
+        "phase": "starting",
+        "done": False,
+        "errors": [],
+        "summary": None,
+        "lead_ids": list(selected_ids),
     }
+    st.session_state["pipeline_progress"] = progress
+    st.session_state["pipeline_running"] = True
 
-    # Stats accumulators per active phase
-    seen: dict[str, int] = {p: 0 for p in active_phases}
-    errs: list[dict] = []
-
-    def on_update(u: PhaseUpdate) -> None:
-        block = status_blocks.get(u.phase)
-        if block is None:
-            return
-        seen[u.phase] = u.idx
-        new_label = f"{_PHASE_LABELS[u.phase]}  ({u.idx}/{u.total})"
-        block.update(label=new_label, state="running")
-        if u.ok and u.payload and u.payload.get("skipped"):
-            reason = u.payload.get("reason") or "already complete"
-            block.write(f"⏭ Lead {u.lead_id} — {reason}, skipping")
-            return
-        if u.ok:
-            extra = ""
-            if u.phase == "scoring" and u.payload:
-                extra = f" — score {u.payload.get('score')} ({u.payload.get('tier')})"
-            elif u.phase == "delivery" and u.payload:
-                if u.payload.get("delivered"):
-                    extra = " — delivered" + (" (dry-run)" if u.payload.get("dry_run") else "")
-                else:
-                    reason = u.payload.get("skip_reason") or "skipped"
-                    extra = f" — skipped: {reason}"
-            block.write(f"✅ Lead {u.lead_id}{extra}")
-        else:
-            block.write(f"❌ Lead {u.lead_id} — `{u.error}`")
-            errs.append({"phase": u.phase, "lead_id": u.lead_id, "error": u.error})
-
-    try:
-        summary = run_phased_pipeline(
+    thread = threading.Thread(
+        target=_run_pipeline_thread,
+        args=(
             selected_ids,
-            dry_run=bool(dry_run),
-            on_update=on_update,
-            run_enrichment=bool(run_enrichment),
-            run_scoring=bool(run_scoring),
-            run_content=bool(run_content),
-        )
-        # Mark each phase complete
-        for phase, block in status_blocks.items():
-            count = seen[phase]
-            block.update(
-                label=f"{_PHASE_LABELS[phase]}  ✓  ({count} processed)",
-                state="complete",
-                expanded=False,
-            )
-    except Exception as exc:
-        st.error(f"Pipeline failed: {exc}")
-        for block in status_blocks.values():
-            block.update(state="error")
+            bool(dry_run),
+            bool(run_enrichment),
+            bool(run_scoring),
+            bool(run_content),
+            progress,
+        ),
+        daemon=True,
+    )
+    thread.start()
+    st.rerun()
+
+if running:
+    prog = st.session_state.get("pipeline_progress", {})
+    current = int(prog.get("current", 0))
+    total = int(prog.get("total", 1)) or 1
+    done = bool(prog.get("done", False))
+    lead_id_str = str(prog.get("current_lead") or "")
+    lead_ids_for_run = prog.get("lead_ids") or []
+
+    st.write(
+        f"Processing {total} lead(s) — IDs: `{lead_ids_for_run}`"
+    )
+
+    if not done:
+        pct = current / total if total > 0 else 0.0
+        st.progress(min(max(pct, 0.0), 1.0))
+        caption_bits = [f"Processing lead {current} of {total}"]
+        if lead_id_str:
+            caption_bits.append(f"(ID {lead_id_str})")
+        st.caption(" ".join(caption_bits))
+        # Poll: yield briefly then rerun so the bar advances. The thread
+        # mutates `prog` in place; the next run sees the latest counts.
+        time.sleep(2)
+        st.rerun()
     else:
-        st.success("Pipeline run complete.")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Enriched", summary["enriched"])
-        m2.metric("Scored", summary["scored"])
-        m3.metric("With email content", summary["content"])
-        m4.metric("Delivered", summary["delivered"])
-
-        tiers = summary["tiers"]
-        st.caption(
-            f"Tier breakdown — A: {tiers['A']}  ·  B: {tiers['B']}  ·  C: {tiers['C']}"
-        )
-
-        if errs:
-            st.warning(f"{len(errs)} error(s) during the run:")
-            st.dataframe(
-                pd.DataFrame(errs),
-                hide_index=True,
-                use_container_width=True,
-                key="run_errors_table",
-            )
-    finally:
+        # Run finished — flip the gate so the buttons re-enable.
         st.session_state["pipeline_running"] = False
         st.cache_data.clear()
+
+        errors = list(prog.get("errors") or [])
+        summary = prog.get("summary") or {}
+
+        if errors:
+            st.warning(f"Completed with {len(errors)} error(s).")
+            with st.expander("Errors", expanded=True):
+                for e in errors:
+                    st.write(f"- {e}")
+        else:
+            st.success(f"Done. Processed {total} lead(s).")
+
+        if summary:
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Enriched", summary.get("enriched", 0))
+            m2.metric("Scored", summary.get("scored", 0))
+            m3.metric("With email content", summary.get("content", 0))
+            m4.metric("Delivered", summary.get("delivered", 0))
+
+            tiers = summary.get("tiers") or {"A": 0, "B": 0, "C": 0}
+            st.caption(
+                f"Tier breakdown — A: {tiers.get('A', 0)}  ·  "
+                f"B: {tiers.get('B', 0)}  ·  C: {tiers.get('C', 0)}"
+            )
 
 st.divider()
 

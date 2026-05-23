@@ -31,7 +31,7 @@ async def run_actor(actor_id: str, run_input: dict, timeout_secs: int = 180) -> 
             retries only 5xx transients per src/retry.py.
     """
     client = apify_client()
-    run = await client.actor(actor_id).call(run_input=run_input, timeout_secs=timeout_secs)
+    run = await client.actor(actor_id).call(run_input=run_input)
     if not run:
         raise ApifyRunFailed(f"{actor_id}: client returned no run object")
 

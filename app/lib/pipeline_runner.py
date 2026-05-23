@@ -279,6 +279,42 @@ def _has_email_content_lead_ids(candidate_ids: Iterable[int]) -> list[int]:
 
 # ---------- Public entry ----------
 
+def process_single_lead(
+    lead_id: int,
+    *,
+    dry_run: bool,
+    run_enrichment: bool = True,
+    run_scoring: bool = True,
+    run_content: bool = True,
+    on_update: Callable[[PhaseUpdate], None] | None = None,
+) -> None:
+    """Run enrich → score → content → deliver for a single lead, in order.
+
+    Each phase is gated by its own flag. Eligibility (tier threshold) is
+    checked after scoring within the same call, so a lead scored in this
+    invocation is immediately visible to content/delivery without needing
+    a separate batch pass. Delivery is gated on ``run_content`` and only
+    fires when content was actually generated.
+
+    Per-phase errors are surfaced via ``on_update`` (when provided) by the
+    underlying ``_phase_*`` coroutines. This function itself does not raise
+    — caller can rely on it returning even if a phase failed for this lead.
+    """
+    if run_enrichment:
+        run_async(_phase_enrich([lead_id], on_update))
+
+    if run_scoring:
+        run_async(_phase_score([lead_id], on_update))
+
+    if run_content:
+        eligible = _send_eligible_lead_ids([lead_id])
+        if eligible:
+            run_async(_phase_content(eligible, on_update))
+            have_email = _has_email_content_lead_ids(eligible)
+            if have_email:
+                run_async(_phase_deliver(have_email, dry_run=dry_run, on_update=on_update))
+
+
 def run_phased_pipeline(
     lead_ids: list[int],
     *,
@@ -288,35 +324,32 @@ def run_phased_pipeline(
     run_scoring: bool = True,
     run_content: bool = True,
 ) -> dict[str, Any]:
-    """Run the four phases for the given lead ids and return a summary dict.
+    """Run the full pipeline per-lead and return a summary dict.
 
-    The Streamlit page is responsible for opening one st.status block per phase
-    and using `on_update` to render per-lead progress inside each block.
+    Each iteration: enrich → score → content+deliver for one lead before
+    moving to the next. This matters because the previous batch-shaped
+    traversal (enrich-all, then score-all, then content-all) ran content
+    gen as a second pass that re-read the score table — fine in isolation,
+    but the per-lead version keeps related work adjacent in the UI feed
+    and means a single lead reaches its final state before the next
+    starts.
 
-    The three ``run_*`` flags gate individual phases so callers can re-run
-    only the steps that need to happen (e.g. score + content on leads that
-    are already enriched). Delivery is gated on ``run_content`` — when
-    content is skipped, delivery is skipped too.
+    The three ``run_*`` flags gate individual steps. Delivery is gated on
+    ``run_content`` — when content is skipped, delivery is skipped too.
     """
     if not lead_ids:
         return {"enriched": 0, "scored": 0, "content": 0, "delivered": 0, "skipped": 0}
 
-    # Phase 1
-    if run_enrichment:
-        run_async(_phase_enrich(lead_ids, on_update))
+    for lid in lead_ids:
+        process_single_lead(
+            lid,
+            dry_run=dry_run,
+            run_enrichment=run_enrichment,
+            run_scoring=run_scoring,
+            run_content=run_content,
+            on_update=on_update,
+        )
 
-    # Phase 2
-    if run_scoring:
-        run_async(_phase_score(lead_ids, on_update))
-
-    # Phases 3 + 4 — content gen and delivery share the eligibility filter
-    if run_content:
-        eligible = _send_eligible_lead_ids(lead_ids)
-        run_async(_phase_content(eligible, on_update))
-        have_email = _has_email_content_lead_ids(eligible)
-        run_async(_phase_deliver(have_email, dry_run=dry_run, on_update=on_update))
-
-    # Summary from DB
     return _summary(lead_ids)
 
 

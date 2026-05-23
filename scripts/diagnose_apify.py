@@ -38,7 +38,7 @@ async def _probe(client: ApifyClientAsync, label: str, actor_id: str, run_input:
 
     start = time.monotonic()
     try:
-        run = await client.actor(actor_id).call(run_input=run_input, timeout_secs=180)
+        run = await client.actor(actor_id).call(run_input=run_input)
     except Exception as exc:
         duration_ms = int((time.monotonic() - start) * 1000)
         print(f"  EXCEPTION after {duration_ms} ms: {exc!r}")
