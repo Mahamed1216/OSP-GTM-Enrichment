@@ -20,6 +20,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from src.ingest_aliases import CANONICAL_ALIASES, REQUIRED_FIELDS
+from src.leads import reset_lead_sequence
 from src.models import Lead
 
 log = logging.getLogger(__name__)
@@ -167,6 +168,12 @@ def ingest_rows(
     input).
     """
     stats = IngestStats()
+
+    # When the leads table was just emptied (e.g. via bulk delete in the
+    # UI), reset the id sequence so the next insert is id=1 instead of
+    # picking up where Postgres left off in the 900s. No-op when leads
+    # exist already.
+    reset_lead_sequence(session)
 
     if pre_deduped:
         rows = list(canonical_rows)

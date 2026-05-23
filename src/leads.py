@@ -16,9 +16,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, select, text, update
+from sqlalchemy.orm import Session
 
-from src.db import session_scope
+from src.db import engine, session_scope
 from src.models import (
     ContentRating,
     Engagement,
@@ -29,6 +30,37 @@ from src.models import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def reset_lead_sequence(session: Session) -> bool:
+    """Reset the leads-id auto-increment to 1 if (and only if) the table is empty.
+
+    Postgres: ``ALTER SEQUENCE leads_id_seq RESTART WITH 1``.
+    SQLite:   ``DELETE FROM sqlite_sequence WHERE name='leads'`` (only effective
+              for AUTOINCREMENT columns; otherwise a harmless no-op).
+
+    Dialect is read from the bound engine rather than ``DATABASE_URL`` so this
+    stays correct if a future runtime overrides the URL but the dialect is
+    locked elsewhere. Caller owns the transaction — no ``session.commit()``
+    here; the enclosing ``session_scope`` (or caller's explicit commit) carries it.
+
+    Returns True if a reset was issued, False if the table was non-empty.
+    """
+    count = session.execute(select(func.count(Lead.id))).scalar() or 0
+    if count > 0:
+        return False
+
+    dialect = engine.dialect.name
+    if dialect == "postgresql":
+        session.execute(text("ALTER SEQUENCE leads_id_seq RESTART WITH 1"))
+    elif dialect == "sqlite":
+        session.execute(text("DELETE FROM sqlite_sequence WHERE name='leads'"))
+    else:
+        # Unknown dialect — log and skip rather than guess.
+        log.warning("reset_lead_sequence_skipped", extra={"dialect": dialect})
+        return False
+    log.info("reset_lead_sequence", extra={"dialect": dialect})
+    return True
 
 
 def delete_lead(lead_id: int) -> dict[str, Any]:

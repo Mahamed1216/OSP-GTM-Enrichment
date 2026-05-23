@@ -20,7 +20,8 @@ from src.config import settings
 from src.db import session_scope
 from src.delivery.eligibility import SKIP_LABELS, filter_eligible, summarize_skips
 from src.delivery.instantly import deliver_email, get_campaign
-from src.leads import delete_lead
+from src.db import session_scope as _delete_session_scope
+from src.leads import delete_lead, reset_lead_sequence
 
 inject_styles()
 
@@ -169,6 +170,15 @@ if selected_lead_ids:
                             st.write(f"✓ deleted lead {lid}")
                         else:
                             st.write(f"⚠️ lead {lid}: {result.get('reason', 'unknown')}")
+                # If the table is now empty, snap the id sequence back to 1
+                # so the next ingest starts fresh. No-op otherwise.
+                try:
+                    with _delete_session_scope() as _sess:
+                        reset_lead_sequence(_sess)
+                except Exception as _exc:
+                    # Sequence reset is best-effort cosmetics — don't fail
+                    # the delete UX if the DDL is denied.
+                    st.write(f"⚠ Could not reset id sequence: {_exc}")
                 status.update(label=f"Deleted {deleted} of {n} leads.", state="complete")
                 st.toast(f"Deleted {deleted} leads.")
                 st.cache_data.clear()
