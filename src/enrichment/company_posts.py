@@ -22,8 +22,10 @@ async def fetch_company_posts(company_url: str, limit: int = 10) -> list[Company
         company_url = "https://" + company_url[7:]
     if "://www." not in company_url:
         company_url = company_url.replace("://", "://www.", 1)
+    input_payload = {"companies": [company_url], "maxPosts": limit}
+    print(f"[company_posts] payload to actor: {input_payload}")
     items = await run_actor(
         settings.apify_actor_company_posts,
-        run_input={"companies": [company_url], "maxPosts": limit},
+        run_input=input_payload,
     )
     return [_parse(it) for it in items[:limit]]
