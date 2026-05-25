@@ -35,6 +35,7 @@ async def run_actor(actor_id: str, run_input: dict, timeout_secs: int = 180) -> 
     if not run:
         raise ApifyRunFailed(f"{actor_id}: client returned no run object")
 
+    print(type(run), run)
     status = run.get("status")
     if status != "SUCCEEDED":
         raise ApifyRunFailed(
