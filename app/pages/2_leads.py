@@ -130,7 +130,7 @@ selection = st.dataframe(
 )
 
 selected_rows = selection.selection.rows if selection and selection.selection else []
-selected_lead_ids = [int(filtered.iloc[i]["id"]) for i in selected_rows]
+selected_lead_ids = [int(filtered.iloc[i]["id"]) for i in selected_rows if i < len(filtered)]
 
 # ---------- Action bar (visible only when ≥1 row selected) ----------
 if selected_lead_ids:
