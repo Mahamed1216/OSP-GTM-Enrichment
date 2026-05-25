@@ -35,18 +35,17 @@ async def run_actor(actor_id: str, run_input: dict, timeout_secs: int = 180) -> 
     if not run:
         raise ApifyRunFailed(f"{actor_id}: client returned no run object")
 
-    print(type(run), run)
-    status = run.get("status")
+    status = run.status if hasattr(run, 'status') else run.get("status")
     if status != "SUCCEEDED":
         raise ApifyRunFailed(
             f"{actor_id}: status={status!r} "
-            f"msg={run.get('statusMessage')!r} run_id={run.get('id')!r}"
+            f"msg={getattr(run, 'status_message', None) if hasattr(run, 'status_message') else run.get('statusMessage')!r} run_id={getattr(run, 'id', None) if hasattr(run, 'id') else run.get('id')!r}"
         )
 
-    dataset_id = run.get("defaultDatasetId")
+    dataset_id = run.default_dataset_id if hasattr(run, 'default_dataset_id') else run.get("defaultDatasetId")
     if not dataset_id:
         raise ApifyRunFailed(
-            f"{actor_id}: SUCCEEDED but no defaultDatasetId (run_id={run.get('id')!r})"
+            f"{actor_id}: SUCCEEDED but no defaultDatasetId (run_id={getattr(run, 'id', None) if hasattr(run, 'id') else run.get('id')!r})"
         )
 
     items_page = await client.dataset(dataset_id).list_items()
