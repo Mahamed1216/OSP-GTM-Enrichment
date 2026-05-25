@@ -32,6 +32,10 @@ def _parse(raw: dict) -> CompanyDetails:
 async def fetch_company_details(company_url: str) -> Optional[CompanyDetails]:
     if not company_url:
         return None
+    if company_url.startswith("http://"):
+        company_url = "https://" + company_url[7:]
+    if "://www." not in company_url:
+        company_url = company_url.replace("://", "://www.", 1)
     items = await run_actor(
         settings.apify_actor_company_details,
         run_input={"urls": [company_url]},
