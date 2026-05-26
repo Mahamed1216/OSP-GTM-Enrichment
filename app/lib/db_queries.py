@@ -540,7 +540,8 @@ def recent_engagement(limit: int = 20) -> pd.DataFrame:
     (which shouldn't exist but might if a lead was deleted while sync was
     in flight) don't surface as half-rendered table rows. Returns the
     columns the Engagement page renders directly — no further joins needed
-    on the page side.
+    on the page side. Also includes subject + body so the page can render
+    the email content inline without a second round-trip.
     """
     stmt = (
         select(
@@ -548,7 +549,10 @@ def recent_engagement(limit: int = 20) -> pd.DataFrame:
             Lead.first_name.label("first_name"),
             Lead.last_name.label("last_name"),
             Lead.company.label("company"),
+            GeneratedContent.id.label("content_id"),
             GeneratedContent.kind.label("kind"),
+            GeneratedContent.subject.label("subject"),
+            GeneratedContent.body.label("body"),
             Engagement.sent.label("sent"),
             Engagement.delivered.label("delivered"),
             Engagement.opened.label("opened"),
@@ -569,7 +573,10 @@ def recent_engagement(limit: int = 20) -> pd.DataFrame:
                 "synced_at": r.synced_at,
                 "lead": f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip(),
                 "company": r.company or "",
+                "content_id": int(r.content_id),
                 "kind": r.kind,
+                "subject": r.subject or "",
+                "body": r.body or "",
                 "sent": bool(r.sent),
                 "delivered": bool(r.delivered),
                 "opened": bool(r.opened),
@@ -580,9 +587,56 @@ def recent_engagement(limit: int = 20) -> pd.DataFrame:
             for r in rows
         ],
         columns=[
-            "synced_at", "lead", "company", "kind",
+            "synced_at", "lead", "company", "content_id", "kind", "subject", "body",
             "sent", "delivered", "opened", "clicked", "replied", "bounced",
         ],
+    )
+
+
+def sent_emails() -> pd.DataFrame:
+    """All email GeneratedContent rows that were successfully pushed to Instantly.
+
+    Filters on delivery_status = "sent" (the Phase 9 outcome flag for a
+    successful API push), kind = "email". Sort newest-first by delivered_at
+    so the Engagement "Sent folder" shows the most recent sends on top.
+    Includes the full body so the page can expand each row without a
+    second query.
+    """
+    stmt = (
+        select(
+            GeneratedContent.id.label("content_id"),
+            GeneratedContent.delivered_at.label("sent_at"),
+            GeneratedContent.subject.label("subject"),
+            GeneratedContent.body.label("body"),
+            Lead.first_name.label("first_name"),
+            Lead.last_name.label("last_name"),
+            Lead.company.label("company"),
+        )
+        .join(Lead, Lead.id == GeneratedContent.lead_id)
+        .where(
+            GeneratedContent.kind == "email",
+            GeneratedContent.delivery_status == "sent",
+        )
+        .order_by(
+            GeneratedContent.delivered_at.desc().nulls_last(),
+            GeneratedContent.id.desc(),
+        )
+    )
+    with session_scope() as session:
+        rows = session.execute(stmt).all()
+    return pd.DataFrame.from_records(
+        [
+            {
+                "content_id": int(r.content_id),
+                "sent_at": r.sent_at,
+                "lead": f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip(),
+                "company": r.company or "",
+                "subject": r.subject or "",
+                "body": r.body or "",
+            }
+            for r in rows
+        ],
+        columns=["content_id", "sent_at", "lead", "company", "subject", "body"],
     )
 
 
