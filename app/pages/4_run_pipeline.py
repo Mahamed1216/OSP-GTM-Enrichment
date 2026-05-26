@@ -36,6 +36,7 @@ from app.lib.pipeline_runner import (
     _send_eligible_lead_ids,
     _summary,
     bulk_regenerate_content,
+    get_email_regen_unfinished_lead_ids,
     process_single_lead,
 )
 from app.styles import inject_styles
@@ -681,6 +682,35 @@ selected_tiers = st.multiselect(
     disabled=running,
 )
 
+# Two checkboxes per spec. Resume defaults ON (so re-running after a partial
+# completion continues instead of redoing work). Force defaults OFF and
+# overrides resume — when both are set, force wins.
+resume_mode = st.checkbox(
+    "Resume from unfinished leads only",
+    value=True,
+    key="bulk_regen_resume",
+    disabled=running,
+    help=(
+        "Skips leads whose latest active email is already at the current "
+        "prompt version. Counts and progress reflect only unfinished leads."
+    ),
+)
+force_regen = st.checkbox(
+    "Force regenerate leads that already have current prompt email content",
+    value=False,
+    key="bulk_regen_force",
+    disabled=running,
+    help=(
+        "Overrides resume. Regenerates every selected lead regardless of "
+        "prompt_version. Use this if you want to refresh leads whose copy "
+        "already matches the current prompt."
+    ),
+)
+
+# Effective skip flag — current-version rows are only skipped when resume
+# is on AND force is off.
+skip_current_version = bool(resume_mode) and not bool(force_regen)
+
 try:
     tier_candidate_ids = (
         get_leads_with_content_by_tier(selected_tiers) if selected_tiers else []
@@ -689,33 +719,61 @@ try:
     # also matches leads whose only content is a call script or LinkedIn DM,
     # which this section no longer touches.
     email_holders = (
-        get_content_lead_ids(tier_candidate_ids, "email") if tier_candidate_ids else set()
+        sorted(get_content_lead_ids(tier_candidate_ids, "email"))
+        if tier_candidate_ids else []
     )
-    candidate_ids = sorted(email_holders)
+    if skip_current_version:
+        candidate_ids = get_email_regen_unfinished_lead_ids(email_holders)
+    else:
+        candidate_ids = email_holders
+    already_current_count = len(email_holders) - len(candidate_ids)
 except Exception as exc:
     st.error(f"Could not compute candidates: {exc}")
     candidate_ids = []
+    email_holders = []
+    already_current_count = 0
 
-st.caption(
-    f"{len(candidate_ids)} lead(s) with existing email content in selected "
-    "tier(s) will have email regenerated. Old email rows are preserved as "
-    "superseded versions; ratings and history are retained. Call scripts and "
-    "LinkedIn DMs are left untouched."
-)
+if skip_current_version:
+    st.caption(
+        f"{len(candidate_ids)} unfinished lead(s) in selected tier(s) — "
+        f"{already_current_count} lead(s) already at the current prompt "
+        f"version will be skipped. Old email rows are preserved as "
+        f"superseded versions; ratings and history retained. Call scripts "
+        f"and LinkedIn DMs are left untouched."
+    )
+else:
+    st.caption(
+        f"{len(candidate_ids)} lead(s) with existing email content in "
+        f"selected tier(s) will have email regenerated. Old email rows are "
+        f"preserved as superseded versions; ratings and history retained. "
+        f"Call scripts and LinkedIn DMs are left untouched."
+    )
 
 regen_pending = bool(st.session_state.get("bulk_regen_pending"))
 
 if not regen_pending:
+    button_label = (
+        f"Continue regenerating email content for {len(candidate_ids)} unfinished leads"
+        if skip_current_version
+        else f"Regenerate email content for {len(candidate_ids)} leads"
+    )
     if st.button(
-        f"Regenerate email content for {len(candidate_ids)} leads",
+        button_label,
         type="primary",
         disabled=(len(candidate_ids) == 0 or running),
         key="bulk_regen_btn",
     ):
         st.session_state["bulk_regen_pending"] = True
+        st.session_state["bulk_regen_skip_current"] = skip_current_version
         st.rerun()
     if selected_tiers and not candidate_ids:
-        st.caption("No leads in the selected tiers have email content yet.")
+        if skip_current_version and email_holders:
+            st.caption(
+                "All leads in the selected tiers are already at the "
+                "current prompt version — nothing to resume."
+            )
+        else:
+            st.caption("No leads in the selected tiers have email content yet.")
 else:
     cc1, cc2 = st.columns([1, 1])
     confirm_regen = cc1.button(
@@ -730,33 +788,90 @@ else:
     if confirm_regen:
         st.session_state["bulk_regen_pending"] = False
         st.session_state["pipeline_running"] = True
+        # Snapshot the resume flag at confirm-time so toggling the checkbox
+        # mid-run can't accidentally flip behavior. Falls back to True for
+        # safety if the snapshot was lost (e.g. session_state cleared).
+        skip_current_run = bool(
+            st.session_state.get("bulk_regen_skip_current", True)
+        )
+
         st.write(
             f"Regenerating {len(candidate_ids)} lead(s) — IDs: `{candidate_ids}`"
         )
         content_label = _PHASE_LABELS["content"]
         bulk_block = st.status(content_label, expanded=True, state="running")
-        bulk_seen = {"n": 0}
+
+        total_run = len(candidate_ids)
+        progress_metrics = st.empty()
+        counts = {
+            "completed": 0,        # successful generate this run
+            "skipped_current": 0,  # already at current prompt version
+            "failed": 0,           # any error / timeout
+            "current_lead": None,
+        }
         bulk_errs: list[dict] = []
+        failed_lead_ids: list[int] = []
+
+        def _render_metrics() -> None:
+            remaining = max(
+                0,
+                total_run
+                - counts["completed"]
+                - counts["skipped_current"]
+                - counts["failed"],
+            )
+            with progress_metrics.container():
+                m1, m2, m3, m4, m5 = st.columns(5)
+                m1.metric(
+                    "Current lead id",
+                    counts["current_lead"] if counts["current_lead"] is not None else "—",
+                )
+                m2.metric("Completed this run", counts["completed"])
+                m3.metric("Skipped (already current)", counts["skipped_current"])
+                m4.metric("Failed", counts["failed"])
+                m5.metric("Remaining", remaining)
+
+        _render_metrics()
 
         def bulk_on_update(u: PhaseUpdate) -> None:
-            bulk_seen["n"] = u.idx
+            counts["current_lead"] = u.lead_id
             bulk_block.update(
                 label=f"{content_label}  ({u.idx}/{u.total})", state="running"
             )
-            if u.ok and u.payload and u.payload.get("skipped"):
-                reason = u.payload.get("reason") or "already complete"
-                bulk_block.write(f"⏭ Lead {u.lead_id} — {reason}, skipping")
-                return
-            if u.ok:
+            payload = u.payload or {}
+            if u.ok and payload.get("skipped_current_version"):
+                counts["skipped_current"] += 1
+                reason = payload.get("reason") or "already at current prompt version"
+                bulk_block.write(f"⏭ Lead {u.lead_id} — {reason}")
+            elif u.ok and payload.get("skipped"):
+                # Other skip reasons (e.g. lead disappeared) — count as completed
+                # for the purposes of "we handled this lead" without erroring.
+                counts["completed"] += 1
+                reason = payload.get("reason") or "skipped"
+                bulk_block.write(f"⏭ Lead {u.lead_id} — {reason}")
+            elif u.ok:
+                counts["completed"] += 1
                 bulk_block.write(f"✅ Lead {u.lead_id}")
             else:
-                bulk_block.write(f"❌ Lead {u.lead_id} — `{u.error}`")
+                counts["failed"] += 1
+                failed_lead_ids.append(int(u.lead_id))
+                tag = "⏱" if payload.get("timed_out") else "❌"
+                bulk_block.write(f"{tag} Lead {u.lead_id} — `{u.error}`")
                 bulk_errs.append({"lead_id": u.lead_id, "error": u.error})
+            _render_metrics()
 
         try:
-            bulk_regenerate_content(candidate_ids, on_update=bulk_on_update)
+            bulk_regenerate_content(
+                candidate_ids,
+                on_update=bulk_on_update,
+                skip_current_version=skip_current_run,
+            )
             bulk_block.update(
-                label=f"{content_label}  ✓  ({bulk_seen['n']} processed)",
+                label=(
+                    f"{content_label}  ✓  ({counts['completed']} regenerated, "
+                    f"{counts['skipped_current']} skipped, "
+                    f"{counts['failed']} failed)"
+                ),
                 state="complete",
                 expanded=False,
             )
@@ -765,26 +880,37 @@ else:
             bulk_block.update(state="error")
         else:
             st.success(
-                f"Bulk regenerate complete. {bulk_seen['n']} lead(s) processed."
+                f"Bulk regenerate complete. "
+                f"{counts['completed']} regenerated, "
+                f"{counts['skipped_current']} skipped, "
+                f"{counts['failed']} failed."
             )
 
             # Summary per spec — only email is regenerated by this flow, so
             # the call_script/linkedin counters are pinned to 0 and surfaced
             # to make the scope obvious in the UI.
-            email_regenerated = max(0, bulk_seen["n"] - len(bulk_errs))
             sm1, sm2, sm3 = st.columns(3)
-            sm1.metric("email_regenerated_count", email_regenerated)
+            sm1.metric("email_regenerated_count", counts["completed"])
             sm2.metric("call_scripts_changed_count", 0)
             sm3.metric("linkedin_dms_changed_count", 0)
 
             if bulk_errs:
-                st.warning(f"{len(bulk_errs)} error(s) during regenerate:")
+                st.warning(
+                    f"{len(bulk_errs)} error(s) during regenerate — "
+                    f"failed lead IDs: `{failed_lead_ids}`"
+                )
                 st.dataframe(
                     pd.DataFrame(bulk_errs),
                     hide_index=True,
                     use_container_width=True,
                     key="bulk_regen_errors_table",
                 )
+                st.caption(
+                    "Re-running with **Resume from unfinished leads only** "
+                    "will retry these — successful rows from this run won't "
+                    "be redone."
+                )
         finally:
             st.session_state["pipeline_running"] = False
+            st.session_state.pop("bulk_regen_skip_current", None)
             st.cache_data.clear()

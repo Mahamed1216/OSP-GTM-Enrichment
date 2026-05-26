@@ -23,7 +23,13 @@ from src.db import session_scope
 from src.delivery.instantly import deliver_email
 from src.enrichment.waterfall import enrich_lead
 from src.models import GeneratedContent, Score
+from src.prompts.email import PROMPT_VERSION as EMAIL_PROMPT_VERSION
 from src.scoring import score_lead
+
+# Per-lead hard cap. The Anthropic SDK has its own timeouts, but a wedged
+# socket can still hang the loop past sensible bounds; 45s matches the
+# resume-mode UX the operator expects (skip this lead, move on).
+_BULK_REGEN_PER_LEAD_TIMEOUT_SEC = 45.0
 
 
 @dataclass
@@ -185,83 +191,184 @@ _KIND_REGEN_DISPATCH = {
 async def _phase_bulk_regen(
     lead_ids: list[int],
     on_update: Callable[[PhaseUpdate], None] | None,
+    *,
+    skip_current_version: bool = True,
 ) -> None:
-    """For each lead, regenerate every active (non-superseded) **email**
-    GeneratedContent row. Call scripts and LinkedIn DMs are intentionally
-    left untouched — this entry point is the bulk EMAIL regenerate path
-    driven by the "3) Bulk regenerate email content" section on the Run
-    Pipeline page. Each generator call inserts a new row, after which we
-    wire `old.superseded_by_id = new.id` so the version chain is
-    preserved (and ratings/history attached to the old row stay intact)."""
+    """Regenerate the active **email** GeneratedContent row for each lead.
+
+    Call scripts and LinkedIn DMs are intentionally left untouched — this
+    entry point is the bulk EMAIL regenerate path driven by Section 3 on
+    the Run Pipeline page.
+
+    Resume semantics: when `skip_current_version` is True (the default),
+    leads whose latest active email row already carries
+    `prompt_version == EMAIL_PROMPT_VERSION` are skipped — so re-running
+    after a partial completion picks up where it left off instead of
+    rewriting work the previous run already finished.
+
+    Per-lead failure isolation: each generator call is wrapped in
+    `asyncio.wait_for(..., 45s)` plus a broad except. Timeouts, Anthropic
+    rate limits, JSON parse errors, missing data — all surface as a
+    `PhaseUpdate(ok=False)` and the loop continues to the next lead.
+    Successful rows are committed inside `generate_email` immediately
+    (one session per lead), so a crash mid-batch keeps prior work."""
     total = len(lead_ids)
     for idx, lid in enumerate(lead_ids, start=1):
+        # Re-read state inside the loop so resume mode also picks up
+        # rows that were updated by another session/tab since the
+        # candidate filter was computed.
         with session_scope() as s:
-            rows = s.execute(
-                select(GeneratedContent.id, GeneratedContent.kind)
+            row = s.execute(
+                select(GeneratedContent.id, GeneratedContent.prompt_version)
                 .where(
                     GeneratedContent.lead_id == lid,
                     GeneratedContent.kind == "email",
                     GeneratedContent.superseded_by_id.is_(None),
                 )
-                .order_by(GeneratedContent.id.asc())
-            ).all()
-        active = [(int(r[0]), str(r[1])) for r in rows]
-        if not active:
+                .order_by(GeneratedContent.id.desc())
+            ).first()
+        if row is None:
+            old_id: int | None = None
+            old_version: str | None = None
+        else:
+            old_id = int(row[0])
+            old_version = row[1]
+
+        if skip_current_version and old_version == EMAIL_PROMPT_VERSION:
             _emit(
                 on_update,
                 PhaseUpdate(
                     "content", lid, idx, total, True,
-                    payload={"skipped": True, "reason": "no active email content"},
+                    payload={
+                        "skipped": True,
+                        "skipped_current_version": True,
+                        "reason": (
+                            f"already at current prompt version "
+                            f"({EMAIL_PROMPT_VERSION})"
+                        ),
+                    },
                 ),
             )
             continue
 
-        errors: list[str] = []
-        for old_id, kind in active:
-            generator = _KIND_REGEN_DISPATCH.get(kind)
-            if generator is None:
-                errors.append(f"unknown kind: {kind}")
-                continue
-            try:
-                await generator(lid)
-            except Exception as exc:
-                errors.append(f"{kind}: {type(exc).__name__}: {exc}")
-                continue
+        # Run the generator with a per-lead timeout. The generator commits
+        # the new GeneratedContent row in its own session_scope, so a
+        # timeout/crash on this lead does not affect already-saved work.
+        try:
+            await asyncio.wait_for(
+                generate_email(lid),
+                timeout=_BULK_REGEN_PER_LEAD_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            _emit(
+                on_update,
+                PhaseUpdate(
+                    "content", lid, idx, total, False,
+                    error=f"timeout after {_BULK_REGEN_PER_LEAD_TIMEOUT_SEC:.0f}s",
+                    payload={"timed_out": True},
+                ),
+            )
+            continue
+        except Exception as exc:
+            _emit(
+                on_update,
+                PhaseUpdate(
+                    "content", lid, idx, total, False,
+                    error=f"email: {type(exc).__name__}: {exc}",
+                ),
+            )
+            continue
+
+        # If there was an old active email row, wire the supersede pointer
+        # so the version chain + ratings stay intact. If there was none
+        # (lead had no email at all), nothing to supersede — the generator
+        # already inserted the fresh row.
+        if old_id is not None:
             with session_scope() as s:
                 new_row = s.execute(
                     select(GeneratedContent)
                     .where(
                         GeneratedContent.lead_id == lid,
-                        GeneratedContent.kind == kind,
+                        GeneratedContent.kind == "email",
                         GeneratedContent.id != old_id,
                         GeneratedContent.superseded_by_id.is_(None),
                     )
                     .order_by(GeneratedContent.id.desc())
                 ).scalars().first()
                 if new_row is None:
-                    errors.append(f"{kind}: generator produced no new row")
+                    _emit(
+                        on_update,
+                        PhaseUpdate(
+                            "content", lid, idx, total, False,
+                            error="email: generator produced no new row",
+                        ),
+                    )
                     continue
                 source = s.get(GeneratedContent, old_id)
                 if source is not None:
                     source.superseded_by_id = new_row.id
 
-        ok = not errors
-        err_msg = "; ".join(errors) if errors else None
-        _emit(on_update, PhaseUpdate("content", lid, idx, total, ok, err_msg))
+        _emit(on_update, PhaseUpdate("content", lid, idx, total, True))
 
 
 def bulk_regenerate_content(
     lead_ids: list[int],
     *,
     on_update: Callable[[PhaseUpdate], None] | None = None,
+    skip_current_version: bool = True,
 ) -> None:
-    """Force-regenerate **email** content for the given leads. Call scripts
-    and LinkedIn DMs are left untouched. Old email rows are preserved with
-    `superseded_by_id` pointing at the new row. Skips idempotency by
-    design — this is the user-invoked refresh path."""
+    """Regenerate **email** content for the given leads. Call scripts and
+    LinkedIn DMs are left untouched. Old email rows are preserved with
+    `superseded_by_id` pointing at the new row.
+
+    `skip_current_version=True` (default) is resume mode — leads whose
+    latest active email is already at `EMAIL_PROMPT_VERSION` are skipped.
+    Pass False to force-regenerate every lead in the list."""
     if not lead_ids:
         return
-    run_async(_phase_bulk_regen(lead_ids, on_update))
+    run_async(
+        _phase_bulk_regen(
+            lead_ids, on_update, skip_current_version=skip_current_version
+        )
+    )
+
+
+def get_email_regen_unfinished_lead_ids(lead_ids: list[int]) -> list[int]:
+    """Subset of `lead_ids` whose latest active email is NOT at the
+    current `EMAIL_PROMPT_VERSION`. Used by the Run Pipeline page to count
+    "unfinished" leads when resume mode is on.
+
+    A lead counts as unfinished if:
+      - its newest non-superseded email row has a different prompt_version
+        from `EMAIL_PROMPT_VERSION`, OR
+      - it has no active email row at all (regenerate will create one).
+    """
+    if not lead_ids:
+        return []
+    with session_scope() as s:
+        rows = s.execute(
+            select(
+                GeneratedContent.lead_id,
+                GeneratedContent.prompt_version,
+                GeneratedContent.id,
+            )
+            .where(
+                GeneratedContent.lead_id.in_(lead_ids),
+                GeneratedContent.kind == "email",
+                GeneratedContent.superseded_by_id.is_(None),
+            )
+            .order_by(
+                GeneratedContent.lead_id.asc(), GeneratedContent.id.desc()
+            )
+        ).all()
+    latest_version_by_lead: dict[int, str] = {}
+    for lid_row, ver, _id in rows:
+        if lid_row not in latest_version_by_lead:
+            latest_version_by_lead[int(lid_row)] = ver or ""
+    return [
+        lid for lid in lead_ids
+        if latest_version_by_lead.get(int(lid), "") != EMAIL_PROMPT_VERSION
+    ]
 
 
 # ---------- Filters between phases (read what's now in the DB) ----------
