@@ -85,7 +85,9 @@ def _run_pipeline_thread(
     dry_run: bool,
     run_enrichment: bool,
     run_scoring: bool,
-    run_content: bool,
+    run_email: bool,
+    run_call_script: bool,
+    run_linkedin_msg: bool,
     progress_dict: dict,
 ) -> None:
     """Background-thread driver: walks lead_ids and updates a shared dict.
@@ -118,7 +120,9 @@ def _run_pipeline_thread(
                     dry_run=dry_run,
                     run_enrichment=run_enrichment,
                     run_scoring=run_scoring,
-                    run_content=run_content,
+                    run_email=run_email,
+                    run_call_script=run_call_script,
+                    run_linkedin_msg=run_linkedin_msg,
                     on_update=_collect,
                 )
             except Exception as exc:
@@ -467,17 +471,29 @@ st.caption(
 )
 
 st.markdown("**Steps to run:**")
-sc1, sc2, sc3 = st.columns(3)
+sc1, sc2, sc3, sc4, sc5 = st.columns(5)
 with sc1:
     run_enrichment = st.checkbox("Enrich", value=True, key="run_enrich")
 with sc2:
     run_scoring = st.checkbox("Score", value=True, key="run_score")
 with sc3:
-    run_content = st.checkbox(
-        "Generate content",
+    run_email = st.checkbox(
+        "Generate email",
         value=True,
-        key="run_content",
-        help="Also gates delivery — when unchecked, neither content nor delivery runs.",
+        key="run_email",
+        help="Also gates delivery — when unchecked, no email is generated or sent.",
+    )
+with sc4:
+    run_call_script = st.checkbox(
+        "Generate call script",
+        value=False,
+        key="run_call_script",
+    )
+with sc5:
+    run_linkedin_msg = st.checkbox(
+        "Generate LinkedIn DM",
+        value=False,
+        key="run_linkedin_msg",
     )
 
 running = bool(st.session_state.get("pipeline_running"))
@@ -583,7 +599,9 @@ if selected_ids and not running:
             bool(dry_run),
             bool(run_enrichment),
             bool(run_scoring),
-            bool(run_content),
+            bool(run_email),
+            bool(run_call_script),
+            bool(run_linkedin_msg),
             progress,
         ),
         daemon=True,

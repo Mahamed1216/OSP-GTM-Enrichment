@@ -94,29 +94,40 @@ async def _phase_score(
 async def _phase_content(
     lead_ids: list[int],
     on_update: Callable[[PhaseUpdate], None] | None,
+    *,
+    run_email: bool = True,
+    run_call_script: bool = True,
+    run_linkedin_msg: bool = True,
 ) -> None:
-    """Per lead, generate email + call script + LinkedIn DM in parallel.
+    """Per lead, generate the enabled content kinds in parallel.
 
     Per-kind idempotency: if a GeneratedContent row of a given kind already
     exists for the lead, that kind is skipped (no API call). A lead with email
-    but no call_script re-attempts only call_script.
+    but no call_script re-attempts only call_script. Kinds disabled by their
+    ``run_*`` flag are skipped without calling the generator.
     """
     total = len(lead_ids)
-    already_email = get_content_lead_ids(lead_ids, "email")
-    already_call = get_content_lead_ids(lead_ids, "call_script")
-    already_li = get_content_lead_ids(lead_ids, "linkedin_msg")
+    already_email = get_content_lead_ids(lead_ids, "email") if run_email else set()
+    already_call = get_content_lead_ids(lead_ids, "call_script") if run_call_script else set()
+    already_li = get_content_lead_ids(lead_ids, "linkedin_msg") if run_linkedin_msg else set()
     for idx, lid in enumerate(lead_ids, start=1):
         tasks: list = []
         skipped_kinds: list[str] = []
-        if lid in already_email:
+        if not run_email:
+            skipped_kinds.append("email")
+        elif lid in already_email:
             skipped_kinds.append("email")
         else:
             tasks.append(generate_email(lid))
-        if lid in already_call:
+        if not run_call_script:
+            skipped_kinds.append("call_script")
+        elif lid in already_call:
             skipped_kinds.append("call_script")
         else:
             tasks.append(generate_call_script(lid))
-        if lid in already_li:
+        if not run_linkedin_msg:
+            skipped_kinds.append("linkedin_msg")
+        elif lid in already_li:
             skipped_kinds.append("linkedin_msg")
         else:
             tasks.append(generate_linkedin_msg(lid))
@@ -285,16 +296,18 @@ def process_single_lead(
     dry_run: bool,
     run_enrichment: bool = True,
     run_scoring: bool = True,
-    run_content: bool = True,
+    run_email: bool = True,
+    run_call_script: bool = True,
+    run_linkedin_msg: bool = True,
     on_update: Callable[[PhaseUpdate], None] | None = None,
 ) -> None:
     """Run enrich → score → content → deliver for a single lead, in order.
 
-    Each phase is gated by its own flag. Eligibility (tier threshold) is
-    checked after scoring within the same call, so a lead scored in this
-    invocation is immediately visible to content/delivery without needing
-    a separate batch pass. Delivery is gated on ``run_content`` and only
-    fires when content was actually generated.
+    Each phase is gated by its own flag. The three content kinds (email,
+    call script, LinkedIn DM) are each individually gated. Eligibility
+    (tier threshold) is checked after scoring within the same call. Delivery
+    is gated on ``run_email`` — only the email kind feeds the Instantly
+    deliver step, so if email isn't generated there's nothing to deliver.
 
     Per-phase errors are surfaced via ``on_update`` (when provided) by the
     underlying ``_phase_*`` coroutines. This function itself does not raise
@@ -306,13 +319,20 @@ def process_single_lead(
     if run_scoring:
         run_async(_phase_score([lead_id], on_update))
 
-    if run_content:
+    if run_email or run_call_script or run_linkedin_msg:
         eligible = _send_eligible_lead_ids([lead_id])
         if eligible:
-            run_async(_phase_content(eligible, on_update))
-            have_email = _has_email_content_lead_ids(eligible)
-            if have_email:
-                run_async(_phase_deliver(have_email, dry_run=dry_run, on_update=on_update))
+            run_async(_phase_content(
+                eligible,
+                on_update,
+                run_email=run_email,
+                run_call_script=run_call_script,
+                run_linkedin_msg=run_linkedin_msg,
+            ))
+            if run_email:
+                have_email = _has_email_content_lead_ids(eligible)
+                if have_email:
+                    run_async(_phase_deliver(have_email, dry_run=dry_run, on_update=on_update))
 
 
 def run_phased_pipeline(
@@ -322,7 +342,9 @@ def run_phased_pipeline(
     on_update: Callable[[PhaseUpdate], None] | None = None,
     run_enrichment: bool = True,
     run_scoring: bool = True,
-    run_content: bool = True,
+    run_email: bool = True,
+    run_call_script: bool = True,
+    run_linkedin_msg: bool = True,
 ) -> dict[str, Any]:
     """Run the full pipeline per-lead and return a summary dict.
 
@@ -334,8 +356,9 @@ def run_phased_pipeline(
     and means a single lead reaches its final state before the next
     starts.
 
-    The three ``run_*`` flags gate individual steps. Delivery is gated on
-    ``run_content`` — when content is skipped, delivery is skipped too.
+    Step flags gate individual steps. The three content kinds are each
+    gated independently. Delivery is gated on ``run_email`` — only email
+    feeds the deliver step.
     """
     if not lead_ids:
         return {"enriched": 0, "scored": 0, "content": 0, "delivered": 0, "skipped": 0}
@@ -346,7 +369,9 @@ def run_phased_pipeline(
             dry_run=dry_run,
             run_enrichment=run_enrichment,
             run_scoring=run_scoring,
-            run_content=run_content,
+            run_email=run_email,
+            run_call_script=run_call_script,
+            run_linkedin_msg=run_linkedin_msg,
             on_update=on_update,
         )
 
