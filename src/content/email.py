@@ -14,7 +14,11 @@ from src.db import session_scope
 from src.icp_config import load_icp_config
 from src.llm import generate_json
 from src.models import Enrichment, GeneratedContent, Lead, Score
-from src.prompts.email import PROMPT_VERSION, build_system as build_email_system
+from src.prompts.email import (
+    PROMPT_VERSION,
+    build_system as build_email_system,
+    current_email_prompt_fingerprint,
+)
 from src.prompts.sanitize import sanitize_generated_text
 
 log = logging.getLogger(__name__)
@@ -77,6 +81,7 @@ async def generate_email(
             body=clean_body,
             signals_cited=result.signals_cited,
             prompt_version=PROMPT_VERSION,
+            prompt_fingerprint=current_email_prompt_fingerprint(),
             model=settings.content_model,
         ))
 

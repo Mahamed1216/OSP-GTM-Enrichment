@@ -99,6 +99,13 @@ class GeneratedContent(Base):
     body: Mapped[str] = mapped_column(Text)
     signals_cited: Mapped[list] = mapped_column(JSON, default=list)
     prompt_version: Mapped[str] = mapped_column(String(32))
+    # SHA256-prefix of the effective system prompt at generation time.
+    # Used by bulk-regen resume mode to detect "this row was generated under
+    # the current prompt". prompt_version alone is insufficient because
+    # editing the overlay in the Prompts UI doesn't bump the version
+    # constant. Nullable: pre-fingerprint rows are correctly treated as
+    # not-current and will be picked up by resume.
+    prompt_fingerprint: Mapped[Optional[str]] = mapped_column(String(64))
     model: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
 

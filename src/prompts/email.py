@@ -1,6 +1,7 @@
 """Cold email prompt — Sonnet 4.6."""
 from __future__ import annotations
 
+import hashlib
 from typing import TYPE_CHECKING
 
 from src.content.winners import format_negatives, format_winners_for
@@ -10,6 +11,25 @@ if TYPE_CHECKING:
     from src.icp_config import ICPConfig
 
 PROMPT_VERSION = "email_v4"
+
+
+def current_email_prompt_fingerprint() -> str:
+    """Stable SHA256-prefix of the user-edited email prompt overlay.
+
+    Used by bulk-regen resume detection to tell "this row was generated
+    under the current prompt" apart from "this row was generated under
+    an older edit of the same `PROMPT_VERSION`". Hashes the effective
+    overlay text (DB-stored override, falling back to the hardcoded
+    default) — not the fully-built system prompt with winners/negatives/
+    ICP merged in, so the fingerprint stays stable across leads and only
+    moves when an operator actually edits the email prompt itself.
+
+    16 hex chars = 64 bits of entropy. Collision odds for the prompt-text
+    universe are effectively zero, and the short form keeps DB rows lean
+    and logs readable.
+    """
+    text = get_effective_prompt("email", DEFAULT_EMAIL_PROMPT_BODY)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 DEFAULT_EMAIL_PROMPT_BODY = """\
 # SENDER

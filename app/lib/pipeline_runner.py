@@ -23,7 +23,10 @@ from src.db import session_scope
 from src.delivery.instantly import deliver_email
 from src.enrichment.waterfall import enrich_lead
 from src.models import GeneratedContent, Score
-from src.prompts.email import PROMPT_VERSION as EMAIL_PROMPT_VERSION
+from src.prompts.email import (
+    PROMPT_VERSION as EMAIL_PROMPT_VERSION,
+    current_email_prompt_fingerprint,
+)
 from src.scoring import score_lead
 
 # Per-lead hard cap. The Anthropic SDK has its own timeouts, but a wedged
@@ -212,6 +215,10 @@ async def _phase_bulk_regen(
     `PhaseUpdate(ok=False)` and the loop continues to the next lead.
     Successful rows are committed inside `generate_email` immediately
     (one session per lead), so a crash mid-batch keeps prior work."""
+    # Snapshot the current fingerprint once for the whole batch so a
+    # mid-batch prompt edit doesn't shift the skip threshold under us.
+    current_fingerprint = current_email_prompt_fingerprint()
+
     total = len(lead_ids)
     for idx, lid in enumerate(lead_ids, start=1):
         # Re-read state inside the loop so resume mode also picks up
@@ -219,7 +226,10 @@ async def _phase_bulk_regen(
         # candidate filter was computed.
         with session_scope() as s:
             row = s.execute(
-                select(GeneratedContent.id, GeneratedContent.prompt_version)
+                select(
+                    GeneratedContent.id,
+                    GeneratedContent.prompt_fingerprint,
+                )
                 .where(
                     GeneratedContent.lead_id == lid,
                     GeneratedContent.kind == "email",
@@ -229,12 +239,20 @@ async def _phase_bulk_regen(
             ).first()
         if row is None:
             old_id: int | None = None
-            old_version: str | None = None
+            old_fingerprint: str | None = None
         else:
             old_id = int(row[0])
-            old_version = row[1]
+            old_fingerprint = row[1]
 
-        if skip_current_version and old_version == EMAIL_PROMPT_VERSION:
+        # Resume mode = "skip if the latest row was produced by the SAME
+        # prompt text that's live right now". A row with no fingerprint
+        # (pre-feature data) is intentionally NOT current — those are the
+        # bad-prompt rows we want resume to catch.
+        if (
+            skip_current_version
+            and old_fingerprint is not None
+            and old_fingerprint == current_fingerprint
+        ):
             _emit(
                 on_update,
                 PhaseUpdate(
@@ -243,8 +261,8 @@ async def _phase_bulk_regen(
                         "skipped": True,
                         "skipped_current_version": True,
                         "reason": (
-                            f"already at current prompt version "
-                            f"({EMAIL_PROMPT_VERSION})"
+                            f"already at current prompt fingerprint "
+                            f"({old_fingerprint})"
                         ),
                     },
                 ),
@@ -334,22 +352,25 @@ def bulk_regenerate_content(
 
 
 def get_email_regen_unfinished_lead_ids(lead_ids: list[int]) -> list[int]:
-    """Subset of `lead_ids` whose latest active email is NOT at the
-    current `EMAIL_PROMPT_VERSION`. Used by the Run Pipeline page to count
-    "unfinished" leads when resume mode is on.
+    """Subset of `lead_ids` whose latest active email was NOT generated
+    under the current prompt fingerprint. Used by the Run Pipeline page
+    to count "unfinished" leads when resume mode is on.
 
-    A lead counts as unfinished if:
-      - its newest non-superseded email row has a different prompt_version
-        from `EMAIL_PROMPT_VERSION`, OR
+    A lead counts as unfinished if any of:
+      - its newest non-superseded email row has a different
+        `prompt_fingerprint` from the live one, OR
+      - that row has `prompt_fingerprint IS NULL` (pre-feature data —
+        intentionally NOT treated as current so resume catches it), OR
       - it has no active email row at all (regenerate will create one).
     """
     if not lead_ids:
         return []
+    current_fp = current_email_prompt_fingerprint()
     with session_scope() as s:
         rows = s.execute(
             select(
                 GeneratedContent.lead_id,
-                GeneratedContent.prompt_version,
+                GeneratedContent.prompt_fingerprint,
                 GeneratedContent.id,
             )
             .where(
@@ -361,13 +382,14 @@ def get_email_regen_unfinished_lead_ids(lead_ids: list[int]) -> list[int]:
                 GeneratedContent.lead_id.asc(), GeneratedContent.id.desc()
             )
         ).all()
-    latest_version_by_lead: dict[int, str] = {}
-    for lid_row, ver, _id in rows:
-        if lid_row not in latest_version_by_lead:
-            latest_version_by_lead[int(lid_row)] = ver or ""
+    latest_fp_by_lead: dict[int, str | None] = {}
+    for lid_row, fp, _id in rows:
+        if int(lid_row) not in latest_fp_by_lead:
+            latest_fp_by_lead[int(lid_row)] = fp
     return [
         lid for lid in lead_ids
-        if latest_version_by_lead.get(int(lid), "") != EMAIL_PROMPT_VERSION
+        if latest_fp_by_lead.get(int(lid)) is None
+        or latest_fp_by_lead.get(int(lid)) != current_fp
     ]
 
 

@@ -682,81 +682,164 @@ selected_tiers = st.multiselect(
     disabled=running,
 )
 
-# Two checkboxes per spec. Resume defaults ON (so re-running after a partial
-# completion continues instead of redoing work). Force defaults OFF and
-# overrides resume — when both are set, force wins.
+# Manual pagination — the primary control. This is "I know exactly which
+# slice of the ordered tier-matching list I want," independent of any
+# version/fingerprint detection. Useful when the version flag is wrong
+# (every row says email_v4) but the operator knows they already finished
+# the first N positions in the C-tier list.
+sp1, sp2 = st.columns(2)
+skip_first_n = sp1.number_input(
+    "Skip first N matching leads",
+    min_value=0,
+    value=0,
+    step=1,
+    key="bulk_regen_skip_n",
+    disabled=running,
+    help=(
+        "Skip the first N leads in the tier-filtered, lead-id-ascending list. "
+        "Use this to resume after a partial run when version detection "
+        "is unreliable. Counts positions in the ordered tier list — NOT "
+        "raw lead IDs."
+    ),
+)
+max_leads_str = sp2.text_input(
+    "Max leads to regenerate",
+    value="",
+    key="bulk_regen_max",
+    disabled=running,
+    placeholder="(blank = all remaining)",
+    help=(
+        "Cap the number of leads this run processes after the skip. "
+        "Leave blank for all remaining."
+    ),
+)
+max_leads: int | None
+try:
+    max_leads = int(max_leads_str.strip()) if max_leads_str.strip() else None
+    if max_leads is not None and max_leads < 1:
+        st.error("Max leads must be at least 1 (or blank).")
+        max_leads = None
+except ValueError:
+    st.error(f"Max leads must be an integer or blank — got `{max_leads_str!r}`.")
+    max_leads = None
+
+# Resume mode (fingerprint-aware) is a SECONDARY filter applied after
+# pagination. Defaults on so future runs after a prompt edit auto-skip
+# already-regenerated leads. Force off it to run the exact paginated set
+# verbatim regardless of fingerprint.
 resume_mode = st.checkbox(
-    "Resume from unfinished leads only",
+    "Resume from unfinished leads only (fingerprint check)",
     value=True,
     key="bulk_regen_resume",
     disabled=running,
     help=(
-        "Skips leads whose latest active email is already at the current "
-        "prompt version. Counts and progress reflect only unfinished leads."
+        "Applied AFTER skip/max. Skips leads whose latest active email "
+        "was generated under the current prompt fingerprint (a hash of "
+        "the email prompt overlay text). Rows without a fingerprint "
+        "(pre-fingerprint data) are NOT treated as current and will be "
+        "regenerated."
     ),
 )
 force_regen = st.checkbox(
-    "Force regenerate leads that already have current prompt email content",
+    "Force regenerate (ignore fingerprint match)",
     value=False,
     key="bulk_regen_force",
     disabled=running,
     help=(
-        "Overrides resume. Regenerates every selected lead regardless of "
-        "prompt_version. Use this if you want to refresh leads whose copy "
-        "already matches the current prompt."
+        "Overrides resume. Regenerates every lead in the paginated set "
+        "regardless of fingerprint."
     ),
 )
-
-# Effective skip flag — current-version rows are only skipped when resume
-# is on AND force is off.
+# Resume only filters when on AND not forced.
 skip_current_version = bool(resume_mode) and not bool(force_regen)
 
 try:
     tier_candidate_ids = (
         get_leads_with_content_by_tier(selected_tiers) if selected_tiers else []
     )
-    # Narrow to leads that actually have email content — the tier query above
-    # also matches leads whose only content is a call script or LinkedIn DM,
-    # which this section no longer touches.
+    # Tier-filtered, sorted by lead_id ascending (stable order) — this is
+    # the ordered list the Skip/Max inputs index into.
     email_holders = (
         sorted(get_content_lead_ids(tier_candidate_ids, "email"))
         if tier_candidate_ids else []
     )
-    if skip_current_version:
-        candidate_ids = get_email_regen_unfinished_lead_ids(email_holders)
+    total_matching = len(email_holders)
+
+    # Apply skip + max pagination.
+    after_skip = email_holders[int(skip_first_n):]
+    if max_leads is not None:
+        paginated_ids = after_skip[:max_leads]
     else:
-        candidate_ids = email_holders
-    already_current_count = len(email_holders) - len(candidate_ids)
+        paginated_ids = after_skip
+    skipped_by_pagination = total_matching - len(paginated_ids)
+
+    # Optional fingerprint filter applied on top.
+    if skip_current_version and paginated_ids:
+        candidate_ids = get_email_regen_unfinished_lead_ids(paginated_ids)
+    else:
+        candidate_ids = list(paginated_ids)
+    fingerprint_filtered_out = len(paginated_ids) - len(candidate_ids)
 except Exception as exc:
     st.error(f"Could not compute candidates: {exc}")
     candidate_ids = []
     email_holders = []
-    already_current_count = 0
+    paginated_ids = []
+    total_matching = 0
+    skipped_by_pagination = 0
+    fingerprint_filtered_out = 0
 
-if skip_current_version:
+# --- Preview block (spec format) ---
+st.markdown("**Preview**")
+prev_cols = st.columns(3)
+prev_cols[0].metric("Total matching tier leads", total_matching)
+prev_cols[1].metric("Skipping first", int(skip_first_n))
+prev_cols[2].metric(
+    "Will regenerate",
+    len(candidate_ids),
+    delta=(
+        None
+        if fingerprint_filtered_out == 0
+        else f"−{fingerprint_filtered_out} already current"
+    ),
+)
+if max_leads is not None:
     st.caption(
-        f"{len(candidate_ids)} unfinished lead(s) in selected tier(s) — "
-        f"{already_current_count} lead(s) already at the current prompt "
-        f"version will be skipped. Old email rows are preserved as "
-        f"superseded versions; ratings and history retained. Call scripts "
-        f"and LinkedIn DMs are left untouched."
+        f"Max leads cap: {max_leads}  ·  After skip: {len(after_skip)}  ·  "
+        f"After cap: {len(paginated_ids)}"
     )
-else:
+if skip_current_version and fingerprint_filtered_out:
     st.caption(
-        f"{len(candidate_ids)} lead(s) with existing email content in "
-        f"selected tier(s) will have email regenerated. Old email rows are "
-        f"preserved as superseded versions; ratings and history retained. "
-        f"Call scripts and LinkedIn DMs are left untouched."
+        f"Resume filter (fingerprint): {fingerprint_filtered_out} of "
+        f"{len(paginated_ids)} paginated lead(s) match the current prompt "
+        f"fingerprint and will be skipped."
     )
+
+# --- Show lead IDs that will be regenerated (spec point) ---
+with st.expander(
+    f"Lead IDs that will be regenerated ({len(candidate_ids)})",
+    expanded=False,
+):
+    if candidate_ids:
+        if len(candidate_ids) <= 200:
+            st.code(", ".join(str(x) for x in candidate_ids), language=None)
+        else:
+            st.code(
+                ", ".join(str(x) for x in candidate_ids[:200])
+                + f", … (+{len(candidate_ids) - 200} more)",
+                language=None,
+            )
+    else:
+        st.caption("(none)")
+
+st.caption(
+    "Email only. Call scripts and LinkedIn DMs are not changed. Old email "
+    "rows are preserved as superseded versions; ratings and history retained."
+)
 
 regen_pending = bool(st.session_state.get("bulk_regen_pending"))
 
 if not regen_pending:
-    button_label = (
-        f"Continue regenerating email content for {len(candidate_ids)} unfinished leads"
-        if skip_current_version
-        else f"Regenerate email content for {len(candidate_ids)} leads"
-    )
+    button_label = f"Regenerate email content for {len(candidate_ids)} leads"
     if st.button(
         button_label,
         type="primary",
@@ -765,15 +848,24 @@ if not regen_pending:
     ):
         st.session_state["bulk_regen_pending"] = True
         st.session_state["bulk_regen_skip_current"] = skip_current_version
+        # Snapshot the paginated lead list at confirm-time so toggling
+        # inputs mid-run can't shift the set.
+        st.session_state["bulk_regen_candidate_ids"] = list(candidate_ids)
         st.rerun()
     if selected_tiers and not candidate_ids:
-        if skip_current_version and email_holders:
-            st.caption(
-                "All leads in the selected tiers are already at the "
-                "current prompt version — nothing to resume."
-            )
-        else:
+        if total_matching == 0:
             st.caption("No leads in the selected tiers have email content yet.")
+        elif skipped_by_pagination >= total_matching:
+            st.caption(
+                "Skip/Max settings exclude every matching lead — adjust to "
+                "include some."
+            )
+        elif skip_current_version and fingerprint_filtered_out:
+            st.caption(
+                "Every lead in the paginated slice already matches the "
+                "current prompt fingerprint. Disable resume mode (or check "
+                "Force) to regenerate them anyway."
+            )
 else:
     cc1, cc2 = st.columns([1, 1])
     confirm_regen = cc1.button(
@@ -794,14 +886,19 @@ else:
         skip_current_run = bool(
             st.session_state.get("bulk_regen_skip_current", True)
         )
+        # Read the lead list snapshotted at button-click so the user's
+        # tier/skip/max selections in the live UI can't alter the run.
+        run_ids: list[int] = list(
+            st.session_state.get("bulk_regen_candidate_ids") or candidate_ids
+        )
 
         st.write(
-            f"Regenerating {len(candidate_ids)} lead(s) — IDs: `{candidate_ids}`"
+            f"Regenerating {len(run_ids)} lead(s) — IDs: `{run_ids}`"
         )
         content_label = _PHASE_LABELS["content"]
         bulk_block = st.status(content_label, expanded=True, state="running")
 
-        total_run = len(candidate_ids)
+        total_run = len(run_ids)
         progress_metrics = st.empty()
         counts = {
             "completed": 0,        # successful generate this run
@@ -862,7 +959,7 @@ else:
 
         try:
             bulk_regenerate_content(
-                candidate_ids,
+                run_ids,
                 on_update=bulk_on_update,
                 skip_current_version=skip_current_run,
             )
@@ -913,4 +1010,5 @@ else:
         finally:
             st.session_state["pipeline_running"] = False
             st.session_state.pop("bulk_regen_skip_current", None)
+            st.session_state.pop("bulk_regen_candidate_ids", None)
             st.cache_data.clear()
