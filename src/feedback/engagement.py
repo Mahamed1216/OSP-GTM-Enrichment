@@ -1,6 +1,20 @@
-"""Pull engagement data from Instantly and persist to Engagement table."""
+"""Pull engagement data from Instantly and persist to Engagement table.
+
+Strategy: a single paginated `POST /api/v2/leads/list` per campaign instead
+of one `GET /api/v2/leads/{id}` per pushed lead. The bulk call returns the
+same `email_*_count` fields per lead, but with two important properties:
+
+  - One HTTP round-trip per ~100 leads vs. N per-lead trips, so transient
+    timeouts no longer silently drop half the metrics (the old code marked
+    each timed-out lead as "failed" and moved on, which is exactly how
+    open/reply numbers went stale on the Engagement page).
+  - Fetches EVERY lead in the campaign, not just the rows the local DB
+    thinks we pushed. Local DB drift (e.g. a manual push or a row whose
+    delivery_id was never persisted) can no longer hide engagement events.
+"""
 import logging
 from datetime import datetime
+from typing import Any, AsyncIterator
 
 import httpx
 from sqlalchemy import select
@@ -12,18 +26,16 @@ from src.retry import retry_api
 
 log = logging.getLogger(__name__)
 
-_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
+_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+_API_BASE = "https://api.instantly.ai/api/v2"
+_PAGE_SIZE = 100
 
 
-@retry_api
-async def _fetch_lead_metrics(delivery_id: str) -> dict:
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        resp = await client.get(
-            f"https://api.instantly.ai/api/v2/leads/{delivery_id}",
-            headers={"Authorization": f"Bearer {settings.instantly_api_key}"},
-        )
-        resp.raise_for_status()
-        return resp.json()
+def _auth_headers() -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {settings.instantly_api_key}",
+        "Content-Type": "application/json",
+    }
 
 
 def _truthy(value) -> bool:
@@ -39,12 +51,15 @@ def _truthy(value) -> bool:
 def _parse_metrics(raw: dict) -> dict:
     """Normalize Instantly's per-lead response into our Engagement field set.
 
-    Instantly's exact field names vary by API version — this maps the common ones
-    and treats any nonzero/truthy as "happened". `raw` is preserved verbatim.
+    Instantly v2 exposes `emails_sent_count`, `email_open_count`,
+    `email_reply_count`, `email_click_count`, and bounce flags on the lead
+    record. We treat any nonzero/truthy as "happened". `raw` is preserved.
     """
     return {
         "sent": _truthy(raw.get("emails_sent_count") or raw.get("sent")),
-        "delivered": _truthy(raw.get("delivered") or raw.get("emails_sent_count")),
+        "delivered": _truthy(
+            raw.get("delivered") or raw.get("emails_sent_count")
+        ),
         "opened": _truthy(raw.get("email_open_count") or raw.get("opened")),
         "clicked": _truthy(raw.get("email_click_count") or raw.get("clicked")),
         "replied": _truthy(raw.get("email_reply_count") or raw.get("replied")),
@@ -53,44 +68,132 @@ def _parse_metrics(raw: dict) -> dict:
     }
 
 
+def _extract_items(payload: dict) -> list[dict]:
+    for key in ("items", "data", "leads"):
+        items = payload.get(key)
+        if isinstance(items, list):
+            return items
+    return []
+
+
+@retry_api
+async def _fetch_leads_page(
+    client: httpx.AsyncClient, starting_after: str | None
+) -> dict:
+    body: dict[str, Any] = {
+        "campaign": settings.instantly_campaign_id,
+        "limit": _PAGE_SIZE,
+    }
+    if starting_after:
+        body["starting_after"] = starting_after
+    resp = await client.post(
+        f"{_API_BASE}/leads/list",
+        headers=_auth_headers(),
+        json=body,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _iter_campaign_leads() -> AsyncIterator[dict]:
+    """Yield every lead in the configured campaign, paginated."""
+    if not settings.instantly_campaign_id:
+        raise RuntimeError(
+            "INSTANTLY_CAMPAIGN_ID is not set — cannot sync engagement"
+        )
+
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        starting_after: str | None = None
+        while True:
+            payload = await _fetch_leads_page(client, starting_after)
+            items = _extract_items(payload)
+            for item in items:
+                yield item
+            starting_after = payload.get("next_starting_after")
+            if not starting_after or not items:
+                return
+
+
 async def sync_engagement() -> dict:
-    """Iterate delivered emails and refresh their Engagement rows from Instantly."""
+    """Bulk-pull every lead in the campaign and upsert Engagement rows.
+
+    Builds a {delivery_id -> content_id} map up front so each API lead can
+    be matched in O(1). Leads we don't recognise locally are skipped (they
+    might be from a manual import) and counted under `unknown`.
+    """
     with session_scope() as session:
-        delivered = session.execute(
-            select(GeneratedContent).where(
+        rows = session.execute(
+            select(GeneratedContent.id, GeneratedContent.delivery_id).where(
                 GeneratedContent.delivered_at.is_not(None),
                 GeneratedContent.delivery_id.is_not(None),
                 GeneratedContent.kind == "email",
             )
-        ).scalars().all()
-        targets = [(c.id, c.delivery_id) for c in delivered]
+        ).all()
+    delivery_to_content: dict[str, int] = {
+        str(r.delivery_id): int(r.id) for r in rows if r.delivery_id
+    }
 
-    synced = failed = 0
-    for content_id, delivery_id in targets:
-        try:
-            raw = await _fetch_lead_metrics(delivery_id)
-        except Exception as exc:
-            log.warning("engagement_fetch_failed", extra={
-                "content_id": content_id,
-                "delivery_id": delivery_id,
-                "error": f"{type(exc).__name__}: {exc}",
-            })
-            failed += 1
-            continue
-        metrics = _parse_metrics(raw)
-        with session_scope() as session:
-            existing = session.execute(
-                select(Engagement).where(Engagement.content_id == content_id)
-            ).scalar_one_or_none()
-            if existing:
-                for k, v in metrics.items():
-                    setattr(existing, k, v)
-                existing.synced_at = datetime.utcnow()
-            else:
-                session.add(Engagement(content_id=content_id, **metrics))
-        synced += 1
+    synced = 0
+    unknown = 0
+    failed = 0
 
-    log.info("engagement_sync_complete", extra={
-        "synced": synced, "failed": failed, "total": len(targets),
-    })
-    return {"synced": synced, "failed": failed, "total": len(targets)}
+    try:
+        async for raw in _iter_campaign_leads():
+            remote_id = str(raw.get("id") or raw.get("lead_id") or "")
+            if not remote_id:
+                continue
+            content_id = delivery_to_content.get(remote_id)
+            if content_id is None:
+                unknown += 1
+                continue
+
+            metrics = _parse_metrics(raw)
+            try:
+                with session_scope() as session:
+                    existing = session.execute(
+                        select(Engagement).where(
+                            Engagement.content_id == content_id
+                        )
+                    ).scalar_one_or_none()
+                    if existing:
+                        for k, v in metrics.items():
+                            setattr(existing, k, v)
+                        existing.synced_at = datetime.utcnow()
+                    else:
+                        session.add(
+                            Engagement(content_id=content_id, **metrics)
+                        )
+                synced += 1
+            except Exception as exc:
+                log.warning(
+                    "engagement_upsert_failed",
+                    extra={
+                        "content_id": content_id,
+                        "remote_id": remote_id,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+                failed += 1
+    except Exception as exc:
+        log.error(
+            "engagement_sync_aborted",
+            extra={"error": f"{type(exc).__name__}: {exc}"},
+        )
+        raise
+
+    total = synced + failed
+    log.info(
+        "engagement_sync_complete",
+        extra={
+            "synced": synced,
+            "failed": failed,
+            "unknown": unknown,
+            "total": total,
+        },
+    )
+    return {
+        "synced": synced,
+        "failed": failed,
+        "unknown": unknown,
+        "total": total,
+    }

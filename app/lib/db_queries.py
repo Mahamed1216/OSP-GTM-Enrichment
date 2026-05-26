@@ -33,22 +33,14 @@ def kpi_counts() -> dict[str, int]:
         leads_total = session.execute(select(func.count(Lead.id))).scalar() or 0
         enriched = session.execute(select(func.count(Enrichment.id))).scalar() or 0
         scored = session.execute(select(func.count(Score.id))).scalar() or 0
-        sent = (
-            session.execute(
-                select(func.count(GeneratedContent.id)).where(
-                    and_(
-                        GeneratedContent.kind == "email",
-                        GeneratedContent.delivered_at.is_not(None),
-                    )
-                )
-            ).scalar()
-            or 0
-        )
-
-        # All engagement-bool counts share the same join shape; collect them
-        # in one pass so the page doesn't issue four near-identical queries.
+        # `sent` was previously COUNT(delivered_at IS NOT NULL), which counts
+        # leads we PUSHED to Instantly — not leads Instantly has actually sent
+        # an email to. The campaign cadence means a chunk of pushes are still
+        # queued at any moment, so that count ran ~2x the live Instantly figure.
+        # The truth lives in Engagement.sent (synced from emails_sent_count > 0).
         eng_bool_stmt = (
             select(
+                func.sum(case((Engagement.sent.is_(True), 1), else_=0)).label("sent"),
                 func.sum(case((Engagement.replied.is_(True), 1), else_=0)).label("replied"),
                 func.sum(case((Engagement.opened.is_(True), 1), else_=0)).label("opened"),
                 func.sum(case((Engagement.clicked.is_(True), 1), else_=0)).label("clicked"),
@@ -62,7 +54,7 @@ def kpi_counts() -> dict[str, int]:
             "leads_total": int(leads_total),
             "enriched": int(enriched),
             "scored": int(scored),
-            "sent": int(sent),
+            "sent": int(row.sent or 0),
             "replied": int(row.replied or 0),
             "opened": int(row.opened or 0),
             "clicked": int(row.clicked or 0),
