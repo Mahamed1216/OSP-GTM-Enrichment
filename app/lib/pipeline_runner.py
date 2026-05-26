@@ -186,9 +186,13 @@ async def _phase_bulk_regen(
     lead_ids: list[int],
     on_update: Callable[[PhaseUpdate], None] | None,
 ) -> None:
-    """For each lead, regenerate every active (non-superseded) GeneratedContent
-    row. Each generator call inserts a new row, after which we wire
-    `old.superseded_by_id = new.id` so the version chain is preserved."""
+    """For each lead, regenerate every active (non-superseded) **email**
+    GeneratedContent row. Call scripts and LinkedIn DMs are intentionally
+    left untouched — this entry point is the bulk EMAIL regenerate path
+    driven by the "3) Bulk regenerate email content" section on the Run
+    Pipeline page. Each generator call inserts a new row, after which we
+    wire `old.superseded_by_id = new.id` so the version chain is
+    preserved (and ratings/history attached to the old row stay intact)."""
     total = len(lead_ids)
     for idx, lid in enumerate(lead_ids, start=1):
         with session_scope() as s:
@@ -196,6 +200,7 @@ async def _phase_bulk_regen(
                 select(GeneratedContent.id, GeneratedContent.kind)
                 .where(
                     GeneratedContent.lead_id == lid,
+                    GeneratedContent.kind == "email",
                     GeneratedContent.superseded_by_id.is_(None),
                 )
                 .order_by(GeneratedContent.id.asc())
@@ -206,7 +211,7 @@ async def _phase_bulk_regen(
                 on_update,
                 PhaseUpdate(
                     "content", lid, idx, total, True,
-                    payload={"skipped": True, "reason": "no active content"},
+                    payload={"skipped": True, "reason": "no active email content"},
                 ),
             )
             continue
@@ -250,8 +255,9 @@ def bulk_regenerate_content(
     *,
     on_update: Callable[[PhaseUpdate], None] | None = None,
 ) -> None:
-    """Force-regenerate content for the given leads. Old rows are preserved
-    with `superseded_by_id` pointing at the new row. Skips idempotency by
+    """Force-regenerate **email** content for the given leads. Call scripts
+    and LinkedIn DMs are left untouched. Old email rows are preserved with
+    `superseded_by_id` pointing at the new row. Skips idempotency by
     design — this is the user-invoked refresh path."""
     if not lead_ids:
         return
