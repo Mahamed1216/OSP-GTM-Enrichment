@@ -117,6 +117,60 @@ async def _post_lead_to_campaign(payload: dict) -> dict:
         return resp.json()
 
 
+@retry_api
+async def find_leads_by_email(email: str, campaign_id: str) -> list[dict]:
+    """Look up leads in the configured campaign whose email matches `email`.
+
+    Uses POST /api/v2/leads/list with the campaign filter + search term.
+    Instantly's `search` is a substring match across multiple fields, so we
+    re-filter the response by exact (case-insensitive) email locally —
+    otherwise "alex@x.io" could match "alexandra@x.io" and we'd PATCH the
+    wrong record.
+
+    Returns a list (zero, one, or many). The bulk-overwrite caller treats
+    >1 as a duplicate-warning case and refuses to update without operator
+    intervention.
+    """
+    if not email or not campaign_id:
+        return []
+    target = email.strip().lower()
+    async with httpx.AsyncClient(timeout=_CLIENT_TIMEOUT) as client:
+        resp = await client.post(
+            f"{_API_BASE}/leads/list",
+            headers=_auth_headers(),
+            json={"campaign": campaign_id, "search": email, "limit": 50},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    items = data.get("items") or data.get("data") or data.get("leads") or []
+    if not isinstance(items, list):
+        return []
+    return [
+        item for item in items
+        if isinstance(item, dict)
+        and str(item.get("email") or "").strip().lower() == target
+    ]
+
+
+@retry_api
+async def patch_lead(remote_lead_id: str, payload: dict) -> dict:
+    """PATCH /api/v2/leads/{id} — update fields on an existing Instantly lead.
+
+    Used by the overwrite flow to update `custom_variables` (subject/body)
+    without re-creating the lead or touching the campaign schedule.
+    Raises httpx.HTTPStatusError on non-2xx; the caller distinguishes
+    "Instantly refused to update" (405/400) from transient failures.
+    """
+    async with httpx.AsyncClient(timeout=_CLIENT_TIMEOUT) as client:
+        resp = await client.patch(
+            f"{_API_BASE}/leads/{remote_lead_id}",
+            headers=_auth_headers(),
+            json=payload,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
 def _build_payload(lead: Lead, content: GeneratedContent) -> dict:
     """Build the Instantly /api/v2/leads payload.
 
@@ -281,3 +335,203 @@ async def _record_skip(
         "verify_status": verify_status,
     })
     return DeliveryResult(delivered=False, skip_reason=reason)
+
+
+# ---------------------------------------------------------------------------
+# Bulk overwrite flow (Phase: post-prompt-wipe rescue)
+# ---------------------------------------------------------------------------
+
+OverwriteStatus = Literal[
+    "updated",          # PATCH succeeded and read-back matched
+    "created",          # lead wasn't in Instantly — created fresh
+    "skipped",          # local guard (no email/no content) — nothing tried
+    "failed",           # API error (5xx, network, read-back mismatch)
+    "duplicate_warning",  # >1 lead in Instantly with this email — refused to act
+    "update_unsupported",  # Instantly rejected PATCH (405/400) — operator must delete+reimport
+]
+
+
+class OverwriteResult(BaseModel):
+    lead_id: int
+    status: OverwriteStatus
+    detail: str | None = None
+    remote_lead_id: str | None = None
+
+
+def _latest_email_content_for(lead_id: int) -> tuple[Lead | None, GeneratedContent | None]:
+    """Snapshot the lead row + the most recent email GeneratedContent for it.
+
+    Snapshots happen inside a single session so callers can use the returned
+    objects detached. Returns (None, None) if the lead doesn't exist; the
+    content half is None when no email has been generated yet.
+    """
+    from sqlalchemy.orm import make_transient
+
+    with session_scope() as session:
+        lead = session.get(Lead, lead_id)
+        if lead is None:
+            return None, None
+        content = session.execute(
+            select(GeneratedContent)
+            .where(
+                GeneratedContent.lead_id == lead_id,
+                GeneratedContent.kind == "email",
+            )
+            .order_by(GeneratedContent.id.desc())
+        ).scalars().first()
+
+        # Expunge so the caller can touch attrs after session close without
+        # triggering refresh on the now-detached instances.
+        session.expunge(lead)
+        if content is not None:
+            session.expunge(content)
+        return lead, content
+
+
+def _read_back_matches(remote: dict, expected_subject: str, expected_body: str) -> bool:
+    """Verify Instantly returned the custom_variables we just wrote."""
+    cv = remote.get("custom_variables") or {}
+    if not isinstance(cv, dict):
+        return False
+    return (
+        str(cv.get("personalized_subject") or "") == (expected_subject or "")
+        and str(cv.get("personalized_body") or "") == (expected_body or "")
+    )
+
+
+async def overwrite_lead_copy(
+    lead_id: int, *, create_if_missing: bool = True
+) -> OverwriteResult:
+    """Push the latest local email copy to Instantly for one lead.
+
+    Per-lead flow:
+      1. Snapshot the lead's email + most-recent GeneratedContent.
+      2. Search Instantly's campaign for that email (exact match).
+      3. >1 match → duplicate_warning (refuses to act).
+      4. 1 match  → PATCH custom_variables, then GET and verify.
+      5. 0 match  → POST a new lead (only if create_if_missing).
+
+    Never deletes, never activates the campaign, never touches
+    delivered_at/delivery_status on existing rows (so the engagement
+    sync continues to be the source of truth for "actually sent").
+    """
+    if not settings.instantly_api_key or not settings.instantly_campaign_id:
+        return OverwriteResult(
+            lead_id=lead_id,
+            status="failed",
+            detail="INSTANTLY_API_KEY or INSTANTLY_CAMPAIGN_ID not configured",
+        )
+
+    lead, content = _latest_email_content_for(lead_id)
+    if lead is None:
+        return OverwriteResult(lead_id=lead_id, status="skipped", detail="lead not found")
+    if not lead.email:
+        return OverwriteResult(lead_id=lead_id, status="skipped", detail="lead has no email")
+    if content is None or not (content.body or "").strip():
+        return OverwriteResult(lead_id=lead_id, status="skipped", detail="no email content generated")
+
+    expected_subject = content.subject or ""
+    expected_body = content.body
+    campaign_id = settings.instantly_campaign_id
+
+    try:
+        matches = await find_leads_by_email(lead.email, campaign_id)
+    except Exception as exc:
+        return OverwriteResult(
+            lead_id=lead_id, status="failed",
+            detail=f"lookup failed: {_format_error(exc)}",
+        )
+
+    if len(matches) > 1:
+        return OverwriteResult(
+            lead_id=lead_id,
+            status="duplicate_warning",
+            detail=f"{len(matches)} leads in campaign share this email — refusing to update",
+        )
+
+    if len(matches) == 1:
+        remote_id = str(matches[0].get("id") or matches[0].get("lead_id") or "")
+        if not remote_id:
+            return OverwriteResult(
+                lead_id=lead_id, status="failed",
+                detail="matched lead has no id in response",
+            )
+        patch_payload = {
+            "custom_variables": {
+                "personalized_subject": expected_subject,
+                "personalized_body": expected_body,
+                "signals_cited": ", ".join(content.signals_cited or []),
+            }
+        }
+        try:
+            await patch_lead(remote_id, patch_payload)
+        except httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+            if code in (400, 404, 405, 409, 422):
+                return OverwriteResult(
+                    lead_id=lead_id,
+                    status="update_unsupported",
+                    detail=(
+                        f"Instantly rejected PATCH (HTTP {code}). Delete and "
+                        f"reimport this lead manually, or use a delete + recreate flow."
+                    ),
+                    remote_lead_id=remote_id,
+                )
+            return OverwriteResult(
+                lead_id=lead_id, status="failed",
+                detail=_format_error(exc), remote_lead_id=remote_id,
+            )
+        except Exception as exc:
+            return OverwriteResult(
+                lead_id=lead_id, status="failed",
+                detail=_format_error(exc), remote_lead_id=remote_id,
+            )
+
+        try:
+            remote = await get_lead(remote_id)
+        except Exception as exc:
+            return OverwriteResult(
+                lead_id=lead_id, status="failed",
+                detail=f"PATCH succeeded but read-back failed: {_format_error(exc)}",
+                remote_lead_id=remote_id,
+            )
+
+        if not _read_back_matches(remote, expected_subject, expected_body):
+            return OverwriteResult(
+                lead_id=lead_id, status="failed",
+                detail="read-back custom_variables did not match local content",
+                remote_lead_id=remote_id,
+            )
+        return OverwriteResult(
+            lead_id=lead_id, status="updated",
+            detail="custom_variables updated and verified",
+            remote_lead_id=remote_id,
+        )
+
+    # No match — create only if allowed.
+    if not create_if_missing:
+        return OverwriteResult(
+            lead_id=lead_id, status="skipped",
+            detail="not in Instantly campaign; create_if_missing=False",
+        )
+
+    payload = _build_payload(lead, content)
+    try:
+        response = await _post_lead_to_campaign(payload)
+    except Exception as exc:
+        return OverwriteResult(
+            lead_id=lead_id, status="failed",
+            detail=f"create failed: {_format_error(exc)}",
+        )
+    new_remote_id = str(response.get("id") or response.get("lead_id") or "")
+
+    try:
+        remote = await get_lead(new_remote_id) if new_remote_id else {}
+    except Exception:
+        remote = {}
+    verified = _read_back_matches(remote, expected_subject, expected_body) if remote else False
+    detail = "created" + ("" if verified else " (read-back unverified)")
+    return OverwriteResult(
+        lead_id=lead_id, status="created",
+        detail=detail, remote_lead_id=new_remote_id or None,
+    )

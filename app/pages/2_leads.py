@@ -19,7 +19,7 @@ from app.styles import inject_styles
 from src.config import settings
 from src.db import session_scope
 from src.delivery.eligibility import SKIP_LABELS, filter_eligible, summarize_skips
-from src.delivery.instantly import deliver_email, get_campaign
+from src.delivery.instantly import deliver_email, get_campaign, overwrite_lead_copy
 from src.db import session_scope as _delete_session_scope
 from src.leads import delete_lead, reset_lead_sequence
 
@@ -388,3 +388,151 @@ if selected_lead_ids:
                 st.session_state.pop("leads_table", None)
                 st.rerun()
             cc2.caption(":red[Click \"Confirm push\" within 5s to proceed.]")
+
+    # ---------- Overwrite existing Instantly copy ----------
+    # For when bad copy was already pushed and the local content has been
+    # regenerated. Updates `custom_variables` on the matched Instantly lead
+    # instead of creating a duplicate; never deletes, never activates the
+    # campaign. See src/delivery/instantly.py:overwrite_lead_copy.
+    n_selected = len(selected_lead_ids)
+    with st.container(border=True):
+        st.markdown("**Overwrite existing Instantly copy**")
+        st.caption(
+            "Updates `personalized_subject` / `personalized_body` on leads "
+            "already in the Instantly campaign with the latest generated copy "
+            "from this DB. Matches by email + campaign id. No duplicates created; "
+            "no campaign activation."
+        )
+
+        ack = st.checkbox(
+            "Overwrite existing Instantly copy with latest generated copy",
+            key="overwrite_ack",
+            value=False,
+            help=(
+                "Required. Confirms you've reviewed the regenerated email copy "
+                "and want it pushed to Instantly for the selected leads."
+            ),
+        )
+
+        create_missing = st.checkbox(
+            "Also create leads that aren't in Instantly yet",
+            key="overwrite_create_missing",
+            value=True,
+            help=(
+                "When a selected lead has no match in Instantly, push it as a "
+                "new lead. Uncheck to update-only (skip unknown leads)."
+            ),
+        )
+
+        oc1, oc2 = st.columns([1.5, 5])
+        overwrite_clicked = oc1.button(
+            f"Overwrite for selected ({n_selected})",
+            key="overwrite_btn",
+            disabled=(n_selected == 0 or not ack),
+            type="secondary",
+        )
+        if n_selected == 0:
+            oc2.caption("Select at least one lead to enable overwrite.")
+        elif not ack:
+            oc2.caption("Check the confirmation box above to enable overwrite.")
+        else:
+            oc2.caption(f"Ready to overwrite {n_selected} selected lead(s).")
+
+        if overwrite_clicked and n_selected and ack:
+            progress = st.progress(0.0, text=f"Overwriting {n_selected} lead(s)…")
+            status = st.status("Overwriting…", expanded=True)
+            counts = {
+                "updated": 0,
+                "created": 0,
+                "skipped": 0,
+                "failed": 0,
+                "duplicate_warning": 0,
+                "update_unsupported": 0,
+            }
+            results: list[tuple[int, str, str]] = []
+            with status:
+                for i, lid in enumerate(selected_lead_ids, start=1):
+                    try:
+                        res = run_async(
+                            overwrite_lead_copy(
+                                lid, create_if_missing=create_missing
+                            )
+                        )
+                    except Exception as exc:
+                        counts["failed"] += 1
+                        detail = f"{type(exc).__name__}: {exc}"
+                        st.write(f"❌ lead {lid} — {detail}")
+                        results.append((lid, "failed", detail))
+                    else:
+                        counts[res.status] = counts.get(res.status, 0) + 1
+                        icon = {
+                            "updated": "✏️",
+                            "created": "➕",
+                            "skipped": "⚠️",
+                            "failed": "❌",
+                            "duplicate_warning": "⚠️",
+                            "update_unsupported": "🛑",
+                        }.get(res.status, "•")
+                        st.write(
+                            f"{icon} lead {lid} — **{res.status}** — {res.detail or ''}"
+                        )
+                        results.append((lid, res.status, res.detail or ""))
+                    progress.progress(
+                        i / n_selected,
+                        text=f"Processed {i} of {n_selected}…",
+                    )
+            status.update(
+                label=(
+                    f"Done — {counts['updated']} updated, "
+                    f"{counts['created']} created, "
+                    f"{counts['skipped']} skipped, "
+                    f"{counts['failed']} failed, "
+                    f"{counts['duplicate_warning']} duplicate warnings."
+                ),
+                state="complete",
+            )
+
+            # Final summary block — five mandatory counters from the spec
+            # plus the update_unsupported bucket (only shown if hit, with a
+            # clear next-step for the operator).
+            st.markdown("---")
+            st.markdown("### Overwrite summary")
+            sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+            sc1.metric("Updated",        counts["updated"])
+            sc2.metric("Created",        counts["created"])
+            sc3.metric("Skipped",        counts["skipped"])
+            sc4.metric("Failed",         counts["failed"])
+            sc5.metric("Duplicate warn", counts["duplicate_warning"])
+
+            if counts["update_unsupported"]:
+                offenders = [
+                    (lid, detail)
+                    for (lid, st_, detail) in results
+                    if st_ == "update_unsupported"
+                ]
+                st.warning(
+                    f"**Instantly refused to update {counts['update_unsupported']} "
+                    f"lead(s).** These cannot be patched in place — you must "
+                    f"delete them from the Instantly campaign and re-import, "
+                    f"or use a delete-and-recreate flow."
+                )
+                with st.expander("Affected leads"):
+                    for lid, detail in offenders:
+                        st.write(f"- lead {lid} — {detail}")
+
+            if counts["duplicate_warning"]:
+                dupes = [
+                    (lid, detail)
+                    for (lid, st_, detail) in results
+                    if st_ == "duplicate_warning"
+                ]
+                st.warning(
+                    f"**{counts['duplicate_warning']} lead(s) have duplicates in "
+                    f"Instantly.** Refused to update to avoid touching the wrong "
+                    f"record. De-dupe in Instantly first."
+                )
+                with st.expander("Affected leads"):
+                    for lid, detail in dupes:
+                        st.write(f"- lead {lid} — {detail}")
+
+            st.session_state.pop("overwrite_ack", None)
