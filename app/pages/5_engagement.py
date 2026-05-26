@@ -447,16 +447,23 @@ if recent_df.empty:
 else:
     st.caption("Click a row to see the email that was sent.")
     for _, row in recent_df.iterrows():
-        when = _format_event_when(row["synced_at"])
+        # Row label per spec: sent timestamp · lead name · company · Email · delivery status.
+        # Engagement icons (open/click/reply/bounce) appended when present so
+        # synced events stay visible without losing the spec-mandated format.
+        when = _format_event_when(row.get("delivered_at") or row.get("synced_at"))
         lead = row["lead"] or "(unknown lead)"
-        company = row["company"]
-        kind_label = _KIND_LABELS.get(row["kind"], row["kind"])
-        status = _event_status_icons(row)
+        company = row.get("company") or ""
+        email = row.get("email") or ""
+        delivery_status = row.get("delivery_status") or "—"
         header_bits = [when, lead]
         if company:
             header_bits.append(company)
-        header_bits.append(kind_label)
-        header_bits.append(status)
+        if email:
+            header_bits.append(email)
+        header_bits.append(delivery_status)
+        signals = _event_status_icons(row)
+        if signals and signals != "—":
+            header_bits.append(signals)
         header = " · ".join(header_bits)
         with st.expander(header):
             subject = row.get("subject") or ""

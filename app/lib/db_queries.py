@@ -526,35 +526,52 @@ def last_sync_time() -> datetime | None:
 
 
 def recent_engagement(limit: int = 20) -> pd.DataFrame:
-    """Most-recently-synced Engagement rows joined with lead + content kind.
+    """Most-recent successful email pushes, joined with optional engagement.
 
-    INNER joins on GeneratedContent and Lead so orphaned engagement rows
-    (which shouldn't exist but might if a lead was deleted while sync was
-    in flight) don't surface as half-rendered table rows. Returns the
-    columns the Engagement page renders directly — no further joins needed
-    on the page side. Also includes subject + body so the page can render
-    the email content inline without a second round-trip.
+    Source is `GeneratedContent` (delivery_status='sent', kind='email') —
+    NOT `Engagement` — so a lead that was just pushed shows up immediately
+    without waiting for the next "Sync engagement from Instantly" run.
+    Engagement is LEFT-joined so opens / replies / clicks surface once
+    they've been synced from Instantly.
+
+    Ordering: COALESCE(delivered_at, created_at) DESC so the newest send
+    is always on top. Email lead/company/subject/body come back inline so
+    the page can render the row + expand-to-email without a second query.
     """
     stmt = (
         select(
-            Engagement.synced_at.label("synced_at"),
-            Lead.first_name.label("first_name"),
-            Lead.last_name.label("last_name"),
-            Lead.company.label("company"),
             GeneratedContent.id.label("content_id"),
+            GeneratedContent.delivered_at.label("delivered_at"),
+            GeneratedContent.created_at.label("created_at"),
+            GeneratedContent.delivery_status.label("delivery_status"),
             GeneratedContent.kind.label("kind"),
             GeneratedContent.subject.label("subject"),
             GeneratedContent.body.label("body"),
-            Engagement.sent.label("sent"),
-            Engagement.delivered.label("delivered"),
-            Engagement.opened.label("opened"),
-            Engagement.clicked.label("clicked"),
-            Engagement.replied.label("replied"),
-            Engagement.bounced.label("bounced"),
+            Lead.first_name.label("first_name"),
+            Lead.last_name.label("last_name"),
+            Lead.company.label("company"),
+            Lead.email.label("email"),
+            Engagement.synced_at.label("synced_at"),
+            Engagement.sent.label("eng_sent"),
+            Engagement.delivered.label("eng_delivered"),
+            Engagement.opened.label("eng_opened"),
+            Engagement.clicked.label("eng_clicked"),
+            Engagement.replied.label("eng_replied"),
+            Engagement.bounced.label("eng_bounced"),
         )
-        .join(GeneratedContent, Engagement.content_id == GeneratedContent.id)
+        .select_from(GeneratedContent)
         .join(Lead, Lead.id == GeneratedContent.lead_id)
-        .order_by(Engagement.synced_at.desc())
+        .outerjoin(Engagement, Engagement.content_id == GeneratedContent.id)
+        .where(
+            GeneratedContent.kind == "email",
+            GeneratedContent.delivery_status == "sent",
+        )
+        .order_by(
+            func.coalesce(
+                GeneratedContent.delivered_at, GeneratedContent.created_at
+            ).desc(),
+            GeneratedContent.id.desc(),
+        )
         .limit(limit)
     )
     with session_scope() as session:
@@ -562,24 +579,33 @@ def recent_engagement(limit: int = 20) -> pd.DataFrame:
     return pd.DataFrame.from_records(
         [
             {
-                "synced_at": r.synced_at,
+                # Use the delivered_at timestamp when present (true "sent time"),
+                # otherwise the engagement synced_at, otherwise content created_at.
+                # The page's row label calls this "Sent" so it must be a send-time
+                # value, not a sync-time value.
+                "synced_at": r.delivered_at or r.synced_at or r.created_at,
+                "delivered_at": r.delivered_at,
+                "delivery_status": r.delivery_status or "sent",
                 "lead": f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip(),
                 "company": r.company or "",
+                "email": r.email or "",
                 "content_id": int(r.content_id),
                 "kind": r.kind,
                 "subject": r.subject or "",
                 "body": r.body or "",
-                "sent": bool(r.sent),
-                "delivered": bool(r.delivered),
-                "opened": bool(r.opened),
-                "clicked": bool(r.clicked),
-                "replied": bool(r.replied),
-                "bounced": bool(r.bounced),
+                "sent": True,  # delivery_status='sent' guarantees this
+                "delivered": bool(r.eng_delivered) if r.eng_delivered is not None else False,
+                "opened": bool(r.eng_opened) if r.eng_opened is not None else False,
+                "clicked": bool(r.eng_clicked) if r.eng_clicked is not None else False,
+                "replied": bool(r.eng_replied) if r.eng_replied is not None else False,
+                "bounced": bool(r.eng_bounced) if r.eng_bounced is not None else False,
             }
             for r in rows
         ],
         columns=[
-            "synced_at", "lead", "company", "content_id", "kind", "subject", "body",
+            "synced_at", "delivered_at", "delivery_status",
+            "lead", "company", "email", "content_id", "kind",
+            "subject", "body",
             "sent", "delivered", "opened", "clicked", "replied", "bounced",
         ],
     )

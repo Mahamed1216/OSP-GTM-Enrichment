@@ -388,6 +388,35 @@ def _latest_email_content_for(lead_id: int) -> tuple[Lead | None, GeneratedConte
         return lead, content
 
 
+def _mark_local_sent(content_id: int, remote_lead_id: str) -> None:
+    """Flip the local GeneratedContent row to delivery_status='sent'.
+
+    Used by the overwrite flow after a successful PATCH or POST so the
+    Leads-page Status pill flips from Pending → Sent immediately, without
+    waiting for the Instantly engagement sync to run.
+
+    - `delivery_status` and `delivery_provider` are always (re-)set to the
+      current truth.
+    - `delivery_id` is updated to the remote id we just confirmed.
+    - `delivered_at` is set ONLY if currently NULL so re-overwriting an
+      already-sent lead doesn't backdate the original delivery timestamp.
+    - `error_message` is cleared to wipe any stale failure.
+    """
+    if content_id is None:
+        return
+    with session_scope() as session:
+        content = session.get(GeneratedContent, content_id)
+        if content is None:
+            return
+        if content.delivered_at is None:
+            content.delivered_at = datetime.utcnow()
+        if remote_lead_id:
+            content.delivery_id = remote_lead_id
+        content.delivery_provider = "instantly"
+        content.delivery_status = "sent"
+        content.error_message = None
+
+
 def _read_back_matches(remote: dict, expected_subject: str, expected_body: str) -> bool:
     """Verify Instantly returned the custom_variables we just wrote.
 
@@ -511,6 +540,8 @@ async def overwrite_lead_copy(
                 detail="read-back custom_variables did not match local content",
                 remote_lead_id=remote_id,
             )
+        # Local DB → Sent. Preserves original delivered_at if already set.
+        _mark_local_sent(content.id, remote_id)
         return OverwriteResult(
             lead_id=lead_id, status="updated",
             detail="custom_variables updated and verified",
@@ -539,6 +570,10 @@ async def overwrite_lead_copy(
     except Exception:
         remote = {}
     verified = _read_back_matches(remote, expected_subject, expected_body) if remote else False
+    # POST succeeded → Instantly accepted the lead. Mark local sent now so
+    # the Leads-page status flips immediately, even if the read-back failed
+    # (which is a verification problem, not a delivery problem).
+    _mark_local_sent(content.id, new_remote_id)
     detail = "created" + ("" if verified else " (read-back unverified)")
     return OverwriteResult(
         lead_id=lead_id, status="created",
