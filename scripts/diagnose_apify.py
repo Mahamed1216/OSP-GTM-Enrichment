@@ -110,11 +110,6 @@ async def amain() -> int:
             settings.apify_actor_company_details,
             {"urls": [COMPANY_URL]},
         ),
-        (
-            "4. company_posts",
-            settings.apify_actor_company_posts,
-            {"companies": [COMPANY_URL], "maxPosts": 10},
-        ),
     ]
 
     failures: list[tuple[str, BaseException]] = []

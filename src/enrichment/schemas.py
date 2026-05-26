@@ -46,13 +46,6 @@ class CompanyDetails(BaseModel):
     raw: dict = Field(default_factory=dict)
 
 
-class CompanyPost(BaseModel):
-    text: Optional[str] = None
-    posted_at: Optional[str] = None
-    url: Optional[str] = None
-    raw: dict = Field(default_factory=dict)
-
-
 class NewsItem(BaseModel):
     title: str
     url: str

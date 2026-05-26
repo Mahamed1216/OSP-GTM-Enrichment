@@ -19,7 +19,6 @@ class Settings(BaseSettings):
     apify_actor_linkedin_profile: str = "dev_fusion/Linkedin-Profile-Scraper"
     apify_actor_linkedin_posts: str = "supreme_coder/linkedin-post"
     apify_actor_company_details: str = "rigelbytes/linkedin-company-details"
-    apify_actor_company_posts: str = "harvestapi/linkedin-company-posts"
 
     # Tavily
     tavily_api_key: str = ""

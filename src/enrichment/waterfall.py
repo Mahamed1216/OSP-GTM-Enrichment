@@ -19,7 +19,6 @@ from sqlalchemy import select
 
 from src.db import session_scope
 from src.enrichment.company_details import fetch_company_details
-from src.enrichment.company_posts import fetch_company_posts
 from src.enrichment.linkedin_posts import fetch_linkedin_posts
 from src.enrichment.linkedin_profile import fetch_linkedin_profile
 from src.enrichment.news import fetch_company_news, fetch_industry_news
@@ -118,7 +117,6 @@ async def enrich_lead(lead_id: int) -> dict:
         ("linkedin_profile", fetch_linkedin_profile(snapshot["linkedin_url"] or ""), bool(snapshot["linkedin_url"])),
         ("linkedin_posts", fetch_linkedin_posts(snapshot["linkedin_url"] or ""), bool(snapshot["linkedin_url"])),
         ("company_details", fetch_company_details(snapshot["company_linkedin_url"] or ""), bool(snapshot["company_linkedin_url"])),
-        ("company_posts", fetch_company_posts(snapshot["company_linkedin_url"] or ""), bool(snapshot["company_linkedin_url"])),
         ("company_news", fetch_company_news(snapshot["company"] or "", icp=icp), bool(snapshot["company"])),
         ("industry_news", fetch_industry_news(snapshot["industry"] or "", icp=icp), industry_input_present),
     ]
@@ -158,7 +156,6 @@ async def enrich_lead(lead_id: int) -> dict:
             existing.linkedin_profile = payload.get("linkedin_profile")
             existing.linkedin_posts = payload.get("linkedin_posts")
             existing.company_details = payload.get("company_details")
-            existing.company_posts = payload.get("company_posts")
             existing.company_news = payload.get("company_news")
             existing.industry_news = payload.get("industry_news")
             existing.source_status = status
@@ -168,7 +165,6 @@ async def enrich_lead(lead_id: int) -> dict:
                 linkedin_profile=payload.get("linkedin_profile"),
                 linkedin_posts=payload.get("linkedin_posts"),
                 company_details=payload.get("company_details"),
-                company_posts=payload.get("company_posts"),
                 company_news=payload.get("company_news"),
                 industry_news=payload.get("industry_news"),
                 source_status=status,

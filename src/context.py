@@ -21,7 +21,6 @@ def format_lead_context(
     *,
     include_score: bool = True,
     max_personal_posts: int = 5,
-    max_company_posts: int = 3,
     max_news: int = 5,
 ) -> str:
     parts: list[str] = [
@@ -69,14 +68,6 @@ def format_lead_context(
             parts.append(f"- {desc}")
         if cd.get("employee_count"):
             parts.append(f"- Employees: {cd.get('employee_count')}")
-
-    cposts = enrichment.company_posts or []
-    if cposts:
-        parts.append("\n## Company posts")
-        for p in cposts[:max_company_posts]:
-            text = _truncate(p.get("text"), 250)
-            if text:
-                parts.append(f"- {text}")
 
     cnews = enrichment.company_news or []
     if cnews:

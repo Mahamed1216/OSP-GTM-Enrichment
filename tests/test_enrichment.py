@@ -40,12 +40,11 @@ async def test_waterfall_does_not_raise_when_all_sources_fail(sample_lead_id):
     with patch("src.enrichment.waterfall.fetch_linkedin_profile", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_linkedin_posts", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_company_details", side_effect=_boom), \
-         patch("src.enrichment.waterfall.fetch_company_posts", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_company_news", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_industry_news", side_effect=_boom):
         status = await enrich_lead(sample_lead_id)
 
-    assert len(status) == 6
+    assert len(status) == 5
     assert all(s["success"] is False for s in status.values())
     assert all(s["error"] for s in status.values())
     assert all("duration_ms" in s for s in status.values())
@@ -59,7 +58,6 @@ async def test_waterfall_records_partial_success(sample_lead_id):
     with patch("src.enrichment.waterfall.fetch_linkedin_profile", side_effect=ok_profile), \
          patch("src.enrichment.waterfall.fetch_linkedin_posts", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_company_details", side_effect=_boom), \
-         patch("src.enrichment.waterfall.fetch_company_posts", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_company_news", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_industry_news", side_effect=_boom):
         status = await enrich_lead(sample_lead_id)
@@ -79,7 +77,6 @@ async def test_waterfall_persists_payload(sample_lead_id):
     with patch("src.enrichment.waterfall.fetch_linkedin_profile", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_linkedin_posts", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_company_details", side_effect=_boom), \
-         patch("src.enrichment.waterfall.fetch_company_posts", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_company_news", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_industry_news", side_effect=_boom):
         await enrich_lead(sample_lead_id)
@@ -90,7 +87,7 @@ async def test_waterfall_persists_payload(sample_lead_id):
         ).scalar_one_or_none()
         assert row is not None
         assert row.source_status
-        assert len(row.source_status) == 6
+        assert len(row.source_status) == 5
 
 
 @pytest.mark.asyncio
@@ -111,7 +108,6 @@ async def test_empty_payload_does_not_render_as_success(sample_lead_id):
     with patch("src.enrichment.waterfall.fetch_linkedin_profile", side_effect=empty_none), \
          patch("src.enrichment.waterfall.fetch_linkedin_posts", side_effect=empty_list), \
          patch("src.enrichment.waterfall.fetch_company_details", side_effect=empty_none), \
-         patch("src.enrichment.waterfall.fetch_company_posts", side_effect=empty_list), \
          patch("src.enrichment.waterfall.fetch_company_news", side_effect=empty_list), \
          patch("src.enrichment.waterfall.fetch_industry_news", side_effect=empty_list):
         status = await enrich_lead(sample_lead_id)
@@ -143,13 +139,12 @@ async def test_nonempty_payload_classified_as_ok(sample_lead_id):
     with patch("src.enrichment.waterfall.fetch_linkedin_profile", side_effect=ok_profile), \
          patch("src.enrichment.waterfall.fetch_linkedin_posts", side_effect=empty_list), \
          patch("src.enrichment.waterfall.fetch_company_details", side_effect=empty_list), \
-         patch("src.enrichment.waterfall.fetch_company_posts", side_effect=empty_list), \
          patch("src.enrichment.waterfall.fetch_company_news", side_effect=empty_list), \
          patch("src.enrichment.waterfall.fetch_industry_news", side_effect=empty_list):
         status = await enrich_lead(sample_lead_id)
 
     assert status["linkedin_profile"]["status"] == "ok"
     assert status["linkedin_profile"]["success"] is True
-    for other in ("linkedin_posts", "company_details", "company_posts", "company_news", "industry_news"):
+    for other in ("linkedin_posts", "company_details", "company_news", "industry_news"):
         assert status[other]["status"] in ("no_results", "skipped")
         assert status[other]["success"] is False
