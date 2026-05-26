@@ -129,22 +129,33 @@ if filtered.empty:
 
 st.caption(f"{len(filtered)} of {len(df)} leads")
 
-# ---------- Bulk select first N (operates on current filtered/sorted view) ----------
-nc1, nc2, _ = st.columns([1, 1, 4], vertical_alignment="bottom")
+# ---------- Bulk select range (operates on current filtered/sorted view) ----------
+nc1, nc2, nc3, _ = st.columns([1, 1, 1, 3], vertical_alignment="bottom")
+_n_total = len(filtered)
 with nc1:
-    _n_total = len(filtered)
-    select_n = st.number_input(
-        "Select first N leads",
+    select_from = st.number_input(
+        "From",
+        min_value=1,
+        max_value=_n_total,
+        value=min(1, _n_total),
+        step=1,
+        key="leads_select_from",
+    )
+with nc2:
+    select_to = st.number_input(
+        "To",
         min_value=1,
         max_value=_n_total,
         value=min(50, _n_total),
         step=1,
-        key="leads_select_n",
+        key="leads_select_to",
     )
-with nc2:
-    if st.button("Select", key="leads_select_n_btn"):
+with nc3:
+    if st.button("Select", key="leads_select_range_btn"):
+        lo = max(1, int(min(select_from, select_to)))
+        hi = min(_n_total, int(max(select_from, select_to)))
         st.session_state["leads_table"] = {
-            "selection": {"rows": list(range(int(select_n))), "columns": []}
+            "selection": {"rows": list(range(lo - 1, hi)), "columns": []}
         }
         st.rerun()
 
