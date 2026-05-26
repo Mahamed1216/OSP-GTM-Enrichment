@@ -32,6 +32,7 @@ from app.lib.db_queries import (
     last_sync_time,
     recent_engagement,
     reply_rate_series,
+    sent_emails,
 )
 from app.styles import inject_styles
 
@@ -79,6 +80,37 @@ def _negatives_cached() -> list[dict]:
 @st.cache_data(ttl=15)
 def _recent_engagement_cached(limit: int) -> "pd.DataFrame":
     return recent_engagement(limit=limit)
+
+
+@st.cache_data(ttl=15)
+def _sent_emails_cached() -> "pd.DataFrame":
+    return sent_emails()
+
+
+def _format_event_when(ts) -> str:
+    if ts is None or pd.isna(ts):
+        return "—"
+    try:
+        return ts.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(ts)
+
+
+def _event_status_icons(row) -> str:
+    parts = []
+    if row.get("bounced"):
+        parts.append("❌ bounced")
+    if row.get("replied"):
+        parts.append("✉️ reply")
+    if row.get("clicked"):
+        parts.append("🔗 click")
+    if row.get("opened"):
+        parts.append("👁 open")
+    if row.get("delivered"):
+        parts.append("✓ deliv")
+    elif row.get("sent"):
+        parts.append("✓ sent")
+    return " · ".join(parts) if parts else "—"
 
 
 def _entry_body(entry: dict) -> str:
@@ -413,14 +445,68 @@ if recent_df.empty:
         "(provided you have an INSTANTLY_API_KEY set and at least one email delivered)."
     )
 else:
-    pretty = recent_df.copy()
-    for col in ("sent", "delivered", "opened", "clicked", "replied"):
-        pretty[col] = pretty[col].map(lambda v: "✓" if v else "—")
-    pretty["bounced"] = pretty["bounced"].map(lambda v: "❌" if v else "—")
-    pretty["kind"] = pretty["kind"].map(lambda k: _KIND_LABELS.get(k, k))
-    pretty = pretty.rename(columns={
-        "synced_at": "When", "lead": "Lead", "company": "Company", "kind": "Type",
-        "sent": "Sent", "delivered": "Deliv", "opened": "Open", "clicked": "Click",
-        "replied": "Reply", "bounced": "Bounce",
+    st.caption("Click a row to see the email that was sent.")
+    for _, row in recent_df.iterrows():
+        when = _format_event_when(row["synced_at"])
+        lead = row["lead"] or "(unknown lead)"
+        company = row["company"]
+        kind_label = _KIND_LABELS.get(row["kind"], row["kind"])
+        status = _event_status_icons(row)
+        header_bits = [when, lead]
+        if company:
+            header_bits.append(company)
+        header_bits.append(kind_label)
+        header_bits.append(status)
+        header = " · ".join(header_bits)
+        with st.expander(header):
+            subject = row.get("subject") or ""
+            body = row.get("body") or ""
+            if subject:
+                st.markdown(f"**Subject:** {subject}")
+            if body:
+                st.markdown("**Body:**")
+                st.text(body)
+            if not subject and not body:
+                st.caption("No stored content for this event.")
+
+st.divider()
+
+# ---------- Sent folder ----------
+st.subheader("Sent folder")
+st.caption("All emails successfully pushed to Instantly. Newest first.")
+try:
+    sent_df = _sent_emails_cached()
+except Exception as exc:
+    st.error(f"Could not load sent folder: {exc}")
+    sent_df = pd.DataFrame()
+
+if sent_df.empty:
+    st.info("Nothing here yet — push an email to Instantly from a lead's detail page.")
+else:
+    summary_df = pd.DataFrame({
+        "Lead": sent_df["lead"],
+        "Company": sent_df["company"],
+        "Email subject": sent_df["subject"],
+        "Sent at": sent_df["sent_at"].map(_format_event_when),
     })
-    st.dataframe(pretty, hide_index=True, width="stretch", key="eng_recent_events_table")
+    st.dataframe(summary_df, hide_index=True, width="stretch", key="eng_sent_folder_table")
+    st.caption("Expand a row below to read the full email body.")
+    for _, row in sent_df.iterrows():
+        when = _format_event_when(row["sent_at"])
+        lead = row["lead"] or "(unknown lead)"
+        company = row["company"]
+        subject = row["subject"] or "(no subject)"
+        header_bits = [when, lead]
+        if company:
+            header_bits.append(company)
+        header_bits.append(subject)
+        header = " · ".join(header_bits)
+        with st.expander(header):
+            if row["subject"]:
+                st.markdown(f"**Subject:** {row['subject']}")
+            body = row["body"] or ""
+            if body:
+                st.markdown("**Body:**")
+                st.text(body)
+            else:
+                st.caption("No body stored for this send.")
