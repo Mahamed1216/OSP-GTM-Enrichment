@@ -30,6 +30,10 @@ def _parse(raw: dict) -> LinkedInProfile:
 async def fetch_linkedin_profile(profile_url: str) -> Optional[LinkedInProfile]:
     if not profile_url:
         return None
+    if profile_url.startswith("http://"):
+        profile_url = "https://" + profile_url[7:]
+    if "://www." not in profile_url:
+        profile_url = profile_url.replace("://", "://www.", 1)
     items = await run_actor(
         settings.apify_actor_linkedin_profile,
         run_input={"profileUrls": [profile_url]},
