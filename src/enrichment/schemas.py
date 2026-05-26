@@ -1,7 +1,7 @@
 """Pydantic schemas for enrichment module outputs."""
-from typing import Any, Optional
+from typing import Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 
 class LinkedInProfile(BaseModel):
@@ -12,26 +12,6 @@ class LinkedInProfile(BaseModel):
     current_company: Optional[str] = None
     current_title: Optional[str] = None
     raw: dict = Field(default_factory=dict)
-
-
-class LinkedInPost(BaseModel):
-    text: Optional[str] = None
-    posted_at: Optional[str] = None
-    url: Optional[str] = None
-    likes: Optional[int] = None
-    comments: Optional[int] = None
-    raw: dict = Field(default_factory=dict)
-
-    # Some Apify actors (e.g. supreme_coder/linkedin-post) return `comments`
-    # and reaction fields as lists of objects rather than counts. Downstream
-    # consumers (scoring prompts, UI badges) want a number, so collapse
-    # list-shaped inputs to len() at validation time.
-    @field_validator("comments", "likes", mode="before")
-    @classmethod
-    def _coerce_list_to_count(cls, v: Any) -> Any:
-        if isinstance(v, list):
-            return len(v)
-        return v
 
 
 class CompanyDetails(BaseModel):

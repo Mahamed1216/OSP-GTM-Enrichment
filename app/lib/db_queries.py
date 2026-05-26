@@ -437,7 +437,6 @@ def get_lead_full(lead_id: int) -> dict[str, Any] | None:
         if enrichment is not None:
             enrichment_dict = {
                 "linkedin_profile": enrichment.linkedin_profile,
-                "linkedin_posts": enrichment.linkedin_posts,
                 "company_details": enrichment.company_details,
                 "company_news": enrichment.company_news,
                 "industry_news": enrichment.industry_news,

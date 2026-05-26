@@ -20,7 +20,6 @@ def format_lead_context(
     score: Optional[Score] = None,
     *,
     include_score: bool = True,
-    max_personal_posts: int = 5,
     max_news: int = 5,
 ) -> str:
     parts: list[str] = [
@@ -50,15 +49,6 @@ def format_lead_context(
         about = _truncate(prof.get("about"), 600)
         if about:
             parts.append(f"- About: {about}")
-
-    posts = enrichment.linkedin_posts or []
-    if posts:
-        parts.append("\n## Recent personal posts")
-        for p in posts[:max_personal_posts]:
-            text = _truncate(p.get("text"), 300)
-            if text:
-                date = p.get("posted_at") or ""
-                parts.append(f"- [{date}] {text}" if date else f"- {text}")
 
     if enrichment.company_details:
         cd = enrichment.company_details

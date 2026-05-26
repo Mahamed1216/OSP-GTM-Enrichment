@@ -3,32 +3,8 @@ from unittest.mock import patch
 
 import pytest
 
-from src.enrichment.schemas import LinkedInPost, LinkedInProfile
+from src.enrichment.schemas import LinkedInProfile
 from src.enrichment.waterfall import enrich_lead
-
-
-def test_linkedin_post_coerces_list_payload_to_count():
-    """supreme_coder/linkedin-post returns comments/reactions as lists of
-    objects; downstream code wants counts. Validator must collapse to len()
-    so both shapes produce the same integer."""
-    as_int = LinkedInPost(comments=3, likes=42)
-    assert as_int.comments == 3
-    assert as_int.likes == 42
-
-    comment_list = [
-        {"time": 1776617879627, "ce": {"OUT_OF_NETWORK": True}},
-        {"time": 1776617879628, "ce": {"OUT_OF_NETWORK": False}},
-        {"time": 1776617879629, "ce": {}},
-    ]
-    likes_list = [{"reactor": f"u{i}"} for i in range(42)]
-    as_list = LinkedInPost(comments=comment_list, likes=likes_list)
-    assert as_list.comments == 3
-    assert as_list.likes == 42
-
-    assert as_list.comments == as_int.comments
-    assert as_list.likes == as_int.likes
-    assert isinstance(as_list.comments, int)
-    assert isinstance(as_list.likes, int)
 
 
 async def _boom(*args, **kwargs):
@@ -38,13 +14,12 @@ async def _boom(*args, **kwargs):
 @pytest.mark.asyncio
 async def test_waterfall_does_not_raise_when_all_sources_fail(sample_lead_id):
     with patch("src.enrichment.waterfall.fetch_linkedin_profile", side_effect=_boom), \
-         patch("src.enrichment.waterfall.fetch_linkedin_posts", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_company_details", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_company_news", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_industry_news", side_effect=_boom):
         status = await enrich_lead(sample_lead_id)
 
-    assert len(status) == 5
+    assert len(status) == 4
     assert all(s["success"] is False for s in status.values())
     assert all(s["error"] for s in status.values())
     assert all("duration_ms" in s for s in status.values())
@@ -56,14 +31,13 @@ async def test_waterfall_records_partial_success(sample_lead_id):
         return LinkedInProfile(full_name="Test User", headline="VP of Sales", raw={"x": 1})
 
     with patch("src.enrichment.waterfall.fetch_linkedin_profile", side_effect=ok_profile), \
-         patch("src.enrichment.waterfall.fetch_linkedin_posts", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_company_details", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_company_news", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_industry_news", side_effect=_boom):
         status = await enrich_lead(sample_lead_id)
 
     assert status["linkedin_profile"]["success"] is True
-    assert status["linkedin_posts"]["success"] is False
+    assert status["company_details"]["success"] is False
 
 
 @pytest.mark.asyncio
@@ -75,7 +49,6 @@ async def test_waterfall_persists_payload(sample_lead_id):
     from src.models import Enrichment
 
     with patch("src.enrichment.waterfall.fetch_linkedin_profile", side_effect=_boom), \
-         patch("src.enrichment.waterfall.fetch_linkedin_posts", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_company_details", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_company_news", side_effect=_boom), \
          patch("src.enrichment.waterfall.fetch_industry_news", side_effect=_boom):
@@ -87,7 +60,7 @@ async def test_waterfall_persists_payload(sample_lead_id):
         ).scalar_one_or_none()
         assert row is not None
         assert row.source_status
-        assert len(row.source_status) == 5
+        assert len(row.source_status) == 4
 
 
 @pytest.mark.asyncio
@@ -106,7 +79,6 @@ async def test_empty_payload_does_not_render_as_success(sample_lead_id):
         return None
 
     with patch("src.enrichment.waterfall.fetch_linkedin_profile", side_effect=empty_none), \
-         patch("src.enrichment.waterfall.fetch_linkedin_posts", side_effect=empty_list), \
          patch("src.enrichment.waterfall.fetch_company_details", side_effect=empty_none), \
          patch("src.enrichment.waterfall.fetch_company_news", side_effect=empty_list), \
          patch("src.enrichment.waterfall.fetch_industry_news", side_effect=empty_list):
@@ -137,7 +109,6 @@ async def test_nonempty_payload_classified_as_ok(sample_lead_id):
         return []
 
     with patch("src.enrichment.waterfall.fetch_linkedin_profile", side_effect=ok_profile), \
-         patch("src.enrichment.waterfall.fetch_linkedin_posts", side_effect=empty_list), \
          patch("src.enrichment.waterfall.fetch_company_details", side_effect=empty_list), \
          patch("src.enrichment.waterfall.fetch_company_news", side_effect=empty_list), \
          patch("src.enrichment.waterfall.fetch_industry_news", side_effect=empty_list):
@@ -145,6 +116,6 @@ async def test_nonempty_payload_classified_as_ok(sample_lead_id):
 
     assert status["linkedin_profile"]["status"] == "ok"
     assert status["linkedin_profile"]["success"] is True
-    for other in ("linkedin_posts", "company_details", "company_news", "industry_news"):
+    for other in ("company_details", "company_news", "industry_news"):
         assert status[other]["status"] in ("no_results", "skipped")
         assert status[other]["success"] is False

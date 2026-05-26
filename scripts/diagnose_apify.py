@@ -101,11 +101,6 @@ async def amain() -> int:
             {"profileUrls": [PROFILE_URL]},
         ),
         (
-            "2. linkedin_posts (using 'urls' per API error)",
-            settings.apify_actor_linkedin_posts,
-            {"urls": [PROFILE_URL], "limit": 10},
-        ),
-        (
             "3. company_details (using 'urls' per API error)",
             settings.apify_actor_company_details,
             {"urls": [COMPANY_URL]},

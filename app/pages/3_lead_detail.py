@@ -29,7 +29,6 @@ _KIND_LABELS = {
 }
 _PAYLOAD_COLUMNS = [
     "linkedin_profile",
-    "linkedin_posts",
     "company_details",
     "company_news",
     "industry_news",
