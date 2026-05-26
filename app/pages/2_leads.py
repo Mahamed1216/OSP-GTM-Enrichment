@@ -71,8 +71,19 @@ if df.empty:
 # in their own DOM tree, so this div mostly serves as visual scaffolding and
 # may not wrap the widgets at the DOM level. Kept for parity with the rest
 # of the design system (see .filter-row in app/styles.py).
+def _on_sent_change() -> None:
+    """When 'Sent only' is checked, clear 'Not sent' so the pair stays exclusive."""
+    if st.session_state.get("leads_filter_sent"):
+        st.session_state["leads_filter_not_sent"] = False
+
+
+def _on_not_sent_change() -> None:
+    if st.session_state.get("leads_filter_not_sent"):
+        st.session_state["leads_filter_sent"] = False
+
+
 st.markdown('<div class="filter-row">', unsafe_allow_html=True)
-fc1, fc2, fc3, _ = st.columns([2, 1, 1, 3])
+fc1, fc2, fc3, fc4, _ = st.columns([2, 1, 1, 1, 2])
 with fc1:
     tier_filter = st.multiselect(
         "Tier",
@@ -82,8 +93,14 @@ with fc1:
         placeholder="All tiers",
     )
 with fc2:
-    sent_only = st.checkbox("Sent only", key="leads_filter_sent")
+    sent_only = st.checkbox(
+        "Sent only", key="leads_filter_sent", on_change=_on_sent_change
+    )
 with fc3:
+    not_sent_only = st.checkbox(
+        "Not sent", key="leads_filter_not_sent", on_change=_on_not_sent_change
+    )
+with fc4:
     enriched_only = st.checkbox("Has enrichment", key="leads_filter_enriched")
 st.markdown('</div>', unsafe_allow_html=True)
 
@@ -92,6 +109,8 @@ if tier_filter:
     filtered = filtered[filtered["Tier"].isin(tier_filter)]
 if sent_only:
     filtered = filtered[filtered["Sent"]]
+if not_sent_only:
+    filtered = filtered[~filtered["Sent"].astype(bool)]
 if enriched_only:
     filtered = filtered[filtered["Enriched"]]
 
@@ -109,6 +128,25 @@ if filtered.empty:
     st.stop()
 
 st.caption(f"{len(filtered)} of {len(df)} leads")
+
+# ---------- Bulk select first N (operates on current filtered/sorted view) ----------
+nc1, nc2, _ = st.columns([1, 1, 4], vertical_alignment="bottom")
+with nc1:
+    _n_total = len(filtered)
+    select_n = st.number_input(
+        "Select first N leads",
+        min_value=1,
+        max_value=_n_total,
+        value=min(50, _n_total),
+        step=1,
+        key="leads_select_n",
+    )
+with nc2:
+    if st.button("Select", key="leads_select_n_btn"):
+        st.session_state["leads_table"] = {
+            "selection": {"rows": list(range(int(select_n))), "columns": []}
+        }
+        st.rerun()
 
 selection = st.dataframe(
     display_df,
