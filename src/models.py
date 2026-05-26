@@ -164,3 +164,22 @@ class WinningExample(Base):
     reply_rate: Mapped[float] = mapped_column(Float, default=0.0)
     manually_flagged: Mapped[bool] = mapped_column(Boolean, default=False)
     promoted_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+
+
+class PromptConfig(Base):
+    """User-edited overrides for the three content-generation system prompts.
+
+    Persisted in the DB (not data/prompts_config.json) so Streamlit Cloud
+    deploys don't wipe overrides — local disk is ephemeral there. One row
+    per channel; saves upsert by channel.
+    """
+    __tablename__ = "prompt_configs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    channel: Mapped[str] = mapped_column(
+        String(32), unique=True, nullable=False, index=True
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=now_utc, onupdate=now_utc, nullable=False
+    )
