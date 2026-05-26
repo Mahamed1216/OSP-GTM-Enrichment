@@ -19,7 +19,12 @@ from app.styles import inject_styles
 from src.config import settings
 from src.db import session_scope
 from src.delivery.eligibility import SKIP_LABELS, filter_eligible, summarize_skips
-from src.delivery.instantly import deliver_email, get_campaign, overwrite_lead_copy
+from src.delivery.instantly import (
+    debug_overwrite_one_lead,
+    deliver_email,
+    get_campaign,
+    overwrite_lead_copy,
+)
 from src.db import session_scope as _delete_session_scope
 from src.leads import delete_lead, reset_lead_sequence
 
@@ -536,3 +541,131 @@ if selected_lead_ids:
                         st.write(f"- lead {lid} — {detail}")
 
             st.session_state.pop("overwrite_ack", None)
+
+    # ---------- Debug Instantly overwrite for selected lead ----------
+    # Temporary diagnostic. Runs ONE search + ONE PATCH + ONE GET on a
+    # single lead, no retries, and dumps every URL / body / status / JSON
+    # so we can prove which of A-E is true (wrong id / wrong endpoint /
+    # wrong body / wrong key / unsupported). Does not delete, does not
+    # activate the campaign, does not touch multiple leads.
+    with st.container(border=True):
+        st.markdown("**Debug Instantly overwrite for selected lead**")
+        debug_enabled = (n_selected == 1)
+        if not debug_enabled:
+            st.caption(
+                f"Select exactly one lead to enable (currently selected: {n_selected})."
+            )
+        debug_clicked = st.button(
+            "Debug Instantly overwrite for selected lead",
+            key="debug_overwrite_btn",
+            disabled=not debug_enabled,
+            type="secondary",
+            help=(
+                "Single lead. Captures the real Instantly API request URL, "
+                "request body, response status, and response JSON for the "
+                "search + PATCH + read-back round trip. No retries — failures "
+                "surface verbatim."
+            ),
+        )
+        if debug_clicked and debug_enabled:
+            target_lid = int(selected_lead_ids[0])
+            with st.spinner(f"Running diagnostic on lead {target_lid}…"):
+                try:
+                    debug = run_async(debug_overwrite_one_lead(target_lid))
+                except Exception as exc:
+                    st.error(f"Diagnostic crashed: {type(exc).__name__}: {exc}")
+                    debug = None
+            if debug:
+                # 1-5: local-side facts
+                st.markdown("### 1–5 · Local state")
+                st.write(f"1. **Local lead id:** `{debug['local_lead_id']}`")
+                st.write(f"2. **Local email:** `{debug['local_email']}`")
+                st.write(
+                    f"3. **Local latest email subject:** "
+                    f"`{debug['local_latest_subject']}`"
+                )
+                st.write("4. **Local latest email body preview (first 280 chars):**")
+                st.code(debug["local_latest_body_preview"] or "")
+                st.write(f"5. **Campaign id:** `{debug['campaign_id']}`")
+
+                # 6-9: search round-trip
+                st.markdown("### 6–9 · Instantly search round-trip")
+                search = debug.get("search") or {}
+                st.write(f"6. **Endpoint:** `POST {search.get('request_url')}`")
+                st.write("7. **Request body:**")
+                st.json(search.get("request_body"))
+                st.write(
+                    f"8. **Response status:** `{search.get('status')}`"
+                    + (f" — error: `{search['error']}`" if search.get("error") else "")
+                )
+                with st.expander("9. Full search response JSON"):
+                    if search.get("response_json") is not None:
+                        st.json(search["response_json"])
+                    else:
+                        st.code(search.get("response_text") or "(no body)")
+                st.caption(
+                    f"Matches with exact email: **{debug.get('search_match_count', 0)}**"
+                )
+
+                # 10: which lead we picked
+                st.markdown("### 10 · Selected remote lead")
+                st.write(
+                    f"10. **Instantly lead id:** "
+                    f"`{debug.get('selected_remote_lead_id') or '(none)'}`"
+                )
+                snapshot = debug.get("selected_remote_lead_snapshot")
+                if snapshot:
+                    with st.expander("Snapshot from search response"):
+                        st.json(snapshot)
+
+                # 11-14: PATCH round-trip
+                st.markdown("### 11–14 · Instantly update (PATCH) round-trip")
+                update = debug.get("update") or {}
+                st.write(f"11. **Endpoint:** `PATCH {update.get('request_url')}`")
+                st.write("12. **Request body:**")
+                st.json(update.get("request_body"))
+                st.write(
+                    f"13. **Response status:** `{update.get('status')}`"
+                    + (f" — error: `{update['error']}`" if update.get("error") else "")
+                )
+                with st.expander("14. Full update response JSON"):
+                    if update.get("response_json") is not None:
+                        st.json(update["response_json"])
+                    else:
+                        st.code(update.get("response_text") or "(no body)")
+
+                # 15-17: read-back round-trip
+                st.markdown("### 15–17 · Read-back (GET) round-trip")
+                readback = debug.get("readback") or {}
+                st.write(f"15. **Endpoint:** `GET {readback.get('request_url')}`")
+                st.write(
+                    f"16. **Response status:** `{readback.get('status')}`"
+                    + (f" — error: `{readback['error']}`" if readback.get("error") else "")
+                )
+                with st.expander("17. Full read-back response JSON"):
+                    if readback.get("response_json") is not None:
+                        st.json(readback["response_json"])
+                    else:
+                        st.code(readback.get("response_text") or "(no body)")
+
+                # 18-20: comparison
+                st.markdown("### 18–20 · Comparison")
+                st.write(
+                    f"18. **Remote `personalized_subject` after PATCH:** "
+                    f"`{debug.get('remote_subject_after')}`"
+                )
+                body_after = debug.get("remote_body_after") or ""
+                st.write("19. **Remote `personalized_body` after PATCH (first 280 chars):**")
+                st.code(body_after[:280] if body_after else "(none)")
+                comp = debug.get("comparison") or {}
+                col_a, col_b = st.columns(2)
+                col_a.metric("subject_match", str(comp.get("subject_match")))
+                col_b.metric("body_match", str(comp.get("body_match")))
+                st.write("20. **Verdict:**")
+                if comp.get("subject_match") and comp.get("body_match"):
+                    st.success(debug.get("verdict") or "match")
+                else:
+                    st.error(debug.get("verdict") or "mismatch")
+
+                with st.expander("Raw diagnostic dict (everything above, structured)"):
+                    st.json(debug)

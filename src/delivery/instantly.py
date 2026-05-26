@@ -389,14 +389,23 @@ def _latest_email_content_for(lead_id: int) -> tuple[Lead | None, GeneratedConte
 
 
 def _read_back_matches(remote: dict, expected_subject: str, expected_body: str) -> bool:
-    """Verify Instantly returned the custom_variables we just wrote."""
-    cv = remote.get("custom_variables") or {}
-    if not isinstance(cv, dict):
-        return False
-    return (
-        str(cv.get("personalized_subject") or "") == (expected_subject or "")
-        and str(cv.get("personalized_body") or "") == (expected_body or "")
-    )
+    """Verify Instantly returned the custom_variables we just wrote.
+
+    Empirically, Instantly v2 surfaces custom variables under the top-level
+    `payload` key (confirmed by dumping live lead responses on the
+    OSP_GTM_TEST campaign — `custom_variables` was never present). We
+    accept either key so the check survives any future API change.
+    """
+    for key in ("payload", "custom_variables"):
+        container = remote.get(key)
+        if not isinstance(container, dict):
+            continue
+        if (
+            str(container.get("personalized_subject") or "") == (expected_subject or "")
+            and str(container.get("personalized_body") or "") == (expected_body or "")
+        ):
+            return True
+    return False
 
 
 async def overwrite_lead_copy(
@@ -535,3 +544,204 @@ async def overwrite_lead_copy(
         lead_id=lead_id, status="created",
         detail=detail, remote_lead_id=new_remote_id or None,
     )
+
+
+# ---------------------------------------------------------------------------
+# One-lead diagnostic — temporary, for proving what Instantly actually does
+# ---------------------------------------------------------------------------
+
+async def _raw_request(
+    method: str, url: str, *, json_body: dict | None = None,
+) -> dict:
+    """Issue a raw httpx call (no retries) and capture the full response.
+
+    Used by the debug flow so failures, error bodies, and unexpected shapes
+    surface verbatim instead of being eaten by @retry_api. Returns a dict
+    with request_url, request_body, status, response_json, response_text.
+    """
+    safe_headers = {"Authorization": "Bearer ***REDACTED***", "Content-Type": "application/json"}
+    record: dict = {
+        "method": method,
+        "request_url": url,
+        "request_headers": safe_headers,
+        "request_body": json_body,
+        "status": None,
+        "response_json": None,
+        "response_text": None,
+        "error": None,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=_CLIENT_TIMEOUT) as client:
+            resp = await client.request(
+                method, url, headers=_auth_headers(), json=json_body,
+            )
+        record["status"] = resp.status_code
+        text = resp.text
+        record["response_text"] = text
+        try:
+            record["response_json"] = resp.json()
+        except Exception:
+            record["response_json"] = None
+    except Exception as exc:
+        record["error"] = f"{type(exc).__name__}: {exc}"
+    return record
+
+
+async def debug_overwrite_one_lead(lead_id: int) -> dict:
+    """Run the overwrite flow for one lead with FULL HTTP capture.
+
+    Does not delete, does not activate the campaign, does not retry. Only
+    touches the single lead identified by `lead_id` and its matching
+    Instantly record. Captures the 20 fields the operator needs to tell
+    apart wrong-id / wrong-endpoint / wrong-body / wrong-key / not-supported.
+
+    Always returns a dict (never raises). Caller renders it in the UI.
+    """
+    out: dict = {
+        "local_lead_id": lead_id,
+        "local_email": None,
+        "local_latest_subject": None,
+        "local_latest_body_preview": None,
+        "local_latest_body": None,
+        "campaign_id": settings.instantly_campaign_id,
+        "search": None,
+        "search_match_count": 0,
+        "selected_remote_lead_id": None,
+        "selected_remote_lead_snapshot": None,
+        "update": None,
+        "readback": None,
+        "remote_subject_after": None,
+        "remote_body_after": None,
+        "comparison": None,
+        "verdict": None,
+    }
+
+    if not settings.instantly_api_key or not settings.instantly_campaign_id:
+        out["verdict"] = "INSTANTLY_API_KEY or INSTANTLY_CAMPAIGN_ID not configured"
+        return out
+
+    lead, content = _latest_email_content_for(lead_id)
+    if lead is None:
+        out["verdict"] = f"lead {lead_id} not found locally"
+        return out
+    if content is None:
+        out["verdict"] = "no email content generated locally for this lead"
+        out["local_email"] = lead.email
+        return out
+
+    out["local_email"] = lead.email
+    out["local_latest_subject"] = content.subject
+    body = content.body or ""
+    out["local_latest_body"] = body
+    out["local_latest_body_preview"] = body[:280]
+
+    # --- 1) Search Instantly for the lead by email + campaign ---
+    search_url = f"{_API_BASE}/leads/list"
+    search_body = {
+        "campaign": settings.instantly_campaign_id,
+        "search": lead.email,
+        "limit": 50,
+    }
+    out["search"] = await _raw_request("POST", search_url, json_body=search_body)
+    items: list[dict] = []
+    if out["search"] and isinstance(out["search"].get("response_json"), dict):
+        payload = out["search"]["response_json"]
+        for key in ("items", "data", "leads"):
+            v = payload.get(key)
+            if isinstance(v, list):
+                items = v
+                break
+    target = (lead.email or "").strip().lower()
+    matches = [
+        it for it in items
+        if isinstance(it, dict)
+        and str(it.get("email") or "").strip().lower() == target
+    ]
+    out["search_match_count"] = len(matches)
+
+    if not matches:
+        out["verdict"] = (
+            "No matching lead in Instantly campaign — overwrite would create "
+            "a new lead. Check campaign_id + email casing."
+        )
+        return out
+    if len(matches) > 1:
+        out["verdict"] = (
+            f"{len(matches)} matching leads in campaign — refusing to update "
+            f"any to avoid touching the wrong record. De-dupe in Instantly."
+        )
+        return out
+
+    remote = matches[0]
+    remote_id = str(remote.get("id") or remote.get("lead_id") or "")
+    out["selected_remote_lead_id"] = remote_id
+    out["selected_remote_lead_snapshot"] = remote
+    if not remote_id:
+        out["verdict"] = "matched lead has no id in search response"
+        return out
+
+    # --- 2) PATCH the lead's custom variables (same body shape the production
+    #         orchestrator uses, so the diagnostic reveals real behavior) ---
+    update_url = f"{_API_BASE}/leads/{remote_id}"
+    update_body = {
+        "custom_variables": {
+            "personalized_subject": content.subject or "",
+            "personalized_body": body,
+            "signals_cited": ", ".join(content.signals_cited or []),
+        }
+    }
+    out["update"] = await _raw_request("PATCH", update_url, json_body=update_body)
+
+    # --- 3) Read back the lead and surface what Instantly actually stored ---
+    readback_url = f"{_API_BASE}/leads/{remote_id}"
+    out["readback"] = await _raw_request("GET", readback_url)
+
+    rb_json = (out["readback"] or {}).get("response_json") or {}
+    # Custom vars empirically live under `payload`; also check `custom_variables`
+    # in case Instantly ever returns them there.
+    sub_after = None
+    body_after = None
+    for container_key in ("payload", "custom_variables"):
+        container = rb_json.get(container_key)
+        if isinstance(container, dict):
+            if sub_after is None and container.get("personalized_subject"):
+                sub_after = container.get("personalized_subject")
+            if body_after is None and container.get("personalized_body"):
+                body_after = container.get("personalized_body")
+    out["remote_subject_after"] = sub_after
+    out["remote_body_after"] = body_after
+
+    subject_match = (sub_after or "") == (content.subject or "")
+    body_match = (body_after or "") == body
+    out["comparison"] = {
+        "subject_match": subject_match,
+        "body_match": body_match,
+        "expected_subject": content.subject,
+        "expected_body_preview": body[:280],
+        "actual_subject": sub_after,
+        "actual_body_preview": (body_after or "")[:280],
+    }
+
+    update_status = (out["update"] or {}).get("status")
+    if subject_match and body_match:
+        out["verdict"] = "SUCCESS — Instantly returned the values we wrote."
+    elif update_status and 200 <= int(update_status) < 300:
+        out["verdict"] = (
+            f"PATCH returned HTTP {update_status} but read-back shows the "
+            f"values were not updated. Likely cause: request body shape — "
+            f"Instantly may require `payload: {{...}}` instead of "
+            f"`custom_variables: {{...}}` on PATCH, or this endpoint does "
+            f"not support updating these variables at all."
+        )
+    elif update_status:
+        out["verdict"] = (
+            f"PATCH failed with HTTP {update_status}. Inspect 'update' "
+            f"response_json/response_text for Instantly's error message — "
+            f"that determines whether it's a wrong endpoint, wrong body, or "
+            f"unsupported operation."
+        )
+    else:
+        out["verdict"] = (
+            "PATCH never returned (network/timeout). See 'update.error'."
+        )
+    return out
