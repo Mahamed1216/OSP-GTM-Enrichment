@@ -51,19 +51,40 @@ def _truthy(value) -> bool:
 def _parse_metrics(raw: dict) -> dict:
     """Normalize Instantly's per-lead response into our Engagement field set.
 
-    Instantly v2 exposes `emails_sent_count`, `email_open_count`,
-    `email_reply_count`, `email_click_count`, and bounce flags on the lead
-    record. We treat any nonzero/truthy as "happened". `raw` is preserved.
+    Field map (verified against live `/api/v2/leads/{id}` responses on the
+    OSP_GTM_TEST campaign, 296-row sample):
+
+      sent/delivered → `timestamp_last_contact` (alias `timestamp_last_touch`)
+        present iff Instantly has fired at least one outbound email. The
+        documented `emails_sent_count` field is NOT in the lead payload —
+        relying on it leaves every row at sent=False, which is what bit us.
+      opened  → `email_open_count > 0`
+      clicked → `email_click_count > 0`
+      replied → `email_reply_count > 0`
+      bounced → status == -1 (Bounced) or any of the legacy bounce fields
+
+    `raw` is preserved verbatim so we can re-derive flags via the backfill
+    in scripts/backfill_engagement_flags.py without re-hitting the API.
     """
+    status = raw.get("status")
+    bounced_status = isinstance(status, int) and status == -1
+    # A bounced lead reached the SMTP layer, so Instantly counts it as
+    # "sent". Treat any timestamp_last_contact OR bounce as proof of send.
+    sent_signal = _truthy(
+        raw.get("timestamp_last_contact")
+        or raw.get("timestamp_last_touch")
+        or raw.get("emails_sent_count")
+        or raw.get("sent")
+    ) or bounced_status
+
     return {
-        "sent": _truthy(raw.get("emails_sent_count") or raw.get("sent")),
-        "delivered": _truthy(
-            raw.get("delivered") or raw.get("emails_sent_count")
-        ),
+        "sent": sent_signal,
+        "delivered": sent_signal,
         "opened": _truthy(raw.get("email_open_count") or raw.get("opened")),
         "clicked": _truthy(raw.get("email_click_count") or raw.get("clicked")),
         "replied": _truthy(raw.get("email_reply_count") or raw.get("replied")),
-        "bounced": _truthy(raw.get("bounced") or raw.get("email_bounce_count")),
+        "bounced": bounced_status
+        or _truthy(raw.get("bounced") or raw.get("email_bounce_count")),
         "raw": raw,
     }
 
