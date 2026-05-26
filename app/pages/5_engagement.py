@@ -490,18 +490,30 @@ else:
         "Sent at": sent_df["sent_at"].map(_format_event_when),
     })
     st.dataframe(summary_df, hide_index=True, width="stretch", key="eng_sent_folder_table")
-    st.caption("Expand a row below to read the full email body.")
+
+    option_labels: dict[int, str] = {}
     for _, row in sent_df.iterrows():
         when = _format_event_when(row["sent_at"])
         lead = row["lead"] or "(unknown lead)"
         company = row["company"]
         subject = row["subject"] or "(no subject)"
-        header_bits = [when, lead]
+        bits = [when, lead]
         if company:
-            header_bits.append(company)
-        header_bits.append(subject)
-        header = " · ".join(header_bits)
-        with st.expander(header):
+            bits.append(company)
+        bits.append(subject)
+        option_labels[int(row["content_id"])] = " · ".join(bits)
+
+    selected_id = st.selectbox(
+        "Select a lead to view email",
+        options=list(option_labels.keys()),
+        format_func=lambda cid: option_labels[cid],
+        index=None,
+        placeholder="Choose a sent email…",
+        key="eng_sent_folder_select",
+    )
+    if selected_id is not None:
+        row = sent_df.loc[sent_df["content_id"] == selected_id].iloc[0]
+        with st.container(border=True):
             if row["subject"]:
                 st.markdown(f"**Subject:** {row['subject']}")
             body = row["body"] or ""
