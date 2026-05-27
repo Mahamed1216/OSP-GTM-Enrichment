@@ -1,10 +1,10 @@
-name: Daily Engagement Sync
+name: Daily Campaign Analytics Sync
 
 on:
   schedule:
-    # Weekdays at 9 AM Eastern. Two crons covers DST without doubling up
-    # the actual work — `scripts/sync_instantly_engagement.py` is idempotent,
-    # but the second cron only fires when its window matches local 9 AM.
+    # Weekdays at 9 AM Eastern. Two crons cover DST without doubling up
+    # the actual work — the sync script is idempotent, and only one of
+    # the two will land at local 9 AM in any given month.
     - cron: '0 13 * * 1-5'   # 13:00 UTC = 9 AM EDT (Mar–Nov)
     - cron: '0 14 * * 1-5'   # 14:00 UTC = 9 AM EST (Nov–Mar)
   workflow_dispatch:
@@ -28,11 +28,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run engagement sync
+      - name: Run campaign analytics sync
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           INSTANTLY_API_KEY: ${{ secrets.INSTANTLY_API_KEY }}
           INSTANTLY_CAMPAIGN_ID: ${{ secrets.INSTANTLY_CAMPAIGN_ID }}
+          # ANTHROPIC_API_KEY is only used by the optional ratings rollup
+          # step at the end of the script — non-fatal if missing.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          SYNC_SECRET: ${{ secrets.SYNC_SECRET }}
-        run: python scripts/sync_instantly_engagement.py
+        run: python scripts/sync_instantly_campaign_analytics.py
