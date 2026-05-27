@@ -29,7 +29,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.db import init_db
-from src.feedback.engagement import sync_campaign_analytics, sync_engagement
+from src.feedback.engagement import (
+    CampaignAnalyticsMismatch,
+    sync_campaign_analytics,
+    sync_engagement,
+)
 from src.feedback.learning import process_ratings, promote_winners
 from src.logging_setup import setup_logging
 
@@ -52,6 +56,31 @@ async def main() -> int:
     # later failure doesn't suppress the snapshot.
     try:
         analytics = await sync_campaign_analytics()
+    except CampaignAnalyticsMismatch as exc:
+        # Hard failure: the API didn't return our campaign. Surface the
+        # debug payload verbatim so the operator can tell wrong-env-var
+        # from API-shape-change.
+        debug = exc.debug
+        print(
+            f"[campaign-analytics-sync] FAILED analytics: {exc}",
+            file=sys.stderr,
+        )
+        print(
+            f"[campaign-analytics-sync] requested_campaign_id="
+            f"{debug.get('requested_campaign_id')}",
+            file=sys.stderr,
+        )
+        print(
+            f"[campaign-analytics-sync] returned_campaign_ids="
+            f"{debug.get('returned_campaign_ids')}",
+            file=sys.stderr,
+        )
+        print(
+            f"[campaign-analytics-sync] record_count="
+            f"{debug.get('record_count')}",
+            file=sys.stderr,
+        )
+        return 1
     except Exception as exc:
         print(
             f"[campaign-analytics-sync] FAILED analytics: "
@@ -60,7 +89,10 @@ async def main() -> int:
         )
         return 1
 
-    campaign_id = analytics.get("campaign_id")
+    requested_id = analytics.get("requested_campaign_id")
+    returned_ids = analytics.get("returned_campaign_ids") or []
+    selected_id = analytics.get("selected_campaign_id")
+    selected_name = analytics.get("selected_campaign_name")
     contacted = int(analytics.get("contacted_count") or 0)
     sent = int(analytics.get("emails_sent_count") or 0)
     opens = int(analytics.get("open_count") or 0)
@@ -71,14 +103,18 @@ async def main() -> int:
         synced_at.isoformat() if isinstance(synced_at, datetime) else str(synced_at)
     )
 
-    # Stable key=value log lines — exactly the fields the task requested,
-    # so an Actions log grep can confirm each metric without parsing prose.
-    print(f"[campaign-analytics-sync] campaign_id={campaign_id}")
-    print(f"[campaign-analytics-sync] instantly_sent_or_sequence_started={contacted}")
-    print(f"[campaign-analytics-sync] instantly_emails_sent={sent}")
-    print(f"[campaign-analytics-sync] instantly_opens={opens}")
-    print(f"[campaign-analytics-sync] instantly_replies={replies}")
-    print(f"[campaign-analytics-sync] instantly_bounces={bounces}")
+    # Stable key=value log lines. Exactly the debug fields the task
+    # spec requires so an Actions log grep can confirm we synced ONE
+    # campaign, not the whole workspace.
+    print(f"[campaign-analytics-sync] requested_campaign_id={requested_id}")
+    print(f"[campaign-analytics-sync] returned_campaign_ids={returned_ids}")
+    print(f"[campaign-analytics-sync] selected_campaign_id={selected_id}")
+    print(f"[campaign-analytics-sync] selected_campaign_name={selected_name}")
+    print(f"[campaign-analytics-sync] sequence_started={contacted}")
+    print(f"[campaign-analytics-sync] emails_sent={sent}")
+    print(f"[campaign-analytics-sync] opens={opens}")
+    print(f"[campaign-analytics-sync] replies={replies}")
+    print(f"[campaign-analytics-sync] bounces={bounces}")
     print(f"[campaign-analytics-sync] open_rate={_safe_rate(opens, sent)}")
     print(f"[campaign-analytics-sync] reply_rate={_safe_rate(replies, sent)}")
     print(f"[campaign-analytics-sync] bounce_rate={_safe_rate(bounces, sent)}")

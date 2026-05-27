@@ -45,7 +45,11 @@ from src.content.winners import (
     set_negative_active,
     set_winner_active,
 )
-from src.feedback.engagement import sync_campaign_analytics, sync_engagement
+from src.feedback.engagement import (
+    CampaignAnalyticsMismatch,
+    sync_campaign_analytics,
+    sync_engagement,
+)
 from src.feedback.learning import process_ratings, promote_winners
 from src.feedback.self_improvement import (
     DEFAULT_BOUNCE_RATE_MAX,
@@ -244,17 +248,27 @@ with promote_col:
 
 if sync_clicked:
     analytics_result: dict | None = None
+    per_lead: dict | None = None
     sync_error: str | None = None
+    mismatch_debug: dict | None = None
     local_before = _local_sent_cached()
     try:
         with st.spinner("Syncing from Instantly…"):
             analytics_result = run_async(sync_campaign_analytics())
             per_lead = run_async(sync_engagement())
+    except CampaignAnalyticsMismatch as exc:
+        sync_error = str(exc)
+        mismatch_debug = exc.debug
     except Exception as exc:
         sync_error = f"{type(exc).__name__}: {exc}"
 
     if sync_error is not None:
         st.error(f"Sync failed: {sync_error}")
+        if mismatch_debug is not None:
+            # Surface the debug bundle so the operator can tell whether
+            # INSTANTLY_CAMPAIGN_ID is wrong or Instantly's response shape
+            # changed.
+            st.json(mismatch_debug)
     elif analytics_result is not None:
         st.cache_data.clear()
         contacted = int(analytics_result.get("contacted_count") or 0)
@@ -264,7 +278,9 @@ if sync_clicked:
         bounces = int(analytics_result.get("bounced_count") or 0)
         denom = sent_remote or 1
         st.success(
-            f"Synced — campaign `{analytics_result.get('campaign_id')}` · "
+            f"Synced — selected campaign "
+            f"`{analytics_result.get('selected_campaign_id')}` "
+            f"({analytics_result.get('selected_campaign_name') or 'unnamed'}) · "
             f"local sent before sync: {local_before} · "
             f"Instantly sequence started: {contacted} · "
             f"sent: {sent_remote} · opens: {opens} · replies: {replies} · "
@@ -272,14 +288,17 @@ if sync_clicked:
             f"open rate: {opens / denom * 100:.1f}% · "
             f"reply rate: {replies / denom * 100:.2f}% · "
             f"bounce rate: {bounces / denom * 100:.2f}% · "
-            f"per-lead: {per_lead.get('synced', 0)} updated, "
-            f"{per_lead.get('failed', 0)} failed."
+            f"per-lead: {(per_lead or {}).get('synced', 0)} updated, "
+            f"{(per_lead or {}).get('failed', 0)} failed."
         )
         if contacted and abs(contacted - local_before) >= 5:
             st.warning(
-                f"Instantly has {contacted} sequence started, but local DB "
-                f"has {local_before} sent records. Investigate — manual "
-                "imports or lost delivery_id rows can cause this gap."
+                f"Instantly campaign "
+                f"`{analytics_result.get('selected_campaign_id')}` has "
+                f"{contacted} sequence started, but local DB has "
+                f"{local_before} sent records for this campaign. "
+                "Investigate — manual imports or lost delivery_id rows "
+                "can cause this gap."
             )
         st.rerun()
 
@@ -349,10 +368,28 @@ with st.expander("Sync debug — raw Instantly analytics + DB comparison"):
     if _snapshot is None:
         st.info("No analytics snapshot yet. Hit \"Sync engagement from Instantly\".")
     else:
+        _raw = _snapshot.get("raw") or {}
+        # The snapshot's `raw` field holds ONLY the matched record (set by
+        # sync_campaign_analytics), so derived ids/names here are the
+        # selected campaign — never an account-wide aggregate.
+        _selected_id = (
+            _raw.get("campaign_id")
+            or _raw.get("id")
+            or _raw.get("campaign")
+            or _snapshot.get("campaign_id")
+        )
+        _selected_name = _raw.get("campaign_name") or _raw.get("name") or "—"
         st.markdown(
-            f"**Campaign ID:** `{_snapshot.get('campaign_id')}`  \n"
+            f"**Requested campaign ID (env):** `{_snapshot.get('campaign_id')}`  \n"
+            f"**Selected campaign ID (from Instantly):** `{_selected_id}`  \n"
+            f"**Selected campaign name:** {_selected_name}  \n"
             f"**Last synced:** {_format_timestamp(_snapshot.get('synced_at'))}"
         )
+        if str(_selected_id).lower() != str(_snapshot.get("campaign_id")).lower():
+            st.warning(
+                "Selected campaign id does not match the configured "
+                "INSTANTLY_CAMPAIGN_ID. The snapshot may be stale — re-sync."
+            )
         st.markdown("**Local vs Instantly comparison**")
         st.dataframe(
             pd.DataFrame(

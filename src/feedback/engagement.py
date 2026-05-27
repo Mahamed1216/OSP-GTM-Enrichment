@@ -135,32 +135,112 @@ async def _iter_campaign_leads() -> AsyncIterator[dict]:
                 return
 
 
+def _record_campaign_id(record: dict) -> str | None:
+    """Extract the campaign UUID from one analytics record.
+
+    Instantly v2 has returned this under several keys across versions:
+    `campaign_id`, `id`, sometimes `campaign`. Return the first non-empty
+    value as a lowercase string so callers can compare without re-casing.
+    """
+    for key in ("campaign_id", "id", "campaign"):
+        val = record.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip().lower()
+    return None
+
+
+class CampaignAnalyticsMismatch(RuntimeError):
+    """Raised when the analytics endpoint returns no record matching the
+    configured INSTANTLY_CAMPAIGN_ID. Carries the debug payload so the
+    caller (script logger, Streamlit UI) can render it verbatim."""
+
+    def __init__(self, message: str, debug: dict):
+        super().__init__(message)
+        self.debug = debug
+
+
 @retry_api
-async def fetch_campaign_analytics(campaign_id: str) -> dict:
-    """GET /api/v2/campaigns/analytics — campaign-level Instantly metrics.
+async def _fetch_campaigns_analytics_raw(campaign_id: str) -> Any:
+    """Hit GET /api/v2/campaigns/analytics with the campaign filter.
 
-    Returns the FIRST analytics record for `campaign_id`. Instantly's API
-    returns a list (one entry per requested campaign) under that endpoint;
-    we request one campaign at a time and unwrap to a single dict so the
-    caller doesn't need to know the array shape.
-
-    Field names below are Instantly's own — never normalise here so the
-    debug expander can render the response verbatim.
+    Instantly's docs name this param `id` (UUID or comma-separated list).
+    We send the same value under both `id` and `campaign_id` so a future
+    rename of the param on Instantly's side doesn't silently fall back to
+    "all campaigns" behavior — at least one of the two will be honored.
     """
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         resp = await client.get(
             f"{_API_BASE}/campaigns/analytics",
             headers=_auth_headers(),
-            params={"campaign_id": campaign_id},
+            params={"id": campaign_id, "campaign_id": campaign_id},
         )
         resp.raise_for_status()
-        payload = resp.json()
-    # Instantly's analytics endpoint returns a list of per-campaign records.
-    if isinstance(payload, list):
-        return payload[0] if payload else {}
-    if isinstance(payload, dict):
-        return payload
-    return {}
+        return resp.json()
+
+
+async def fetch_campaign_analytics(campaign_id: str) -> dict:
+    """Fetch and STRICTLY filter analytics for one campaign id.
+
+    Instantly's `/campaigns/analytics` endpoint silently ignores unknown
+    query params and falls back to returning EVERY campaign in the
+    workspace. If we picked `payload[0]` on that response we'd display
+    account-wide numbers under the campaign's label — which is exactly
+    the bug this rewrite fixes.
+
+    Guarantees:
+      - Returns the record whose campaign id matches `campaign_id`
+        (case-insensitive) regardless of where Instantly puts the id key.
+      - Raises `CampaignAnalyticsMismatch` if no record matches; the
+        exception carries the list of returned campaign ids so the
+        operator can see whether their env var is wrong or Instantly
+        returned an unexpected shape.
+      - Never aggregates, never sums, never returns multiple campaigns.
+    """
+    target = (campaign_id or "").strip().lower()
+    if not target:
+        raise CampaignAnalyticsMismatch(
+            "INSTANTLY_CAMPAIGN_ID is empty — refusing to call /campaigns/analytics.",
+            {"requested_campaign_id": campaign_id},
+        )
+
+    raw = await _fetch_campaigns_analytics_raw(campaign_id)
+
+    if isinstance(raw, list):
+        records = [r for r in raw if isinstance(r, dict)]
+    elif isinstance(raw, dict):
+        records = [raw]
+    else:
+        records = []
+
+    returned_ids: list[str] = []
+    matched: dict | None = None
+    for rec in records:
+        rid = _record_campaign_id(rec)
+        if rid:
+            returned_ids.append(rid)
+        if rid == target:
+            matched = rec
+            break
+
+    if matched is None:
+        # The response either named no campaign id at all (a bare object
+        # could be ambiguous) or named ones that don't match the env var.
+        # If the API returned EXACTLY one record with no id key we accept
+        # it — older Instantly responses for a campaign-scoped query do
+        # exist in this shape. Anything else is a hard fail so account-
+        # wide numbers never land in the snapshot.
+        if len(records) == 1 and _record_campaign_id(records[0]) is None:
+            return records[0]
+        raise CampaignAnalyticsMismatch(
+            f"Instantly /campaigns/analytics returned {len(records)} record(s); "
+            f"none matched INSTANTLY_CAMPAIGN_ID={campaign_id}.",
+            {
+                "requested_campaign_id": campaign_id,
+                "returned_campaign_ids": returned_ids,
+                "record_count": len(records),
+            },
+        )
+    return matched
 
 
 def _coerce_int(value: Any) -> int:
@@ -217,11 +297,21 @@ def _parse_analytics(raw: dict) -> dict:
 
 
 async def sync_campaign_analytics() -> dict:
-    """Pull campaign-level analytics from Instantly and persist a snapshot.
+    """Pull analytics for the configured campaign only and persist a snapshot.
 
-    Returns a dict with parsed metrics + raw response + the snapshot id
-    so the UI can quote a "Last synced from Instantly" timestamp and
-    render the raw JSON in the debug expander.
+    Returns a dict combining the parsed metrics, the raw matched record,
+    and a small debug bundle the UI can render to prove the snapshot is
+    NOT an account-wide aggregate:
+
+      requested_campaign_id   — value of INSTANTLY_CAMPAIGN_ID
+      returned_campaign_ids   — every id Instantly handed back this call
+      selected_campaign_id    — the id we matched and persisted
+      selected_campaign_name  — campaign_name from the matched record
+
+    Raises CampaignAnalyticsMismatch (subclass of RuntimeError) if none
+    of the returned records matches the env var; the caller (script /
+    UI) should surface it as a hard failure so account-wide totals never
+    silently land in the KPI cards.
     """
     campaign_id = settings.instantly_campaign_id
     if not settings.instantly_api_key or not campaign_id:
@@ -229,24 +319,70 @@ async def sync_campaign_analytics() -> dict:
             "INSTANTLY_API_KEY or INSTANTLY_CAMPAIGN_ID not set — "
             "cannot sync campaign analytics"
         )
-    raw = await fetch_campaign_analytics(campaign_id)
-    parsed = _parse_analytics(raw)
+
+    raw_full = await _fetch_campaigns_analytics_raw(campaign_id)
+    if isinstance(raw_full, list):
+        all_records = [r for r in raw_full if isinstance(r, dict)]
+    elif isinstance(raw_full, dict):
+        all_records = [raw_full]
+    else:
+        all_records = []
+    returned_ids = [
+        rid for rid in (_record_campaign_id(r) for r in all_records) if rid
+    ]
+
+    target = campaign_id.strip().lower()
+    matched: dict | None = None
+    for rec in all_records:
+        if _record_campaign_id(rec) == target:
+            matched = rec
+            break
+    if matched is None and len(all_records) == 1 and not returned_ids:
+        # Single anonymous record (legacy Instantly response shape) — accept.
+        matched = all_records[0]
+
+    if matched is None:
+        raise CampaignAnalyticsMismatch(
+            f"Instantly returned {len(all_records)} campaign record(s); "
+            f"none matched INSTANTLY_CAMPAIGN_ID={campaign_id}. Refusing to "
+            "store account-wide analytics.",
+            {
+                "requested_campaign_id": campaign_id,
+                "returned_campaign_ids": returned_ids,
+                "record_count": len(all_records),
+            },
+        )
+
+    parsed = _parse_analytics(matched)
+    selected_id = _record_campaign_id(matched) or campaign_id
+    selected_name = (
+        matched.get("campaign_name")
+        or matched.get("name")
+        or None
+    )
+
     snapshot_id: int
     synced_at = datetime.utcnow()
     with session_scope() as session:
+        # Store the env-var campaign id (not the API-returned one) so the
+        # snapshot is keyed by what the operator configured. The matched
+        # record itself goes into `raw` for full audit.
         snapshot = InstantlyAnalyticsSnapshot(
             campaign_id=campaign_id,
-            raw=raw or {},
+            raw=matched or {},
             synced_at=synced_at,
             **parsed,
         )
         session.add(snapshot)
         session.flush()
         snapshot_id = snapshot.id
+
     log.info(
         "instantly_analytics_synced",
         extra={
-            "campaign_id": campaign_id,
+            "requested_campaign_id": campaign_id,
+            "selected_campaign_id": selected_id,
+            "returned_campaign_ids": returned_ids,
             "snapshot_id": snapshot_id,
             **parsed,
         },
@@ -255,7 +391,11 @@ async def sync_campaign_analytics() -> dict:
         "snapshot_id": snapshot_id,
         "campaign_id": campaign_id,
         "synced_at": synced_at,
-        "raw": raw,
+        "raw": matched,
+        "requested_campaign_id": campaign_id,
+        "returned_campaign_ids": returned_ids,
+        "selected_campaign_id": selected_id,
+        "selected_campaign_name": selected_name,
         **parsed,
     }
 
