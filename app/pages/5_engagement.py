@@ -530,70 +530,82 @@ else:
 
             # Persist the recommendation ONCE per (bottleneck, value)
             # signature so re-rendering the page doesn't spam the history.
+            # save_recommendation() returns None on a DB error; in that
+            # case we still render the diagnosis read-only with a warning
+            # — never crash the whole page.
             sig = f"{diag.bottleneck}_{diag.loop_status}_{int(diag.current_metric_value * 10000)}"
             pending_rec_key = f"sil_pending_rec_{sig}"
             if pending_rec_key not in st.session_state:
-                st.session_state[pending_rec_key] = save_recommendation(diag)
+                st.session_state[pending_rec_key] = save_recommendation(
+                    diag, metric_snapshot=_metrics,
+                )
             rec_id = st.session_state[pending_rec_key]
 
-            a, b, c = st.columns(3)
-            with a:
-                approve = st.button(
-                    "Approve change for next send",
-                    key=f"sil_approve_{rec_id}",
-                    type="primary",
-                    disabled=(diag.loop_status != LOOP_READY),
-                    help=(
-                        None
-                        if diag.loop_status == LOOP_READY
-                        else "Approve is only available at standard confidence "
-                        f"(≥ {SAMPLE_LOW_CONF_MAX} sent). Use Save-as-draft "
-                        "for low-confidence drafts."
-                    ),
+            if rec_id is None:
+                st.warning(
+                    "Could not save this recommendation to the database — "
+                    "the diagnosis above is read-only. Check the app logs "
+                    "for the SQLAlchemy error; the page itself is fine."
                 )
-            with b:
-                reject = st.button("Reject", key=f"sil_reject_{rec_id}", type="secondary")
-            with c:
-                draft = st.button(
-                    "Save as draft recommendation",
-                    key=f"sil_draft_{rec_id}",
-                    type="secondary",
-                )
-
-            if approve and diag.loop_status == LOOP_READY:
-                try:
-                    approve_recommendation(rec_id, approved_by="demo_sdr")
-                except Exception as exc:
-                    st.error(f"Approval failed: {exc}")
-                else:
-                    st.cache_data.clear()
-                    st.session_state.pop(pending_rec_key, None)
-                    st.success(
-                        "Approved — addendum appended to the email prompt "
-                        "overlay. Future generations will use it; already-"
-                        "sent emails are unchanged."
+            else:
+                a, b, c = st.columns(3)
+                with a:
+                    approve = st.button(
+                        "Approve change for next send",
+                        key=f"sil_approve_{rec_id}",
+                        type="primary",
+                        disabled=(diag.loop_status != LOOP_READY),
+                        help=(
+                            None
+                            if diag.loop_status == LOOP_READY
+                            else "Approve is only available at standard confidence "
+                            f"(≥ {SAMPLE_LOW_CONF_MAX} sent). Use Save-as-draft "
+                            "for low-confidence drafts."
+                        ),
                     )
-                    st.rerun()
-            if reject:
-                try:
-                    reject_recommendation(rec_id, rejected_by="demo_sdr")
-                except Exception as exc:
-                    st.error(f"Reject failed: {exc}")
-                else:
-                    st.session_state.pop(pending_rec_key, None)
-                    st.cache_data.clear()
-                    st.info("Recommendation rejected.")
-                    st.rerun()
-            if draft:
-                try:
-                    save_as_draft(rec_id)
-                except Exception as exc:
-                    st.error(f"Save-as-draft failed: {exc}")
-                else:
-                    st.session_state.pop(pending_rec_key, None)
-                    st.cache_data.clear()
-                    st.info("Saved as draft.")
-                    st.rerun()
+                with b:
+                    reject = st.button("Reject", key=f"sil_reject_{rec_id}", type="secondary")
+                with c:
+                    draft = st.button(
+                        "Save as draft recommendation",
+                        key=f"sil_draft_{rec_id}",
+                        type="secondary",
+                    )
+
+                if approve and diag.loop_status == LOOP_READY:
+                    try:
+                        approve_recommendation(rec_id, approved_by="demo_sdr")
+                    except Exception as exc:
+                        st.error(f"Approval failed: {exc}")
+                    else:
+                        st.cache_data.clear()
+                        st.session_state.pop(pending_rec_key, None)
+                        st.success(
+                            "Approved — addendum appended to the email "
+                            "prompt overlay. Future generations will use "
+                            "it; already-sent emails are unchanged."
+                        )
+                        st.rerun()
+                if reject:
+                    try:
+                        reject_recommendation(rec_id, rejected_by="demo_sdr")
+                    except Exception as exc:
+                        st.error(f"Reject failed: {exc}")
+                    else:
+                        st.session_state.pop(pending_rec_key, None)
+                        st.cache_data.clear()
+                        st.info("Recommendation rejected.")
+                        st.rerun()
+                if draft:
+                    try:
+                        save_as_draft(rec_id)
+                    except Exception as exc:
+                        st.error(f"Save-as-draft failed: {exc}")
+                    else:
+                        st.session_state.pop(pending_rec_key, None)
+                        st.cache_data.clear()
+                        st.info("Saved as draft.")
+                        st.rerun()
         elif diag.bottleneck == "none":
             st.caption("Green across the board — nothing to do.")
         else:

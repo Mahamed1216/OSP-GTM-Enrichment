@@ -208,15 +208,24 @@ class PromptRecommendation(Base):
     The loop diagnoses a bottleneck (open / reply / bounce / delivery)
     from the latest analytics snapshot, drafts a recommendation, and
     persists it here. No prompt is ever modified until status flips to
-    `approved`; on approval, `proposed_prompt` is written to the
-    `prompt_configs` overlay table so only FUTURE generations pick it up.
-    The previous overlay text is stashed in `previous_prompt_snapshot`
-    so the operator can roll back.
+    `approved`; on approval, `proposed_addendum` is appended to the
+    `prompt_configs` overlay so only FUTURE generations pick it up. The
+    previous overlay text is stashed in `previous_prompt_snapshot` so
+    the operator can roll back.
+
+    Length notes — the values written here that bit us once:
+      - status: "ready_for_approval" = 19 chars → declared 32 (was 16).
+      - loop_status: same vocabulary as `status` for new rows but kept
+        separate so the approval lifecycle (`status`) and the loop's
+        diagnostic state (`loop_status`) can diverge over time.
+      - proposed_addendum / previous_prompt_snapshot: TEXT because a
+        long prompt overlay or a multi-paragraph addendum will blow
+        through any VARCHAR cap.
     """
     __tablename__ = "prompt_recommendations"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    bottleneck: Mapped[str] = mapped_column(String(32))  # open_rate|reply_rate|bounce_rate|delivery
+    bottleneck: Mapped[str] = mapped_column(String(32))  # open_rate|reply_rate|bounce_rate|delivery|none
     channel: Mapped[Optional[str]] = mapped_column(String(32))  # email|None for non-prompt actions
     diagnosis: Mapped[str] = mapped_column(Text)
     current_metric_label: Mapped[str] = mapped_column(String(64))
@@ -225,13 +234,29 @@ class PromptRecommendation(Base):
     recommended_change: Mapped[str] = mapped_column(Text)
     expected_impact: Mapped[str] = mapped_column(Text)
     risk_level: Mapped[str] = mapped_column(String(16))  # low | medium | high
+    # `proposed_prompt` is the legacy column from the first loop revision.
+    # `proposed_addendum` is the canonical column going forward. New code
+    # always writes to addendum; `list_recommendations` reads addendum
+    # then falls back to prompt for old rows.
     proposed_prompt: Mapped[Optional[str]] = mapped_column(Text)
+    proposed_addendum: Mapped[Optional[str]] = mapped_column(Text)
     previous_prompt_snapshot: Mapped[Optional[str]] = mapped_column(Text)
     sample_size: Mapped[int] = mapped_column(Integer, default=0)
     low_confidence: Mapped[bool] = mapped_column(Boolean, default=False)
-    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending|approved|rejected|draft
+    # Approval lifecycle: pending | approved | rejected | draft | ready_for_approval
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    # Loop's diagnostic state at save time: wait | diagnose_only | draft | ready_for_approval
+    loop_status: Mapped[Optional[str]] = mapped_column(String(32))
+    confidence: Mapped[Optional[str]] = mapped_column(String(16))  # insufficient | low | standard
+    # JSON-encoded copy of the kpi_view dict at diagnose time. Lets the
+    # history expander show "what the metrics looked like when this
+    # recommendation was drafted" without joining back to the snapshot
+    # table (which may have rolled forward since).
+    metric_snapshot: Mapped[Optional[dict]] = mapped_column(JSON)
     approved_by: Mapped[Optional[str]] = mapped_column(String(64))
     approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    rejected_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    drafted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
 
 

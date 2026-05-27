@@ -42,6 +42,7 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from sqlalchemy import case, func, select
+from sqlalchemy.exc import SQLAlchemyError
 
 from src.db import session_scope
 from src.models import (
@@ -493,41 +494,73 @@ def diagnose(
 # Persistence — only for prompt-change candidates.
 # ---------------------------------------------------------------------------
 
-def save_recommendation(diag: Diagnosis) -> int | None:
+def save_recommendation(
+    diag: Diagnosis,
+    *,
+    metric_snapshot: dict[str, Any] | None = None,
+) -> int | None:
     """Persist a Diagnosis IFF it's an actionable prompt-change candidate.
 
-    Returns the new row id, or None when the diagnosis is wait /
-    diagnose-only / none (those don't belong in the recommendation
-    history because they have no addendum to approve or roll back).
-    The previous module saved one for every render — that surfaced
-    bounce/delivery noise in the history.
+    Returns the new row id, or None on a non-actionable diagnosis OR on
+    a database error. Callers (the Engagement page) treat None as
+    "diagnosis is still renderable, just don't show approval buttons" —
+    the page does NOT crash if persistence fails.
+
+    Database errors are logged but swallowed. This was added after a
+    Postgres `DataError: value too long for type character varying(16)`
+    on the `status` column took down the whole page render. The column
+    has since been widened, but the resilience stays.
     """
     if not diag.is_actionable_prompt_change:
         return None
-    # The DB column is named `proposed_prompt`; we persist the addendum
-    # text under that column so existing migrations still apply. The
-    # approval step appends it to the current overlay (not overwrites).
+
     initial_status = "ready_for_approval" if diag.loop_status == LOOP_READY else "draft"
-    with session_scope() as session:
-        rec = PromptRecommendation(
-            bottleneck=diag.bottleneck,
-            channel=diag.channel,
-            diagnosis=diag.diagnosis,
-            current_metric_label=diag.current_metric_label,
-            current_metric_value=float(diag.current_metric_value),
-            target_metric_value=float(diag.target_metric_value),
-            recommended_change=diag.recommended_change,
-            expected_impact=diag.expected_impact,
-            risk_level=diag.risk_level,
-            proposed_prompt=diag.proposed_addendum,
-            previous_prompt_snapshot=diag.previous_prompt_snapshot,
-            sample_size=int(diag.sample_size),
-            low_confidence=(diag.confidence == "low"),
-            status=initial_status,
+    drafted_at = datetime.utcnow() if initial_status == "draft" else None
+    try:
+        with session_scope() as session:
+            rec = PromptRecommendation(
+                bottleneck=diag.bottleneck,
+                channel=diag.channel,
+                diagnosis=diag.diagnosis,
+                current_metric_label=diag.current_metric_label,
+                current_metric_value=float(diag.current_metric_value),
+                target_metric_value=float(diag.target_metric_value),
+                recommended_change=diag.recommended_change,
+                expected_impact=diag.expected_impact,
+                risk_level=diag.risk_level,
+                # Write to both columns: `proposed_addendum` is canonical
+                # going forward; `proposed_prompt` is kept in sync so any
+                # consumer still reading the legacy column sees the same
+                # text. New code reads addendum first, prompt as fallback.
+                proposed_addendum=diag.proposed_addendum,
+                proposed_prompt=diag.proposed_addendum,
+                previous_prompt_snapshot=diag.previous_prompt_snapshot,
+                sample_size=int(diag.sample_size),
+                low_confidence=(diag.confidence == "low"),
+                status=initial_status,
+                loop_status=diag.loop_status,
+                confidence=diag.confidence,
+                metric_snapshot=metric_snapshot,
+                drafted_at=drafted_at,
+            )
+            session.add(rec)
+            session.flush()
+            return int(rec.id)
+    except SQLAlchemyError as exc:
+        # session_scope() already rolled back on the way out. We log
+        # with the SQL the row tried to commit so the schema-vs-payload
+        # mismatch is debuggable from the Streamlit Cloud logs alone.
+        log.warning(
+            "save_recommendation_failed",
+            extra={
+                "error": f"{type(exc).__name__}: {exc}",
+                "bottleneck": diag.bottleneck,
+                "loop_status": diag.loop_status,
+                "status_value": initial_status,
+                "status_value_len": len(initial_status),
+            },
         )
-        session.add(rec)
-        session.flush()
-        return int(rec.id)
+        return None
 
 
 def approve_recommendation(rec_id: int, *, approved_by: str) -> dict[str, Any]:
@@ -544,7 +577,8 @@ def approve_recommendation(rec_id: int, *, approved_by: str) -> dict[str, Any]:
             raise ValueError(f"Recommendation {rec_id} not found")
         if rec.status == "approved":
             return {"id": rec_id, "status": "approved", "already": True}
-        if not rec.channel or not rec.proposed_prompt:
+        addendum_text = rec.proposed_addendum or rec.proposed_prompt
+        if not rec.channel or not addendum_text:
             raise ValueError(
                 "Recommendation has no addendum to apply — bounce/delivery "
                 "diagnoses cannot be approved as prompt changes."
@@ -553,7 +587,7 @@ def approve_recommendation(rec_id: int, *, approved_by: str) -> dict[str, Any]:
         rec.approved_by = approved_by
         rec.approved_at = datetime.utcnow()
         channel = rec.channel
-        addendum = rec.proposed_prompt
+        addendum = addendum_text
         # Re-read the current overlay HERE (not at diagnosis time) so a
         # concurrent edit by the operator can't be silently overwritten.
         previous = get_effective_prompt(channel, DEFAULT_EMAIL_PROMPT_BODY)
@@ -575,7 +609,11 @@ def reject_recommendation(rec_id: int, *, rejected_by: str) -> None:
             raise ValueError(f"Recommendation {rec_id} not found")
         rec.status = "rejected"
         rec.approved_by = rejected_by
-        rec.approved_at = datetime.utcnow()
+        # `rejected_at` is the new dedicated column; `approved_at` is also
+        # set for backward compatibility with old history-page queries.
+        now = datetime.utcnow()
+        rec.rejected_at = now
+        rec.approved_at = now
 
 
 def save_as_draft(rec_id: int) -> None:
@@ -584,6 +622,7 @@ def save_as_draft(rec_id: int) -> None:
         if rec is None:
             raise ValueError(f"Recommendation {rec_id} not found")
         rec.status = "draft"
+        rec.drafted_at = datetime.utcnow()
 
 
 def rollback_recommendation(rec_id: int) -> dict[str, Any]:
@@ -678,14 +717,21 @@ def list_recommendations(limit: int = 20) -> list[dict[str, Any]]:
                 "recommended_change": r.recommended_change,
                 "expected_impact": r.expected_impact,
                 "risk_level": r.risk_level,
-                "proposed_addendum": r.proposed_prompt,  # column renamed for clarity in API
+                # Prefer the new column; fall back to the legacy column
+                # for rows persisted before the schema fix.
+                "proposed_addendum": r.proposed_addendum or r.proposed_prompt,
                 "previous_prompt_snapshot": r.previous_prompt_snapshot,
                 "sample_size": int(r.sample_size or 0),
                 "low_confidence": bool(r.low_confidence),
+                "confidence": r.confidence,
+                "loop_status": r.loop_status,
                 "status": r.status,
                 "approved_by": r.approved_by,
                 "approved_at": r.approved_at,
+                "rejected_at": r.rejected_at,
+                "drafted_at": r.drafted_at,
                 "created_at": r.created_at,
+                "metric_snapshot": r.metric_snapshot,
             }
             for r in rows
         ]

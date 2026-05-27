@@ -22,19 +22,47 @@ _RUNTIME_COLUMN_ADDS: list[tuple[str, str, str]] = [
     # Added so bulk-regen resume can fingerprint the prompt that produced
     # a row, rather than relying on the unchanging prompt_version constant.
     ("generated_contents", "prompt_fingerprint", "VARCHAR(64)"),
+    # Self-improvement-loop audit columns. Added in the schema-mismatch
+    # fix after a DataError on Streamlit Cloud Postgres — the loop's
+    # status vocabulary outgrew the original VARCHAR(16) `status` column
+    # and the audit fields below were never persisted at all.
+    ("prompt_recommendations", "loop_status", "VARCHAR(32)"),
+    ("prompt_recommendations", "confidence", "VARCHAR(16)"),
+    ("prompt_recommendations", "proposed_addendum", "TEXT"),
+    # JSON in raw DDL: Postgres treats it natively, SQLite stores it
+    # under its dynamic-typing rules and accepts the keyword without
+    # error since SQLite 3.7. SQLAlchemy's `JSON` type handles the
+    # serialisation on read/write so both backends round-trip cleanly.
+    ("prompt_recommendations", "metric_snapshot", "JSON"),
+    ("prompt_recommendations", "rejected_at", "TIMESTAMP"),
+    ("prompt_recommendations", "drafted_at", "TIMESTAMP"),
+]
+
+# Postgres-only column widenings. SQLite ignores VARCHAR length caps so
+# there's nothing to do for it — the same insert that succeeds on SQLite
+# 1-line-tests is the one that errors on Streamlit Cloud's Postgres.
+# (table, column, new type)
+_RUNTIME_COLUMN_WIDENS_PG: list[tuple[str, str, str]] = [
+    # "ready_for_approval" = 19 chars; original column was VARCHAR(16).
+    ("prompt_recommendations", "status", "VARCHAR(32)"),
 ]
 
 
 def _apply_runtime_migrations() -> None:
-    """Idempotently add columns we've introduced since the table was created.
+    """Idempotently bring existing tables in line with the current model.
 
-    `Base.metadata.create_all()` covers new tables but never alters existing
-    ones, and we don't run Alembic in this project. The list above is the
-    one source of truth for runtime-applied column additions; both SQLite
-    and Postgres accept the plain `ALTER TABLE ... ADD COLUMN` form below.
+    Two passes:
+      1. ADD COLUMN for any model column missing from the live table.
+         Cross-dialect: both SQLite and Postgres accept the plain
+         `ALTER TABLE ... ADD COLUMN` form.
+      2. ALTER COLUMN TYPE for Postgres-only widening of VARCHARs that
+         outgrew their original cap. Skipped on SQLite because SQLite's
+         VARCHAR(N) doesn't enforce N anyway.
     """
     inspector = inspect(engine)
     existing_tables = set(inspector.get_table_names())
+
+    # Pass 1 — add missing columns.
     for table_name, col_name, ddl_type in _RUNTIME_COLUMN_ADDS:
         if table_name not in existing_tables:
             continue  # create_all just made it with the new column already in place
@@ -45,6 +73,25 @@ def _apply_runtime_migrations() -> None:
             conn.execute(
                 text(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {ddl_type}")
             )
+
+    # Pass 2 — widen string columns on Postgres.
+    if engine.dialect.name == "postgresql":
+        # Re-inspect after pass 1 in case a column we want to widen was
+        # just added (no-op widen, but harmless).
+        inspector = inspect(engine)
+        for table_name, col_name, new_type in _RUNTIME_COLUMN_WIDENS_PG:
+            if table_name not in existing_tables:
+                continue
+            cols = {c["name"] for c in inspector.get_columns(table_name)}
+            if col_name not in cols:
+                continue
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        f"ALTER TABLE {table_name} "
+                        f"ALTER COLUMN {col_name} TYPE {new_type}"
+                    )
+                )
 
 
 def init_db() -> None:
