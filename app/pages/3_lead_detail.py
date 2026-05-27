@@ -384,6 +384,83 @@ with tab_enrich:
                             reason = info.get("reason") or "no payload returned"
                             st.markdown(f":orange[**{label.title()}:**] {reason}")
 
+        # ---------- Buyer account research card ----------
+        st.subheader("Buyer account research")
+        ba = enrichment.get("buyer_accounts") or {}
+        if not ba:
+            st.info(
+                "No buyer-account research stored yet. Click Lead Actions "
+                "→ Rerun enrichment to populate this."
+            )
+        else:
+            motion = ba.get("buyer_motion") or "unknown"
+            accounts = ba.get("likely_buyer_accounts") or []
+            direct_buyers = ba.get("likely_direct_buyers") or []
+            partner_channels = ba.get("likely_partner_channels") or []
+            segments = ba.get("likely_buyer_segments") or []
+            buyer_conf = (
+                ba.get("buyer_account_confidence")
+                or ba.get("buyer_confidence")
+                or "low"
+            )
+            partner_conf = ba.get("partner_confidence") or "low"
+            rationale = ba.get("buyer_account_rationale") or ba.get("reasoning") or ""
+            flagged = ba.get("flagged_competitors") or []
+            b2b_evidence = ba.get("explicit_b2b_motion_evidence") or []
+            with st.container(border=True):
+                cols = st.columns(2)
+                with cols[0]:
+                    st.markdown(f"**Motion:** `{motion}`")
+                    st.markdown(f"**Buyer confidence:** {buyer_conf}")
+                with cols[1]:
+                    st.markdown(f"**Partner confidence:** {partner_conf}")
+                    if b2b_evidence:
+                        st.markdown(
+                            f"**B2B motion evidence ({len(b2b_evidence)}):** "
+                            + ", ".join(b2b_evidence[:3])
+                            + (" …" if len(b2b_evidence) > 3 else "")
+                        )
+
+                st.markdown(
+                    "**likely_buyer_accounts:** "
+                    + (", ".join(accounts) if accounts else ":gray[(none — using segment fallback)]")
+                )
+                if direct_buyers and direct_buyers != accounts:
+                    st.markdown(
+                        "**likely_direct_buyers:** " + ", ".join(direct_buyers)
+                    )
+                if partner_channels:
+                    st.markdown(
+                        "**likely_partner_channels:** " + ", ".join(partner_channels)
+                    )
+                st.markdown(
+                    "**likely_buyer_segments:** "
+                    + (", ".join(segments) if segments else ":gray[(none)]")
+                )
+                if flagged:
+                    st.markdown(
+                        ":red[**flagged_competitors (never name as buyers):**] "
+                        + ", ".join(flagged)
+                    )
+                if rationale:
+                    st.caption(f"Rationale: {rationale}")
+                if not accounts:
+                    # Explain WHY there are no named accounts so the
+                    # operator can decide whether to retry research or
+                    # accept the segment fallback.
+                    if motion.upper() in ("B2C",) and not b2b_evidence:
+                        st.warning(
+                            "No named buyers because the company appears "
+                            "B2C with no explicit B2B motion evidence — "
+                            "this lead is the ICP-skip case (tier D)."
+                        )
+                    else:
+                        st.warning(
+                            "No 2 high-confidence named buyer accounts "
+                            "surfaced. Email generation will fall back to "
+                            "buyer segments + \"teams like that\" CTA."
+                        )
+
         st.subheader("Source payloads")
         any_payload = False
         for col in _PAYLOAD_COLUMNS:

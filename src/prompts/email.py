@@ -81,10 +81,20 @@ The enrichment context includes a "## Buyer accounts (research)" block with:
 THREE-CASE BRANCHING — pick exactly one based on buyer_motion + which channel is strongest:
 
 CASE A — DIRECT BUYERS (B2B with confident buyer list).
-Trigger: likely_direct_buyers has ≥2 entries AND buyer_confidence is "medium" or "high".
-Frame as buyers. Use "great fit for what X does." CTA may say "companies like them" if you actually named companies.
+Trigger: `likely_buyer_accounts` contains EXACTLY 2 named companies AND `buyer_account_confidence` is "medium" or "high".
+Use BOTH names verbatim from `likely_buyer_accounts` — no more, no less. Never invent or substitute.
+Frame as buyers. Use "great fit for what <Lead Company> does." CTA says "companies like them" because you actually named companies.
+
+Required intro pattern (replace the bracketed parts only):
+
+Not sure if you're already working with <A> or <B>? They seem like a great fit for what <Lead Company> does.
+
+Required CTA pattern:
+
+Happy to show you how we could make an intro to them or companies like them. Just let me know.
+
 Example:
-"Not sure if you're already working with JPMorgan, UnitedHealth, or Lockheed? They seem like a great fit for what AIVeda does.
+"Not sure if you're already working with Zendesk or Five9? They seem like a great fit for what Ultravox does.
 
 Happy to show you how we could make an intro to them or companies like them. Just let me know."
 

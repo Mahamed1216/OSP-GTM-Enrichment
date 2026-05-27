@@ -103,6 +103,16 @@ STEP 1 — Decide buyer_motion. Who actually writes the check?
 STEP 2 — Populate the four channel buckets. Each item is either a
 NAMED company or a short SEGMENT label. Never list a competitor.
 
+  CRITICAL for B2B / B2B2C: also populate `likely_buyer_accounts` with
+  EXACTLY 2 named company picks (your best two from
+  `likely_direct_buyers`). The downstream email layer plugs those two
+  names verbatim into "Not sure if you're already working with A or B?"
+  — so the pair must be plausible, non-competing buyer companies.
+  If you cannot identify 2 strong candidates with confidence, leave
+  `likely_buyer_accounts` EMPTY and the email layer will fall back to
+  segments. Never fill with one strong + one weak; an empty list is
+  better than a guess.
+
   - likely_direct_buyers
       Orgs/segments that BUY and PAY for the product. For B2B SaaS this
       is the customer list. For B2C this is usually EMPTY (consumers
@@ -190,17 +200,22 @@ Output schema (JSON, no prose):
 
 Worked examples:
 
-A) Voice AI infrastructure (e.g. Ultravox.ai)
+A) Voice AI infrastructure (e.g. Ultravox.ai) — B2B with 2 named buyers
 {
   "buyer_motion": "B2B",
-  "likely_direct_buyers": ["support orgs deploying voice agents", "healthcare call centers", "fintech ops teams"],
+  "likely_direct_buyers": ["Zendesk", "Five9", "support orgs deploying voice agents", "healthcare call centers"],
   "likely_partner_channels": [],
   "likely_referral_channels": [],
   "likely_end_users": [],
   "buyer_confidence": "medium",
   "partner_confidence": "low",
-  "reasoning": "Voice AI infra is embedded by enterprise support and contact-center teams; no consumer-facing motion.",
-  "flagged_competitors": ["Bland AI", "Retell AI", "ElevenLabs"]
+  "reasoning": "Voice AI infra is embedded by enterprise support / contact-center platforms; case studies surfaced Zendesk and Five9 as deployment partners.",
+  "flagged_competitors": ["Bland AI", "Retell AI", "ElevenLabs"],
+  "likely_buyer_accounts": ["Zendesk", "Five9"],
+  "likely_buyer_segments": ["support orgs deploying voice agents", "healthcare call centers"],
+  "buyer_account_confidence": "medium",
+  "buyer_account_rationale": "Zendesk and Five9 surfaced as live integration partners in research; they fit Ultravox's embed motion.",
+  "explicit_b2b_motion_evidence": []
 }
 
 B) Consumer credit app (e.g. Dovly) — pure B2C, NO B2B motion evidence found

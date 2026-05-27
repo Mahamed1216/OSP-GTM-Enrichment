@@ -21,6 +21,7 @@ from src.prompts.email import (
 )
 from src.prompts.sanitize import (
     coerce_sdr_direct_pitch,
+    coerce_structure_1_named_buyers,
     detect_banned_direct_pitch_phrases,
     detect_competitor_as_buyer,
     detect_partner_channel_mismatch,
@@ -75,8 +76,25 @@ async def generate_email(
             ba.get("likely_buyer_accounts") or []
         )
         flagged_competitors: list[str] = list(ba.get("flagged_competitors") or [])
+        # Explicit `likely_buyer_accounts` field from buyer discovery v2
+        # — the canonical "2 named buyers" pair for Structure 1 CASE A.
+        # Fall back to v2 `likely_direct_buyers` (filtered to titlecase
+        # brand-shaped entries) when the dedicated field is empty, so old
+        # enrichment rows still drive the coercer.
+        explicit_buyer_accounts: list[str] = list(
+            ba.get("likely_buyer_accounts") or []
+        )
+        if not explicit_buyer_accounts:
+            # Heuristic backfill: from direct_buyers, prefer items that
+            # look like brand names (Titlecase, no plural noun-phrase shape).
+            import re as _re
+            brand_re = _re.compile(r"^[A-Z][\w\.\-'&]*(?:\s+[A-Z][\w\.\-'&]*){0,3}$")
+            explicit_buyer_accounts = [
+                n for n in direct_buyers if brand_re.match((n or "").strip())
+            ]
         company_industry = lead.industry or None
         lead_first_name = (lead.first_name or "").strip()
+        lead_company = (lead.company or "").strip()
 
     # ICP-skip short-circuit: tier "D" means scoring already decided
     # this is a poor OSP fit (typically B2C without B2B motion). Skip
@@ -155,6 +173,19 @@ async def generate_email(
     stripped_body, strip_warning = strip_structure_1_opening_hook(clean_body)
     clean_body = stripped_body
 
+    # Named-buyer coercer: when buyer discovery surfaced ≥2 high-conf
+    # buyer companies but the model wrote a segment-only Structure 1
+    # intro (e.g. "community banks, commercial lenders, broker
+    # networks"), rewrite the intro + CTA to use the 2 named buyers
+    # verbatim. No-op when there aren't 2 named buyers OR when both
+    # names already appear in the body OR when the body is Structure 2.
+    named_buyer_body, named_buyer_warning = coerce_structure_1_named_buyers(
+        clean_body,
+        lead_company=lead_company,
+        buyer_accounts=explicit_buyer_accounts,
+    )
+    clean_body = named_buyer_body
+
     # Post-generation validators. These are HEURISTIC flags, not hard
     # blocks — the email still saves, but warnings ride along on
     # `signals_cited` so the operator can review on the Lead detail page
@@ -164,6 +195,8 @@ async def generate_email(
         validation_warnings.append(coerce_warning)
     if strip_warning:
         validation_warnings.append(strip_warning)
+    if named_buyer_warning:
+        validation_warnings.append(named_buyer_warning)
     seg_warnings = detect_segment_vs_company_mismatch(
         clean_body, named_buyer_accounts=named_buyers,
     )

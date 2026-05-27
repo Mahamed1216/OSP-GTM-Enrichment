@@ -467,6 +467,89 @@ def strip_structure_1_opening_hook(body: str) -> tuple[str, str | None]:
     return cleaned, "Removed Structure 1 opening hook."
 
 
+def coerce_structure_1_named_buyers(
+    body: str,
+    *,
+    lead_company: str,
+    buyer_accounts: list[str],
+) -> tuple[str, str | None]:
+    """Rewrite a Structure 1 intro/CTA to use the 2 named buyer accounts.
+
+    Triggers when:
+      - The body has a Structure 1 starter ("Not sure if you're already
+        working with ...") AND no Structure 2 marker ("Instead of
+        hiring ...").
+      - `buyer_accounts` has at least 2 names.
+      - The body doesn't already include BOTH of the first two buyer
+        names (case-insensitive substring match).
+
+    Action — replace everything from the Structure 1 starter line to
+    end-of-body with a canonical two-paragraph block:
+
+        Not sure if you're already working with <A> or <B>? They seem
+        like a great fit for what <Lead Company> does.
+
+        Happy to show you how we could make an intro to them or
+        companies like them. Just let me know.
+
+    Returns (body, warning_or_None). Greeting (and any blank line after
+    it) is preserved untouched.
+    """
+    if not body or len(buyer_accounts) < 2:
+        return body, None
+    a = (buyer_accounts[0] or "").strip()
+    b = (buyer_accounts[1] or "").strip()
+    if not a or not b:
+        return body, None
+
+    lower = body.lower()
+    if not any(s in lower for s in _STRUCTURE_1_STARTERS):
+        return body, None
+    if any(m in lower for m in _STRUCTURE_2_MARKERS):
+        return body, None
+
+    # Already correct: both names present in body.
+    a_in_body = a.lower() in lower
+    b_in_body = b.lower() in lower
+    if a_in_body and b_in_body:
+        return body, None
+
+    company = (lead_company or "").strip() or "the team"
+    new_intro = (
+        f"Not sure if you're already working with {a} or {b}? "
+        f"They seem like a great fit for what {company} does."
+    )
+    new_cta = (
+        "Happy to show you how we could make an intro to them or "
+        "companies like them. Just let me know."
+    )
+
+    lines = body.split("\n")
+    greeting_idx = 0
+    for i, line in enumerate(lines):
+        if line.strip():
+            greeting_idx = i
+            break
+    starter_idx: int | None = None
+    for i in range(greeting_idx + 1, len(lines)):
+        if any(s in lines[i].lower() for s in _STRUCTURE_1_STARTERS):
+            starter_idx = i
+            break
+    if starter_idx is None:
+        return body, None
+
+    # Keep [greeting + any blanks up to starter] as the preamble; drop
+    # from starter through end; substitute canonical intro + CTA.
+    preamble = lines[:starter_idx]
+    # Trim trailing blanks on preamble so we don't stack 3+ newlines.
+    while preamble and not preamble[-1].strip():
+        preamble.pop()
+    new_lines = preamble + ["", new_intro, "", new_cta]
+    return "\n".join(new_lines), (
+        f"Rewrote Structure 1 intro to use named buyers ({a}, {b})."
+    )
+
+
 def coerce_sdr_direct_pitch(
     body: str, *, first_name: str,
 ) -> tuple[str, str | None]:
