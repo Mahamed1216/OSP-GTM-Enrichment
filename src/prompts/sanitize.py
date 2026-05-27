@@ -216,11 +216,17 @@ def detect_segment_vs_company_mismatch(
 
 
 _BANNED_DIRECT_PITCH_PHRASES = [
+    # Pain / timeline framing — banned from every direct pitch.
     "real tension",
     "weeks, not months",
     "weeks not months",
     "no ramp",
     "no attrition risk",
+    # Legacy SDR-pitch phrases the v5 template replaces.
+    "i could fill",
+    "0 onboarding time",
+    "fraction of the cost",
+    "meetings and pipeline next week",
 ]
 
 
@@ -229,13 +235,152 @@ def detect_banned_direct_pitch_phrases(body: str) -> list[str]:
 
     These were called out as too-AI-written in operator feedback. The
     template is two paragraphs; anything that adds "real tension" or
-    "weeks not months" indicates the model fell back to the verbose
-    pattern. Returns the list of hits (empty == clean).
+    "weeks not months" or the legacy "I could fill" / "fraction of the
+    cost" wording indicates the model fell back to the verbose pattern.
+    Returns the list of hits (empty == clean).
     """
     if not body:
         return []
     haystack = body.lower()
     return [p for p in _BANNED_DIRECT_PITCH_PHRASES if p in haystack]
+
+
+# ---------------------------------------------------------------------------
+# SDR direct-pitch coercer — deterministic rewrite when the model leaks the
+# legacy pattern despite the prompt template.
+# ---------------------------------------------------------------------------
+
+_SDR_SIGNAL_PATTERNS = [
+    re.compile(r"\bfounding\s+sdr\b", re.IGNORECASE),
+    re.compile(r"\bfounding\s+bdr\b", re.IGNORECASE),
+    re.compile(r"\bopen\s+sdr\b", re.IGNORECASE),
+    re.compile(r"\bopen\s+bdr\b", re.IGNORECASE),
+    re.compile(r"\bsdr\s+(?:req|role|hire|hiring)\b", re.IGNORECASE),
+    re.compile(r"\bbdr\s+(?:req|role|hire|hiring)\b", re.IGNORECASE),
+    re.compile(r"\bhiring\s+(?:a\s+|an\s+|the\s+|your\s+)?(?:founding\s+)?(?:s|b)dr\b", re.IGNORECASE),
+    re.compile(r"\bsdr\s+req\b", re.IGNORECASE),
+    re.compile(r"\bbdr\s+req\b", re.IGNORECASE),
+    # Numbered counts: "5 SDRs", "10 BDRs", "fill the 5 SDRs you have open".
+    re.compile(r"\b\d+\s+sdrs?\b", re.IGNORECASE),
+    re.compile(r"\b\d+\s+bdrs?\b", re.IGNORECASE),
+]
+
+
+def _body_mentions_sdr_hiring(body: str) -> bool:
+    """True iff the body talks about SDR/BDR-style hiring.
+
+    Used as half of the coercion trigger: only rewrite when the body
+    itself references SDR/BDR-hiring (so non-hiring emails are never
+    touched). Combined with banned-phrase detection in the caller, this
+    avoids destructive rewrites of correct outputs.
+    """
+    if not body:
+        return False
+    return any(p.search(body) for p in _SDR_SIGNAL_PATTERNS)
+
+
+def _pick_role_phrase(body: str) -> str:
+    """Choose the canonical role phrase from the body's own language.
+
+    The prompt template restricts ROLE PHRASE to one of six fixed
+    options. The order below is the matching priority: most specific
+    wins (founding SDR / founding BDR), then numbered count, then
+    generic single role. Defaults to "open SDR req" if SDR/BDR
+    mentioned without enough specificity.
+    """
+    if not body:
+        return "open SDR req"
+    lower = body.lower()
+    if "founding sdr" in lower:
+        return "founding SDR"
+    if "founding bdr" in lower:
+        return "founding BDR"
+    # Numbered counts: "5 SDRs", "10 SDR roles", "those 3 SDRs".
+    count_match = re.search(
+        r"\b(\d+)\s+(?:open\s+)?sdr(?:s|\s+roles?)?\b", body, re.IGNORECASE,
+    )
+    if count_match:
+        n = int(count_match.group(1))
+        if n >= 2:
+            return f"those {n} SDRs"
+    count_match = re.search(
+        r"\b(\d+)\s+(?:open\s+)?bdr(?:s|\s+roles?)?\b", body, re.IGNORECASE,
+    )
+    if count_match:
+        n = int(count_match.group(1))
+        if n >= 2:
+            return f"those {n} BDRs"
+    if re.search(r"\bbdr\b", lower):
+        return "open BDR req"
+    return "open SDR req"
+
+
+def canonical_sdr_direct_pitch(first_name: str, role_phrase: str) -> str:
+    """Return the verbatim two-paragraph SDR direct pitch.
+
+    The CTA is fixed ("Want to meet one of them?"). `role_phrase` is the
+    only variable. Single-role variants take "your" ("your founding
+    SDR", "your open SDR req"); the numbered-count variant doesn't
+    ("those 5 SDRs"). No signature, no sender name — ends on the CTA.
+    """
+    fn = (first_name or "").strip() or "Hi"
+    role = role_phrase.strip() or "open SDR req"
+    # "those N SDRs/BDRs" already includes its own determiner; everything
+    # else takes "your".
+    opener_target = role if role.lower().startswith("those ") else f"your {role}"
+    return (
+        f"{fn},\n\n"
+        f"Instead of hiring {opener_target}, I can basically guarantee you "
+        "more results without the onboarding time.\n\n"
+        "We have SDRs already trained selling to your buyers. All US based. "
+        "Want to meet one of them?"
+    )
+
+
+def coerce_sdr_direct_pitch(
+    body: str, *, first_name: str,
+) -> tuple[str, str | None]:
+    """Deterministically rewrite an SDR-hiring body to the canonical pattern.
+
+    Trigger: body mentions SDR/BDR-hiring AND
+      (a) body contains any banned legacy phrase
+       OR (b) body does not already follow the canonical opener
+              ("Instead of hiring") + closing CTA ("Want to meet one of them?").
+
+    When triggered, replace the body with the canonical two-paragraph
+    template using a role phrase picked from the original body. Returns
+    `(new_body, warning_or_None)` — `warning_or_None` is a short note
+    suitable for stashing in `signals_cited` so the operator sees what
+    happened.
+
+    When not triggered, returns the body unchanged with `None`.
+    """
+    if not body:
+        return body, None
+    if not _body_mentions_sdr_hiring(body):
+        return body, None
+
+    has_banned = bool(detect_banned_direct_pitch_phrases(body))
+    has_canonical_opener = bool(
+        re.search(r"\binstead of hiring\b", body, re.IGNORECASE)
+    )
+    has_canonical_cta = bool(
+        re.search(
+            r"\bwant to meet (?:one of them|one of em|them)\b\s*\??",
+            body,
+            re.IGNORECASE,
+        )
+    )
+    if has_canonical_opener and has_canonical_cta and not has_banned:
+        # Already on template — leave it alone.
+        return body, None
+
+    role_phrase = _pick_role_phrase(body)
+    rewritten = canonical_sdr_direct_pitch(first_name, role_phrase)
+    return rewritten, (
+        f"Rewrote SDR-hiring body to canonical Eric pattern "
+        f"(role_phrase={role_phrase!r})."
+    )
 
 
 def detect_partner_channel_mismatch(

@@ -132,20 +132,35 @@ Scan the enrichment signals. Pick the strongest available angle. Priority:
 
 1. HIRING SIGNAL — read by role type, in this priority order:
 
-   1a. SDR / BDR / Sales Development Rep / "Outbound rep" / "founding SDR" hiring (STRONGEST possible signal — this is the exact function OSP replaces). If the prospect has even ONE open SDR/BDR/founding-SDR role, use the SHORT DIRECT PITCH below. Do NOT explain the pain. Do NOT use "real tension", "no ramp", "no attrition risk", "weeks not months". The pitch is two short paragraphs. End on the CTA "Want to meet one of them?".
+   1a. SDR / BDR / Sales Development Rep / "Outbound rep" / "founding SDR" hiring (STRONGEST possible signal — this is the exact function OSP replaces). If the prospect has even ONE open SDR/BDR/founding-SDR role, use the SHORT DIRECT PITCH below VERBATIM. The body MUST match this template word-for-word except the role phrase. Do NOT add a third paragraph. Do NOT add value-comparison phrases. Do NOT explain the pain. This template was hand-tuned and any deviation is a regression.
 
-   SHORT DIRECT PITCH — template (two paragraphs, no signature):
+   SHORT DIRECT PITCH — verbatim template, two paragraphs, no signature:
+
    [First name],
 
-   Instead of hiring your [open SDR req | open BDR req | founding SDR | open sales req], I can basically guarantee you more results without the onboarding time.
+   Instead of hiring your <ROLE PHRASE>, I can basically guarantee you more results without the onboarding time.
 
    We have SDRs already trained selling to your buyers. All US based. Want to meet one of them?
 
-   Variations on the first line based on the specific role enrichment names:
-   - "open SDR req" / "open SDR reqs" (one or more SDR roles)
-   - "founding SDR" (exactly the founding-SDR title)
-   - "open BDR req" (BDR variant)
-   - "open sales req" (generic sales hiring, role type unclear)
+   <ROLE PHRASE> picked from this fixed list — never invent new phrasing:
+   - "founding SDR"     — when the role title is exactly "founding SDR"
+   - "founding BDR"     — when the role title is exactly "founding BDR"
+   - "open SDR req"     — single SDR role, generic
+   - "open BDR req"     — single BDR role, generic
+   - "those N SDRs"     — 2+ SDR roles (substitute the actual count for N)
+   - "those N BDRs"     — 2+ BDR roles
+
+   For sub-cases 1b/1c (AE hiring or generic GTM hiring without an SDR/BDR/founding-SDR signal), the template above does NOT apply — use a normal direct pitch, not this verbatim one.
+
+   FORBIDDEN PHRASES for the SDR-hiring direct pitch (every one of these is a regression — your output will be rewritten if you include them):
+   - "I could fill"           — the template says "Instead of hiring", not "I could fill".
+   - "0 onboarding time"      — the template says "without the onboarding time".
+   - "fraction of the cost"   — no cost comparison; the template doesn't argue price.
+   - "meetings and pipeline next week" — no timeline promise in this template.
+   - "Interested?"            — the CTA is "Want to meet one of them?", not "Interested?".
+   - "real tension"           — pain framing is banned.
+   - "weeks, not months" / "weeks not months" — timeline framing is banned.
+   - "no ramp" / "no attrition risk" — pain-relief framing is banned.
 
    1b. Account Executive / Closer / Sales Rep hiring (5+ open roles). Use the short direct pitch with adjusted first line: "Instead of hiring your open AE reqs, I can basically guarantee you a steady pipeline of qualified meetings without the onboarding time." Same second paragraph and CTA.
 

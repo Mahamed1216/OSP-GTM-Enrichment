@@ -20,6 +20,7 @@ from src.prompts.email import (
     current_email_prompt_fingerprint,
 )
 from src.prompts.sanitize import (
+    coerce_sdr_direct_pitch,
     detect_banned_direct_pitch_phrases,
     detect_competitor_as_buyer,
     detect_partner_channel_mismatch,
@@ -70,6 +71,7 @@ async def generate_email(
         )
         flagged_competitors: list[str] = list(ba.get("flagged_competitors") or [])
         company_industry = lead.industry or None
+        lead_first_name = (lead.first_name or "").strip()
 
     winners = load_top_winners_for("email", k=3)
     negatives = load_top_negatives("email", k=2)
@@ -96,11 +98,27 @@ async def generate_email(
     clean_subject = sanitize_generated_text(result.subject, sender_first_name)
     clean_body = sanitize_generated_text(result.body, sender_first_name)
 
+    # SDR-pitch coercer — deterministic rewrite when the body talks
+    # about SDR/BDR hiring AND the model leaked legacy phrasing ("I
+    # could fill", "0 onboarding time", "fraction of the cost",
+    # "meetings and pipeline next week") instead of using the canonical
+    # two-paragraph template ending on "Want to meet one of them?".
+    # The coercer is a no-op when the body either doesn't mention
+    # SDR/BDR hiring (different signal) or already follows the canonical
+    # pattern (correct output). Runs BEFORE the validators so they see
+    # the final body the operator will actually read.
+    coerced_body, coerce_warning = coerce_sdr_direct_pitch(
+        clean_body, first_name=lead_first_name,
+    )
+    clean_body = coerced_body
+
     # Post-generation validators. These are HEURISTIC flags, not hard
     # blocks — the email still saves, but warnings ride along on
     # `signals_cited` so the operator can review on the Lead detail page
     # and choose to regenerate.
     validation_warnings: list[str] = []
+    if coerce_warning:
+        validation_warnings.append(coerce_warning)
     seg_warnings = detect_segment_vs_company_mismatch(
         clean_body, named_buyer_accounts=named_buyers,
     )
