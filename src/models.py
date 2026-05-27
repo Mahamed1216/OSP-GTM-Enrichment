@@ -55,6 +55,9 @@ class Enrichment(Base):
     company_posts: Mapped[Optional[list]] = mapped_column(JSON)
     company_news: Mapped[Optional[list]] = mapped_column(JSON)
     industry_news: Mapped[Optional[list]] = mapped_column(JSON)
+    # Buyer-account discovery: who would BUY the lead's company's product.
+    # Schema matches BuyerAccountResult from src.enrichment.buyer_accounts.
+    buyer_accounts: Mapped[Optional[dict]] = mapped_column(JSON)
 
     # {source_name: {"success": bool, "error": str|None, "duration_ms": int}}
     source_status: Mapped[dict] = mapped_column(JSON, default=dict)

@@ -134,6 +134,87 @@ def detect_competitor_as_buyer(
     return sorted(set(flagged))
 
 
+def detect_segment_vs_company_mismatch(
+    body: str,
+    *,
+    named_buyer_accounts: list[str] | None = None,
+) -> list[str]:
+    """Flag the segments-but-CTA-says-"companies like them" mismatch.
+
+    Heuristic, not a hard block — returns a list of warning strings the
+    caller (email writer) attaches to signals_cited / metadata for the
+    operator to review. Returns [] when no mismatch is detected.
+
+    Logic:
+      - Look at the first ~2 sentences of the body to find a list-style
+        intro question ("are you working with X, Y, or Z?", "not sure
+        if you're working with X, Y").
+      - If that list contains ONLY tokens that look like segments
+        (multi-word noun phrases, plurals, no Titlecase brand markers)
+        and the body later contains the literal phrase "companies like
+        them" / "companies like that", flag the mismatch.
+      - If `named_buyer_accounts` is provided and any of those names
+        appear in the body, the mismatch is auto-cleared.
+    """
+    if not body:
+        return []
+    warnings: list[str] = []
+
+    has_companies_like = bool(
+        re.search(r"\bcompanies\s+like\s+(?:them|that)\b", body, flags=re.IGNORECASE)
+    )
+    if not has_companies_like:
+        return warnings
+
+    if named_buyer_accounts:
+        haystack = body.lower()
+        if any(
+            name.lower() in haystack
+            for name in named_buyer_accounts
+            if name and name.strip()
+        ):
+            # Body actually names at least one buyer account, so the
+            # "companies like them" CTA has a referent.
+            return warnings
+
+    # Find the first intro question that lists candidates.
+    intro_re = re.compile(
+        r"(?:are you|not sure if you're|curious if you're)[^?]*?with\s+([^?\n]+)\?",
+        flags=re.IGNORECASE,
+    )
+    match = intro_re.search(body)
+    if not match:
+        # No structured intro list; can't reason about it. Flag softly.
+        warnings.append(
+            "Body uses 'companies like them' but no buyer-account list "
+            "was detected — verify the CTA referent."
+        )
+        return warnings
+
+    candidate_list = match.group(1)
+    items = re.split(r",|\bor\b", candidate_list)
+    items = [i.strip() for i in items if i.strip()]
+    if not items:
+        return warnings
+
+    # A "named company" looks like a Titlecase brand token (e.g. JPMorgan,
+    # UnitedHealth) or has a domain suffix. A "segment" reads as a multi-
+    # word lowercase noun phrase ("financial services firms", "healthcare
+    # systems"). The classifier is intentionally conservative: if ANY
+    # item looks like a brand, we assume real companies were named.
+    looks_like_brand = re.compile(
+        r"^(?:[A-Z][A-Za-z0-9&\-]*(?:\s+[A-Z][A-Za-z0-9&\-]*){0,3})$"
+    )
+    any_brand = any(looks_like_brand.match(i) for i in items)
+    if not any_brand:
+        warnings.append(
+            "Body lists buyer SEGMENTS but the CTA says 'companies like "
+            "them' — switch CTA to 'teams like that' or name actual buyer "
+            "companies. Intro list: " + ", ".join(items)
+        )
+    return warnings
+
+
 def sanitize_generated_text(text: str, sender_first_name: str) -> str:
     if not text:
         return text

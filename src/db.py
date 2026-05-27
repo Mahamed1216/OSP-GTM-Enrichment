@@ -42,6 +42,11 @@ _RUNTIME_COLUMN_ADDS: list[tuple[str, str, str]] = [
     ("prompt_configs", "updated_by", "VARCHAR(64)"),
     # is_active defaults to TRUE so existing rows behave the same as new ones.
     ("prompt_configs", "is_active", "BOOLEAN DEFAULT TRUE"),
+    # Buyer-account discovery. JSON column holds the BuyerAccountResult
+    # dump; left null for pre-migration enrichment rows (the email
+    # generator falls back to the buyer-segment branch when this is
+    # null, so old rows don't break).
+    ("enrichments", "buyer_accounts", "JSON"),
 ]
 
 # Postgres-only column widenings. SQLite ignores VARCHAR length caps so

@@ -18,6 +18,7 @@ from typing import Any, Awaitable, Callable
 from sqlalchemy import select
 
 from src.db import session_scope
+from src.enrichment.buyer_accounts import discover_buyer_accounts
 from src.enrichment.company_details import fetch_company_details
 from src.enrichment.linkedin_profile import fetch_linkedin_profile
 from src.enrichment.news import fetch_company_news, fetch_industry_news
@@ -117,6 +118,19 @@ async def enrich_lead(lead_id: int) -> dict:
         ("company_details", fetch_company_details(snapshot["company_linkedin_url"] or ""), bool(snapshot["company_linkedin_url"])),
         ("company_news", fetch_company_news(snapshot["company"] or "", icp=icp), bool(snapshot["company"])),
         ("industry_news", fetch_industry_news(snapshot["industry"] or "", icp=icp), industry_input_present),
+        # Buyer-account discovery uses company name + industry, so input
+        # is "present" iff we have a company name. The discover function
+        # never raises, but a missing Tavily/Anthropic key surfaces as
+        # a low-confidence empty result which classify() will mark
+        # "no_results" — that's the correct status.
+        (
+            "buyer_accounts",
+            discover_buyer_accounts(
+                snapshot["company"] or "",
+                industry=snapshot["industry"],
+            ),
+            bool(snapshot["company"]),
+        ),
     ]
     input_present_by_name = {name: present for name, _, present in sources}
 
@@ -155,6 +169,7 @@ async def enrich_lead(lead_id: int) -> dict:
             existing.company_details = payload.get("company_details")
             existing.company_news = payload.get("company_news")
             existing.industry_news = payload.get("industry_news")
+            existing.buyer_accounts = payload.get("buyer_accounts")
             existing.source_status = status
         else:
             session.add(Enrichment(
@@ -163,6 +178,7 @@ async def enrich_lead(lead_id: int) -> dict:
                 company_details=payload.get("company_details"),
                 company_news=payload.get("company_news"),
                 industry_news=payload.get("industry_news"),
+                buyer_accounts=payload.get("buyer_accounts"),
                 source_status=status,
             ))
 

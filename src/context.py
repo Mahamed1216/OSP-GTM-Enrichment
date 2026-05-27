@@ -72,4 +72,33 @@ def format_lead_context(
         for n in inews[:max_news]:
             parts.append(f"- {n.get('title')}")
 
+    ba = enrichment.buyer_accounts or {}
+    if ba:
+        # Surface ALL four buyer-discovery fields the email prompt expects,
+        # plus flagged competitors so the model can avoid naming them.
+        # The email prompt branches on whether named accounts exist + the
+        # confidence — keep the formatting machine-readable enough for
+        # that branching to be unambiguous.
+        accounts = ba.get("likely_buyer_accounts") or []
+        segments = ba.get("likely_buyer_segments") or []
+        confidence = ba.get("buyer_account_confidence") or "low"
+        rationale = (ba.get("buyer_account_rationale") or "").strip()
+        flagged = ba.get("flagged_competitors") or []
+        parts.append("\n## Buyer accounts (research)")
+        parts.append(
+            f"- likely_buyer_accounts: "
+            + (", ".join(accounts) if accounts else "(none)")
+        )
+        parts.append(
+            f"- likely_buyer_segments: "
+            + (", ".join(segments) if segments else "(none)")
+        )
+        parts.append(f"- buyer_account_confidence: {confidence}")
+        if rationale:
+            parts.append(f"- buyer_account_rationale: {rationale}")
+        if flagged:
+            parts.append(
+                f"- DO NOT NAME (competitors): {', '.join(flagged)}"
+            )
+
     return "\n".join(parts)

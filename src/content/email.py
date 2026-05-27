@@ -19,7 +19,11 @@ from src.prompts.email import (
     build_system as build_email_system,
     current_email_prompt_fingerprint,
 )
-from src.prompts.sanitize import sanitize_generated_text
+from src.prompts.sanitize import (
+    detect_competitor_as_buyer,
+    detect_segment_vs_company_mismatch,
+    sanitize_generated_text,
+)
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +51,12 @@ async def generate_email(
         ).scalar_one_or_none()
         user_msg = format_lead_context(lead, enrichment, score)
         user_msg += "\n\nWrite the email now. Output JSON only."
+        # Snapshot buyer-account fields for the post-generation validator.
+        # Read INSIDE the session so we never touch detached attributes.
+        ba = (enrichment.buyer_accounts or {}) if enrichment else {}
+        named_buyers: list[str] = list(ba.get("likely_buyer_accounts") or [])
+        flagged_competitors: list[str] = list(ba.get("flagged_competitors") or [])
+        company_industry = lead.industry or None
 
     winners = load_top_winners_for("email", k=3)
     negatives = load_top_negatives("email", k=2)
@@ -73,17 +83,48 @@ async def generate_email(
     clean_subject = sanitize_generated_text(result.subject, sender_first_name)
     clean_body = sanitize_generated_text(result.body, sender_first_name)
 
+    # Post-generation validators. These are HEURISTIC flags, not hard
+    # blocks — the email still saves, but warnings ride along on
+    # `signals_cited` so the operator can review on the Lead detail page
+    # and choose to regenerate.
+    validation_warnings: list[str] = []
+    seg_warnings = detect_segment_vs_company_mismatch(
+        clean_body, named_buyer_accounts=named_buyers,
+    )
+    validation_warnings.extend(seg_warnings)
+    competitor_hits = detect_competitor_as_buyer(
+        clean_body,
+        company_industry=company_industry,
+        competitor_seed=flagged_competitors,
+    )
+    if competitor_hits:
+        validation_warnings.append(
+            "Possible competitor named as buyer: " + ", ".join(competitor_hits)
+        )
+    # Attach as prefixed entries to signals_cited so existing UIs that
+    # render the field show them without a schema change. Prefix makes
+    # them filterable downstream.
+    signals_with_warnings = list(result.signals_cited or []) + [
+        f"validator:{w}" for w in validation_warnings
+    ]
+
     with session_scope() as session:
         session.add(GeneratedContent(
             lead_id=lead_id,
             kind="email",
             subject=clean_subject,
             body=clean_body,
-            signals_cited=result.signals_cited,
+            signals_cited=signals_with_warnings,
             prompt_version=PROMPT_VERSION,
             prompt_fingerprint=current_email_prompt_fingerprint(),
             model=settings.content_model,
         ))
+
+    if validation_warnings:
+        log.warning(
+            "email_validation_warnings",
+            extra={"lead_id": lead_id, "warnings": validation_warnings},
+        )
 
     log.info("email_generated", extra={
         "lead_id": lead_id,

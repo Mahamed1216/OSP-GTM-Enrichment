@@ -69,27 +69,42 @@ BAD: "Three months into the VP role and you're already hiring."
 BAD: "I saw you just brought on John."
 
 # BUYER ACCOUNTS — WHO TO NAME
-When the prospect's company sells software, AI, infrastructure, services, or a platform, any companies you name in the intro play MUST be plausible BUYERS of that product, not competitors.
+The enrichment context includes a "## Buyer accounts (research)" block with:
+- likely_buyer_accounts (named companies)
+- likely_buyer_segments (segment labels)
+- buyer_account_confidence (low | medium | high)
+- DO NOT NAME (competitors) — companies you must never reference as buyers.
 
-Rules:
-- NEVER name a direct competitor as a potential customer or intro target.
-- "Direct competitor" = a company in the same product category as the prospect's company (e.g., for a voice AI infrastructure company, other voice AI infrastructure companies are competitors).
-- For AI infrastructure companies, do not name other AI infrastructure vendors as buyers.
-- For voice AI companies, do not name other voice AI platforms as buyers.
-- For sales tools / SDR tools, do not name other sales tools as buyers.
-- If you cannot confidently identify 2-3 named buyer accounts, USE THE SAFER PATTERN BELOW instead of guessing.
+BRANCHING RULE — match the CTA wording to what you actually named:
 
-Safer pattern (use when buyer accounts are unclear):
-- Describe the BUYER SEGMENT in plain language. Example: "support, healthcare, or enterprise call center teams using voice agents", "fintech ops teams running outbound calls", "SaaS support orgs deploying AI agents".
-- Or ask about a buyer ROLE: "teams building voice agents at larger support orgs", "RevOps leaders at growth-stage SaaS".
-- The intro play still works without specific named companies.
+CASE A: likely_buyer_accounts has ≥2 entries AND buyer_account_confidence is "medium" or "high".
+- Name those companies in the intro question.
+- CTA may use "companies like them" since you actually named companies.
+- Example: "Not sure if you're already working with JPMorgan, UnitedHealth, or Lockheed? They seem like a great fit for what AIVeda does."
+  CTA: "Happy to show you how we could make an intro to them or companies like them. Just let me know."
 
-BAD (Ultravox.ai, a voice AI infrastructure company):
+CASE B: likely_buyer_accounts is empty OR buyer_account_confidence is "low".
+- Use likely_buyer_segments in the intro question. Do NOT invent named companies.
+- CTA MUST NOT say "companies like them" — you named no companies. Reference TEAMS instead.
+- Example: "Not sure if you're already working with financial services firms, healthcare systems, or defense contractors? They seem like a great fit for what AIVeda does."
+  CTA: "Happy to show you how we could get you in front of teams like that. Just let me know."
+
+Hard rules — never break these:
+1. NEVER name a direct competitor as a potential buyer. The enrichment "DO NOT NAME (competitors)" list is authoritative.
+2. NEVER invent buyer company names that are not in likely_buyer_accounts.
+3. If buyer_account_confidence == "low" or likely_buyer_accounts is empty, your CTA MUST use the "teams like that" phrasing — never "companies like them".
+4. If both lists are empty, fall back to a single-target framing without naming companies or segments.
+
+BAD (Ultravox.ai, voice AI infrastructure):
 "Are you working with Bland AI, Retell AI, or ElevenLabs?"
-Reason: those are direct competitors, not buyers.
+Reason: those are competitors, not buyers.
 
-GOOD:
-"Curious if you're already getting in front of support, healthcare, or enterprise call-center teams building on voice agents?"
+BAD (segments named, CTA mismatched):
+"Not sure if you're already working with financial services firms, healthcare systems, or defense contractors? Happy to show you how we could make an intro to them or companies like them."
+Reason: no companies were named, so "companies like them" has nothing to refer back to.
+
+GOOD (CASE B — segments + matching CTA):
+"Curious if you're already getting in front of support, healthcare, or enterprise call-center teams building on voice agents? Happy to show you how we could get you in front of teams like that. Just let me know."
 
 # GOAL OF THIS MESSAGE
 The #1 goal is to get ANY REPLY, NOT to book a meeting. Treat meeting booking as a second step that happens after they respond. The CTA should invite a SHORT one or two-word reply ("yes", "send it", "interested", "sure"), NEVER a call or meeting time.
