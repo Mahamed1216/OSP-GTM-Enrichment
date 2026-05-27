@@ -137,10 +137,11 @@ def _sent_emails_cached() -> "pd.DataFrame":
 def _format_event_when(ts) -> str:
     if ts is None or pd.isna(ts):
         return "—"
-    try:
-        return ts.strftime("%Y-%m-%d %H:%M")
-    except Exception:
-        return str(ts)
+    # Route every event timestamp through the shared ET formatter so the
+    # engagement events list, sent folder, and recommendation history
+    # all render consistently in Eastern.
+    from app.lib.formatters import format_et
+    return format_et(ts)
 
 
 def _event_status_icons(row) -> str:
@@ -209,7 +210,11 @@ def _format_pct(num: int, denom: int) -> str:
 def _format_timestamp(ts: datetime | None) -> str:
     if ts is None:
         return "never"
-    return ts.strftime("%Y-%m-%d %H:%M:%S")
+    # Eastern Time via the shared formatter so "Last synced from
+    # Instantly", recommendation history, and approval timestamps
+    # all read the same.
+    from app.lib.formatters import format_et
+    return format_et(ts)
 
 
 st.markdown(

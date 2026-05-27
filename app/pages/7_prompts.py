@@ -85,7 +85,16 @@ def _last_saved_caption() -> str:
     ts = get_last_saved_timestamp()
     if ts is None:
         return ":gray[No overlay saved yet — showing defaults.]"
-    return f":gray[Last saved: {ts}]"
+    # `ts` is a string from the loader (legacy contract); the loader
+    # writes ISO-ish UTC. Reparse + reformat in Eastern so this caption
+    # matches the rest of the UI.
+    try:
+        from datetime import datetime
+        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        from app.lib.formatters import format_et
+        return f":gray[Last saved: {format_et(parsed)}]"
+    except Exception:
+        return f":gray[Last saved: {ts}]"
 
 
 def _render_channel(channel: str, label: str, default_body: str) -> None:
@@ -137,11 +146,10 @@ def _render_email_channel_sectioned(channel: str, label: str, default_body: str)
         st.caption(f"Loaded from: {_SOURCE_LABELS.get(source, source)}")
         meta = get_overlay_metadata(channel) if source == "database" else None
         if meta:
+            from app.lib.formatters import format_et
             meta_bits = []
             if meta.get("updated_at"):
-                meta_bits.append(
-                    f"updated_at {meta['updated_at'].strftime('%Y-%m-%d %H:%M:%S')}"
-                )
+                meta_bits.append(f"updated_at {format_et(meta['updated_at'])}")
             if meta.get("updated_by"):
                 meta_bits.append(f"by {meta['updated_by']}")
             if meta.get("prompt_fingerprint"):

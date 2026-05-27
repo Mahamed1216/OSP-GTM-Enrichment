@@ -1,7 +1,20 @@
-"""Formatting helpers for durations, timestamps, and source-status icons."""
+"""Formatting helpers for durations, timestamps, and source-status icons.
+
+Timestamps are stored in UTC (naive `datetime.utcnow()` writes), but all
+display goes through `fmt_timestamp`, which is now an alias for
+`format_et`. That keeps storage untouched while every page renders
+"2026-05-27 2:55 PM ET". Eastern is DST-aware via zoneinfo (America/
+New_York) — no manual offset math.
+"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
+
+try:  # Python 3.9+ stdlib
+    from zoneinfo import ZoneInfo
+    _ET = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover — zoneinfo missing only on very old envs
+    _ET = timezone(__import__("datetime").timedelta(hours=-5))
 
 
 def fmt_duration_ms(ms: int | float | None) -> str:
@@ -12,7 +25,12 @@ def fmt_duration_ms(ms: int | float | None) -> str:
     return f"{ms / 1000:.1f} s"
 
 
-def fmt_timestamp(value: datetime | str | None) -> str:
+def format_et(value: datetime | str | None) -> str:
+    """Render a UTC-stored timestamp as Eastern Time: '2026-05-27 2:55 PM ET'.
+
+    Accepts naive datetimes (assumed UTC), tz-aware datetimes (any zone,
+    converted to ET), or ISO strings. Returns '—' for None.
+    """
     if value is None:
         return "—"
     if isinstance(value, str):
@@ -21,8 +39,20 @@ def fmt_timestamp(value: datetime | str | None) -> str:
         except ValueError:
             return value
     if value.tzinfo is None:
+        # Naive timestamp — we store UTC by convention everywhere.
         value = value.replace(tzinfo=timezone.utc)
-    return value.strftime("%Y-%m-%d %H:%M:%S UTC")
+    et = value.astimezone(_ET)
+    # %-I/%#I aren't portable; do the hour-strip manually.
+    hour = et.strftime("%I").lstrip("0") or "12"
+    return et.strftime(f"%Y-%m-%d {hour}:%M %p ET")
+
+
+def fmt_timestamp(value: datetime | str | None) -> str:
+    """Backward-compat alias — every page already imports this name.
+
+    Previously rendered in UTC; now renders in Eastern via `format_et`.
+    """
+    return format_et(value)
 
 
 def source_status_icon(success: bool | None) -> str:

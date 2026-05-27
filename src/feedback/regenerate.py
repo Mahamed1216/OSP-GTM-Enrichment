@@ -30,6 +30,85 @@ class RegenerateRefused(ValueError):
     """Raised when preconditions for regeneration are not met."""
 
 
+async def regenerate_direct(
+    generated_content_id: int, feedback_text: str
+) -> int:
+    """Regenerate using an ad-hoc feedback string — no rating required.
+
+    Backs the Lead Detail "Redo with feedback" textbox. The original
+    `regenerate_with_feedback` requires a persisted thumbs-down rating
+    with non-empty feedback; that's appropriate for the rating-driven
+    learning loop but it locks the operator out after the first rating
+    is submitted (rating widget hides; button disappears). This entry
+    point sidesteps the rating ledger entirely.
+
+    Preconditions:
+      - source row exists (LookupError otherwise)
+      - source.superseded_by_id IS NULL (cycle/double-regen guard — same
+        as the rating-driven path; we still set the supersede pointer)
+      - feedback_text is non-empty after strip
+    The same `_KIND_DISPATCH` generator runs, so it picks up the LIVE DB
+    prompt overlay (no caching) and stamps the current prompt fingerprint
+    on the new row.
+    """
+    feedback = (feedback_text or "").strip()
+    if not feedback:
+        raise RegenerateRefused("Empty feedback — provide guidance for the rewrite.")
+
+    with session_scope() as session:
+        source = session.get(GeneratedContent, generated_content_id)
+        if source is None:
+            raise LookupError(f"GeneratedContent {generated_content_id} not found")
+        if source.superseded_by_id is not None:
+            raise RegenerateRefused(
+                f"GeneratedContent {generated_content_id} is already superseded "
+                f"by {source.superseded_by_id}"
+            )
+        kind = source.kind
+        lead_id = source.lead_id
+
+    generator = _KIND_DISPATCH.get(kind)
+    if generator is None:
+        raise RegenerateRefused(f"Unknown content kind: {kind!r}")
+
+    log.info(
+        "regenerate_direct_started",
+        extra={"content_id": generated_content_id, "kind": kind, "lead_id": lead_id},
+    )
+    await generator(lead_id, regeneration_feedback=feedback)
+
+    with session_scope() as session:
+        new_row = session.execute(
+            select(GeneratedContent)
+            .where(
+                GeneratedContent.lead_id == lead_id,
+                GeneratedContent.kind == kind,
+                GeneratedContent.id != generated_content_id,
+                GeneratedContent.superseded_by_id.is_(None),
+            )
+            .order_by(GeneratedContent.id.desc())
+        ).scalars().first()
+        if new_row is None:
+            raise RuntimeError(
+                f"Generator for kind={kind!r} did not produce a new GeneratedContent row "
+                f"for lead {lead_id}"
+            )
+        new_id = new_row.id
+        source = session.get(GeneratedContent, generated_content_id)
+        source.superseded_by_id = new_id
+
+    log.info(
+        "regenerate_direct_complete",
+        extra={
+            "old_content_id": generated_content_id,
+            "new_content_id": new_id,
+            "kind": kind,
+            "lead_id": lead_id,
+        },
+    )
+    return new_id
+
+
 async def regenerate_with_feedback(generated_content_id: int) -> int:
     """Regenerate content using its thumbs-down rating's feedback. Returns new content id.
 

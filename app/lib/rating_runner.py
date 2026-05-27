@@ -10,7 +10,7 @@ from typing import Any
 
 from app.lib.async_runner import run_async
 from src.feedback.ratings import record_rating
-from src.feedback.regenerate import regenerate_with_feedback
+from src.feedback.regenerate import regenerate_direct, regenerate_with_feedback
 from src.leads import delete_lead
 
 
@@ -39,6 +39,16 @@ def regenerate_sync(content_id: int) -> int:
         wrong rating direction, or empty feedback)
     """
     return run_async(regenerate_with_feedback(content_id))
+
+
+def regenerate_direct_sync(content_id: int, feedback: str) -> int:
+    """Redo content with an ad-hoc feedback string — no rating required.
+
+    Used by the Lead Detail "Redo with feedback" textbox so the operator
+    can re-roll an email without first submitting a thumbs-down rating.
+    Returns the new content id; old row's superseded_by_id is set.
+    """
+    return run_async(regenerate_direct(content_id, feedback))
 
 
 def delete_lead_sync(lead_id: int) -> dict[str, Any]:

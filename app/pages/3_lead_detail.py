@@ -16,7 +16,12 @@ from app.lib.badges import pill, status_badge, tier_badge
 from app.lib.components import fit_score_viz
 from app.lib.db_queries import get_lead_full
 from app.lib.formatters import fmt_duration_ms, fmt_timestamp, source_status_display
-from app.lib.rating_runner import delete_lead_sync, record_rating_sync, regenerate_sync
+from app.lib.rating_runner import (
+    delete_lead_sync,
+    record_rating_sync,
+    regenerate_direct_sync,
+    regenerate_sync,
+)
 from app.styles import inject_styles
 from src.feedback.ratings import get_rating
 
@@ -357,9 +362,33 @@ with tab_content:
                         disabled=True,
                         key=f"ld_body_{kind}_{active['id']}",
                     )
+                    # Metadata caption — model, prompt version, fingerprint
+                    # (first 8 of the SHA-prefix stored on the row),
+                    # current overlay source ("Database" when an overlay
+                    # row exists; otherwise the JSON/code fallback), and
+                    # the created_at rendered in Eastern Time.
+                    _fp = (active.get("prompt_fingerprint") or "")[:8] or "—"
+                    _source_label = "—"
+                    if active["kind"] == "email":
+                        try:
+                            from src.prompts.email import DEFAULT_EMAIL_PROMPT_BODY
+                            from src.prompts.loader import get_effective_prompt_with_source
+                            _, _source_key = get_effective_prompt_with_source(
+                                "email", DEFAULT_EMAIL_PROMPT_BODY,
+                            )
+                            _source_label = {
+                                "database": "Database",
+                                "local_json": "Local JSON",
+                                "code_default": "Code default",
+                            }.get(_source_key, _source_key)
+                        except Exception:
+                            _source_label = "—"
                     st.caption(
-                        f"Model: `{active['model']}`  ·  Prompt version: `{active['prompt_version']}`  "
-                        f"·  Created: {fmt_timestamp(active['created_at'])}"
+                        f"Model: `{active['model']}`  ·  "
+                        f"Prompt version: `{active['prompt_version']}`  ·  "
+                        f"Fingerprint: `{_fp}`  ·  "
+                        f"Prompt source: {_source_label}  ·  "
+                        f"Created: {fmt_timestamp(active['created_at'])}"
                     )
                     cited = active.get("signals_cited") or []
                     if cited:
@@ -371,7 +400,62 @@ with tab_content:
                         # Rating widgets only on the head.
                         _render_rating_block(active["id"])
 
-                        # Regenerate button: appears only when rated down + feedback exists.
+                        # Always-available "Redo with feedback" widget. Free
+                        # text input + button; not gated on a rating. Calls
+                        # `regenerate_direct_sync` which re-reads the LIVE
+                        # DB prompt overlay before generating, so the new
+                        # row picks up any prompt edits the operator just
+                        # saved on the Prompts page. The old row's
+                        # superseded_by_id is set; the head pointer moves.
+                        st.divider()
+                        st.markdown("**Redo with feedback**")
+                        redo_fb_key = f"ld_redo_fb_{kind}_{active['id']}"
+                        redo_btn_key = f"ld_redo_btn_{kind}_{active['id']}"
+                        redo_running_key = f"ld_redo_running_{kind}_{active['id']}"
+                        in_flight = bool(st.session_state.get(redo_running_key, False))
+                        redo_feedback = st.text_area(
+                            "What should the rewrite change?",
+                            key=redo_fb_key,
+                            placeholder=(
+                                "e.g. use the founding SDR direct pitch; drop \"real tension\"; "
+                                "no sender signature."
+                            ),
+                            disabled=in_flight,
+                            height=80,
+                        )
+                        if st.button(
+                            "🔄 Redo with feedback (uses latest DB prompt)",
+                            key=redo_btn_key,
+                            type="primary",
+                            disabled=in_flight or not (redo_feedback or "").strip(),
+                        ):
+                            st.session_state[redo_running_key] = True
+                            new_id: int | None = None
+                            error_msg: str | None = None
+                            try:
+                                with st.spinner("Regenerating with feedback…"):
+                                    new_id = regenerate_direct_sync(
+                                        active["id"], redo_feedback,
+                                    )
+                            except Exception as exc:
+                                error_msg = f"{type(exc).__name__}: {exc}"
+                            finally:
+                                # ALWAYS clear the in-flight flag, even on
+                                # error — that's what was leaving the input
+                                # permanently disabled.
+                                st.session_state[redo_running_key] = False
+
+                            if error_msg is not None:
+                                st.error(f"Redo failed: {error_msg}")
+                            elif new_id is not None:
+                                st.session_state[state_key] = new_id
+                                st.success("Email regenerated with latest prompt.")
+                                st.rerun()
+
+                        # Legacy rating-driven path still available when the
+                        # operator has rated the row down with feedback.
+                        # Kept as a secondary affordance so the existing
+                        # workflow still works.
                         try:
                             head_rating = get_rating(active["id"])
                         except Exception:
@@ -381,14 +465,13 @@ with tab_content:
                             and head_rating.get("rating") == "down"
                             and (head_rating.get("feedback_text") or "").strip()
                         ):
-                            st.divider()
                             if st.button(
-                                "🔄 Regenerate with this feedback",
+                                "🔄 Regenerate using the saved rating feedback",
                                 key=f"ld_regen_{kind}_{active['id']}",
-                                type="primary",
+                                type="secondary",
                             ):
                                 try:
-                                    with st.spinner("Regenerating with feedback…"):
+                                    with st.spinner("Regenerating with rating feedback…"):
                                         new_id = regenerate_sync(active["id"])
                                     st.toast("New version generated", icon="✨")
                                     st.session_state[state_key] = new_id
