@@ -3,7 +3,7 @@ from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-Tier = Literal["A", "B", "C"]
+Tier = Literal["A", "B", "C", "D"]
 
 
 class Settings(BaseSettings):
@@ -52,7 +52,10 @@ class Settings(BaseSettings):
         return "C"
 
     def should_send(self, tier: Tier) -> bool:
-        rank = {"A": 3, "B": 2, "C": 1}
+        # "D" is the ICP-skip tier (e.g., confirmed B2C with no B2B
+        # motion). It ranks below C so it's blocked from delivery under
+        # every send_min_tier setting.
+        rank = {"A": 3, "B": 2, "C": 1, "D": 0}
         return rank[tier] >= rank[self.send_min_tier]
 
 

@@ -69,6 +69,13 @@ class BuyerAccountResult(BaseModel):
     partner_confidence: Literal["low", "medium", "high"] = "low"
     reasoning: str = ""
 
+    # Concrete evidence the company has a B2B sales motion (enterprise
+    # pricing page, partner program, white-label product, employer
+    # benefits, embedded-finance deals, B2B case studies, etc.). Empty
+    # when no such evidence was found in research. Used by the scoring
+    # module to disqualify B2C-only companies from OSP outreach.
+    explicit_b2b_motion_evidence: list[str] = Field(default_factory=list)
+
     # v1 fields (legacy — kept for backward-compat with rows persisted
     # before the schema split).
     likely_buyer_accounts: list[str] = Field(default_factory=list)
@@ -128,6 +135,25 @@ STEP 5 — Reasoning.
     were chosen. Name the evidence ("customer page lists Acme, Beta",
     "no enterprise pricing — consumer billing").
 
+STEP 6 — Explicit B2B motion evidence (CRITICAL for B2C companies).
+  - `explicit_b2b_motion_evidence`: list every concrete artifact in the
+    research that proves the company SELLS to businesses, not just
+    partners with them. Each entry is a short quote or fact:
+      * "enterprise pricing page"
+      * "partner program for banks"
+      * "white-label product for credit unions"
+      * "employer benefits offering on workplace.example.com"
+      * "embedded-finance API documented at api.example.com"
+      * "case study with [Business Customer Name]"
+      * "channel sales team listed on careers page"
+      * "B2B pricing tiers"
+  - DO NOT list market-adjacent companies (mortgage lenders, banks,
+    neobanks, credit unions) as B2B evidence just because they exist
+    in the same market. Evidence MUST show the target sells TO them.
+  - Empty list when no such evidence exists. For a pure-B2C product
+    like a consumer credit-repair app with only individual billing,
+    this list MUST be empty even if banks appear in the research.
+
 Critical rules:
   1. NEVER conflate partners with direct buyers. If the product is
      sold to consumers but BANKS or LENDERS appear in research, that's
@@ -158,7 +184,8 @@ Output schema (JSON, no prose):
   "likely_buyer_segments": ["..."],
   "buyer_account_confidence": "low | medium | high",
   "buyer_account_rationale": "<1-2 sentences>",
-  "flagged_competitors": ["..."]
+  "flagged_competitors": ["..."],
+  "explicit_b2b_motion_evidence": ["..."]
 }
 
 Worked examples:
@@ -176,7 +203,7 @@ A) Voice AI infrastructure (e.g. Ultravox.ai)
   "flagged_competitors": ["Bland AI", "Retell AI", "ElevenLabs"]
 }
 
-B) Consumer credit app (e.g. Dovly)
+B) Consumer credit app (e.g. Dovly) — pure B2C, NO B2B motion evidence found
 {
   "buyer_motion": "B2C",
   "likely_direct_buyers": [],
@@ -185,7 +212,21 @@ B) Consumer credit app (e.g. Dovly)
   "likely_end_users": ["consumers repairing or building credit"],
   "buyer_confidence": "low",
   "partner_confidence": "medium",
-  "reasoning": "Dovly's app is sold to individuals; banks and lenders are partner/referral channels, not direct buyers."
+  "reasoning": "Dovly's app is sold to individuals; banks and lenders are partner/referral channels, not direct buyers.",
+  "explicit_b2b_motion_evidence": []
+}
+
+C) Same company but research surfaced a real B2B motion
+{
+  "buyer_motion": "B2B2C",
+  "likely_direct_buyers": ["employers offering financial wellness benefits"],
+  "likely_partner_channels": ["financial wellness platforms"],
+  "likely_referral_channels": [],
+  "likely_end_users": ["consumers repairing or building credit"],
+  "buyer_confidence": "medium",
+  "partner_confidence": "medium",
+  "reasoning": "Workplace.dovly.com lists 12 employer customers; clear B2B benefits motion alongside the consumer app.",
+  "explicit_b2b_motion_evidence": ["employer benefits page lists Aon, Mercer, 10 others", "B2B pricing tier visible on benefits.dovly.com"]
 }
 """
 

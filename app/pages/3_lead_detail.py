@@ -191,6 +191,17 @@ with m3:
     if lead.get("email"):
         st.markdown(f"**Email**  `{lead['email']}`")
 
+# ICP-skip banner. Tier "D" is reserved for confirmed B2C / non-fit
+# leads — scoring writes it via the deterministic rule:b2c_skip path.
+# The banner sits between the metric row and the actions panel so the
+# operator sees it before deciding to rerun anything.
+if score and score.get("tier") == "D":
+    st.warning(
+        "**B2C company. Not a fit for OSP unless clear B2B sales "
+        "motion exists.**  \n"
+        + (score.get("rationale") or "")
+    )
+
 st.divider()
 
 # ---------- Lead actions ----------

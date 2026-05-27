@@ -52,6 +52,10 @@ async def generate_email(
         score = session.execute(
             select(Score).where(Score.lead_id == lead_id)
         ).scalar_one_or_none()
+        # ICP-skip path: tier "D" is reserved for confirmed B2C / non-fit
+        # leads. Snapshot the flag here so we can short-circuit AFTER the
+        # session closes (no detached-attribute access on the score row).
+        is_icp_skip = bool(score and getattr(score, "tier", None) == "D")
         user_msg = format_lead_context(lead, enrichment, score)
         user_msg += "\n\nWrite the email now. Output JSON only."
         # Snapshot buyer-account fields for the post-generation validators.
@@ -72,6 +76,35 @@ async def generate_email(
         flagged_competitors: list[str] = list(ba.get("flagged_competitors") or [])
         company_industry = lead.industry or None
         lead_first_name = (lead.first_name or "").strip()
+
+    # ICP-skip short-circuit: tier "D" means scoring already decided
+    # this is a poor OSP fit (typically B2C without B2B motion). Skip
+    # the LLM call entirely, persist a canned skip record, and return.
+    if is_icp_skip:
+        skip_subject = ""
+        skip_body = "SKIP: Primary motion appears B2C. No clear B2B outbound motion found."
+        skip_signals = ["B2C motion, poor OSP fit"]
+        with session_scope() as session:
+            session.add(GeneratedContent(
+                lead_id=lead_id,
+                kind="email",
+                subject=skip_subject,
+                body=skip_body,
+                signals_cited=skip_signals,
+                prompt_version=PROMPT_VERSION,
+                prompt_fingerprint=current_email_prompt_fingerprint(),
+                model="rule:icp_skip",
+                skip_reason="tier_below_threshold",
+            ))
+        log.info(
+            "email_icp_skip",
+            extra={"lead_id": lead_id, "reason": "tier_D_b2c_no_b2b_motion"},
+        )
+        return EmailResult(
+            subject=skip_subject or "(skip)",
+            body=skip_body,
+            signals_cited=skip_signals,
+        )
 
     winners = load_top_winners_for("email", k=3)
     negatives = load_top_negatives("email", k=2)

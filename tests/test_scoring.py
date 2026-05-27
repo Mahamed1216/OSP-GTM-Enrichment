@@ -17,8 +17,16 @@ def test_score_schema_rejects_score_below_1():
 
 
 def test_score_schema_rejects_unknown_tier():
+    # "D" is now the ICP-skip tier (B2C no-fit); test with a still-
+    # invalid tier letter so we still cover the literal-validation path.
     with pytest.raises(ValidationError):
-        ScoreResult(score=50, tier="D", rationale="x", signals_used=[])
+        ScoreResult(score=50, tier="Z", rationale="x", signals_used=[])
+
+
+def test_score_schema_accepts_d_tier():
+    # D is reserved for the deterministic B2C-skip path. Must validate.
+    r = ScoreResult(score=20, tier="D", rationale="B2C skip", signals_used=["B2C motion, poor OSP fit"])
+    assert r.tier == "D"
 
 
 def test_score_schema_rejects_blank_rationale():
