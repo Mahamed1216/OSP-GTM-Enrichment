@@ -55,10 +55,16 @@ from src.feedback.self_improvement import (
     DEFAULT_BOUNCE_RATE_MAX,
     DEFAULT_OPEN_RATE_TARGET,
     DEFAULT_REPLY_RATE_TARGET,
+    LOOP_DIAGNOSE,
+    LOOP_DRAFT,
+    LOOP_READY,
+    LOOP_WAIT,
     MIN_SAMPLE_FOR_RECOMMENDATION,
-    MetricSet,
+    REPLY_DIAGNOSE_HOURS,
+    SAMPLE_LOW_CONF_MAX,
     approve_recommendation,
     diagnose,
+    kpi_view,
     list_recommendations,
     performance_by_prompt_version,
     reject_recommendation,
@@ -324,14 +330,15 @@ st.divider()
 # ---------- KPI row (Instantly is source of truth) ----------
 st.caption("Source: Instantly campaign analytics")
 
-if _snapshot is not None:
-    sent_remote = int(_snapshot.get("emails_sent_count") or 0)
-    contacted = int(_snapshot.get("contacted_count") or 0)
-    opens = int(_snapshot.get("open_count") or 0)
-    replies = int(_snapshot.get("reply_count") or 0)
-    bounces = int(_snapshot.get("bounced_count") or 0)
-else:
-    sent_remote = contacted = opens = replies = bounces = 0
+# `kpi_view()` is the single source for every number on this page. The
+# self-improving loop below reads the SAME dict — so KPI cards and the
+# loop's "current bounce rate" can never disagree on a rounding boundary.
+_metrics = kpi_view(_snapshot)
+sent_remote = _metrics["sent"]
+contacted = _metrics["contacted"]
+opens = _metrics["opens"]
+replies = _metrics["replies"]
+bounces = _metrics["bounces"]
 
 c1, c2, c3, c4 = st.columns(4)
 with c1:
@@ -356,12 +363,15 @@ if _snapshot is not None and contacted and contacted != sent_remote:
         f"· clicks: {int(_snapshot.get('click_count') or 0):,}"
     )
 
-# Discrepancy warning + debug expander
+# Sync-hygiene warning: surfaced ONLY here, never as a self-improvement
+# recommendation. The loop's delivery branch is informational; this
+# warning is the operator-facing version.
 _local_sent = _local_sent_cached()
 if _snapshot is not None and contacted and abs(contacted - _local_sent) >= 5:
     st.warning(
-        f"Instantly has {contacted:,} sequence started, but local DB has "
-        f"{_local_sent:,} sent records."
+        f"Sync hygiene: Instantly has {contacted:,} sequence started, but "
+        f"local DB has {_local_sent:,} sent records for this campaign. "
+        "Investigate the gap — this is a tracking issue, not a copy issue."
     )
 
 with st.expander("Sync debug — raw Instantly analytics + DB comparison"):
@@ -442,63 +452,89 @@ with st.expander("Benchmarks", expanded=False):
 if _snapshot is None:
     st.info("Sync from Instantly first — the loop needs a metrics snapshot to diagnose.")
 else:
-    metrics = MetricSet.from_snapshot(_snapshot)
+    # `diagnose()` reads the SAME `_metrics` dict the KPI cards above
+    # rendered from, so the loop's "current bounce rate" can't differ
+    # from the bounce-rate card by a rounding step.
     diag = diagnose(
-        metrics,
+        _metrics,
         open_rate_target=open_rate_target,
         reply_rate_target=reply_rate_target,
         bounce_rate_max=bounce_rate_max,
-        contacted_expected=_local_sent or None,
+        local_sent_count=_local_sent or None,
     )
 
-    if diag.sample_size < MIN_SAMPLE_FOR_RECOMMENDATION:
-        st.info(
-            f"Not enough data for a strong recommendation yet "
-            f"({diag.sample_size} sent, need ≥ {MIN_SAMPLE_FOR_RECOMMENDATION}). "
-            "Recommendations below are labeled low confidence."
-        )
+    _STATUS_BADGE = {
+        LOOP_WAIT: ("⏸ Wait", "info"),
+        LOOP_DIAGNOSE: ("🔍 Diagnose only", "info"),
+        LOOP_DRAFT: ("📝 Draft recommendation", "warning"),
+        LOOP_READY: ("✅ Ready for approval", "success"),
+    }
+    badge_text, badge_kind = _STATUS_BADGE.get(diag.loop_status, ("—", "info"))
 
-    if diag.bottleneck == "none":
-        st.success(diag.diagnosis)
-    else:
-        with st.container(border=True):
-            cols = st.columns(4)
-            with cols[0]:
-                st.metric(
-                    diag.current_metric_label,
+    with st.container(border=True):
+        # Status banner
+        if badge_kind == "success":
+            st.success(badge_text)
+        elif badge_kind == "warning":
+            st.warning(badge_text)
+        else:
+            st.info(badge_text)
+
+        # Metric panel — same numbers as the KPI cards above.
+        cols = st.columns(4)
+        with cols[0]:
+            st.metric(
+                diag.current_metric_label,
+                (
                     f"{diag.current_metric_value * 100:.1f}%"
                     if diag.current_metric_label in ("Open rate", "Reply rate", "Bounce rate")
-                    else f"{diag.current_metric_value:,.0f}",
-                )
-            with cols[1]:
-                st.metric(
-                    "Target",
+                    else f"{diag.current_metric_value:,.0f}"
+                ),
+            )
+        with cols[1]:
+            st.metric(
+                "Target",
+                (
                     f"{diag.target_metric_value * 100:.1f}%"
                     if diag.current_metric_label in ("Open rate", "Reply rate", "Bounce rate")
-                    else f"{diag.target_metric_value:,.0f}",
+                    else f"{diag.target_metric_value:,.0f}"
+                ),
+            )
+        with cols[2]:
+            st.metric("Sample", f"{diag.sample_size:,}")
+        with cols[3]:
+            hours = diag.hours_since_latest_send
+            st.metric(
+                "Since latest send",
+                "—" if hours is None else f"{hours:.1f}h",
+            )
+
+        st.markdown(f"**Bottleneck:** `{diag.bottleneck}` · **Confidence:** {diag.confidence}")
+        st.markdown(f"**Diagnosis:** {diag.diagnosis}")
+        st.markdown(f"**Recommended action:** {diag.recommended_change}")
+        if diag.expected_impact and diag.expected_impact != "—":
+            st.markdown(f"**Expected impact:** {diag.expected_impact}  ·  **Risk:** {diag.risk_level}")
+
+        # Approval controls only render for prompt-change candidates that
+        # passed every gate (sample + timing + open-rate-healthy when
+        # applicable). Bounce / delivery / wait / diagnose-only diagnoses
+        # NEVER show Approve.
+        if diag.is_actionable_prompt_change:
+            with st.expander("Proposed addendum — small, appended to current overlay"):
+                st.caption(
+                    "On approval, this text is APPENDED to the existing email "
+                    "prompt overlay. Your previous edits are preserved. Only "
+                    "future generated emails are affected."
                 )
-            with cols[2]:
-                st.metric("Risk", diag.risk_level.capitalize())
-            with cols[3]:
-                st.metric(
-                    "Confidence",
-                    "Low" if diag.low_confidence else "Standard",
-                )
+                st.code(diag.proposed_addendum, language="markdown")
 
-            st.markdown(f"**Diagnosis:** {diag.diagnosis}")
-            st.markdown(f"**Recommended change:** {diag.recommended_change}")
-            st.markdown(f"**Expected impact:** {diag.expected_impact}")
-
-            if diag.proposed_prompt and diag.previous_prompt_snapshot:
-                with st.expander("Proposed prompt — review before approving"):
-                    st.text(diag.proposed_prompt)
-
-            # Save the diagnosis as a pending recommendation, then expose
-            # approve / reject / draft buttons.
-            pending_rec_key = f"sil_pending_rec_{diag.bottleneck}_{int(diag.current_metric_value * 10000)}"
+            # Persist the recommendation ONCE per (bottleneck, value)
+            # signature so re-rendering the page doesn't spam the history.
+            sig = f"{diag.bottleneck}_{diag.loop_status}_{int(diag.current_metric_value * 10000)}"
+            pending_rec_key = f"sil_pending_rec_{sig}"
             if pending_rec_key not in st.session_state:
                 st.session_state[pending_rec_key] = save_recommendation(diag)
-            rec_id = int(st.session_state[pending_rec_key])
+            rec_id = st.session_state[pending_rec_key]
 
             a, b, c = st.columns(3)
             with a:
@@ -506,14 +542,17 @@ else:
                     "Approve change for next send",
                     key=f"sil_approve_{rec_id}",
                     type="primary",
-                    disabled=(diag.proposed_prompt is None),
+                    disabled=(diag.loop_status != LOOP_READY),
+                    help=(
+                        None
+                        if diag.loop_status == LOOP_READY
+                        else "Approve is only available at standard confidence "
+                        f"(≥ {SAMPLE_LOW_CONF_MAX} sent). Use Save-as-draft "
+                        "for low-confidence drafts."
+                    ),
                 )
             with b:
-                reject = st.button(
-                    "Reject",
-                    key=f"sil_reject_{rec_id}",
-                    type="secondary",
-                )
+                reject = st.button("Reject", key=f"sil_reject_{rec_id}", type="secondary")
             with c:
                 draft = st.button(
                     "Save as draft recommendation",
@@ -521,7 +560,7 @@ else:
                     type="secondary",
                 )
 
-            if approve and diag.proposed_prompt:
+            if approve and diag.loop_status == LOOP_READY:
                 try:
                     approve_recommendation(rec_id, approved_by="demo_sdr")
                 except Exception as exc:
@@ -530,8 +569,9 @@ else:
                     st.cache_data.clear()
                     st.session_state.pop(pending_rec_key, None)
                     st.success(
-                        "Approved — new prompt overlay saved. Future generations "
-                        "will use it; already-sent emails are unchanged."
+                        "Approved — addendum appended to the email prompt "
+                        "overlay. Future generations will use it; already-"
+                        "sent emails are unchanged."
                     )
                     st.rerun()
             if reject:
@@ -554,6 +594,15 @@ else:
                     st.cache_data.clear()
                     st.info("Saved as draft.")
                     st.rerun()
+        elif diag.bottleneck == "none":
+            st.caption("Green across the board — nothing to do.")
+        else:
+            # wait / diagnose-only for any bottleneck, or bounce/delivery.
+            # No buttons by design.
+            st.caption(
+                "No prompt change available at this state. Re-evaluate after "
+                "more sends arrive or the timing window passes."
+            )
 
 # ---------- Recommendation history ----------
 with st.expander("Recommendation history & rollback"):
@@ -566,19 +615,23 @@ with st.expander("Recommendation history & rollback"):
                 "approved": "✓",
                 "rejected": "✗",
                 "draft": "·",
-                "pending": "…",
+                "ready_for_approval": "⏳",
             }.get(rec["status"], "?")
             header = (
-                f"{status_icon} {rec['status'].capitalize()} · "
+                f"{status_icon} {rec['status'].replace('_', ' ').capitalize()} · "
                 f"{rec['bottleneck']} · "
                 f"{rec['current_metric_label']} "
                 f"{rec['current_metric_value'] * 100:.1f}% → "
                 f"target {rec['target_metric_value'] * 100:.1f}% · "
+                f"sample {rec['sample_size']} · "
                 f"{_format_timestamp(rec['created_at'])}"
             )
             with st.container(border=True):
                 st.markdown(header)
                 st.caption(rec["diagnosis"])
+                if rec.get("proposed_addendum"):
+                    with st.expander("Addendum that was proposed"):
+                        st.code(rec["proposed_addendum"], language="markdown")
                 if rec["approved_by"]:
                     st.caption(
                         f"By {rec['approved_by']} at "
@@ -638,11 +691,12 @@ with st.expander("Prompt experiment tracker — performance by prompt version"):
             }
         )
         st.dataframe(df, hide_index=True, width="stretch")
-        if (df["Sent"] < MIN_SAMPLE_FOR_RECOMMENDATION).any():
-            st.caption(
-                f"Rows with Sent < {MIN_SAMPLE_FOR_RECOMMENDATION} are flagged "
-                "low-confidence and ignored by the auto-recommendation."
-            )
+        st.caption(
+            f"Rows with Sent < {MIN_SAMPLE_FOR_RECOMMENDATION} are flagged "
+            "low-confidence. The self-improvement loop reads campaign-level "
+            "Instantly metrics, not this table, but the same minimum-sample "
+            "rule applies before any prompt change is suggested."
+        )
 
 st.divider()
 

@@ -1,27 +1,44 @@
 """Approval-gated self-improvement loop.
 
-Inputs:
-  - Latest InstantlyAnalyticsSnapshot (source of truth for KPIs).
-  - Per-prompt-version rollup from local Engagement + GeneratedContent
-    (used to label experiments and gate small samples).
+Design contract (the previous iteration of this module violated several
+of these — the rewrite enforces them):
 
-Outputs:
-  - A PromptRecommendation row (status='pending') describing the
-    bottleneck, the proposed change, expected impact, and risk level.
-  - On approval, the proposed_prompt text is written to the
-    `prompt_configs` overlay (the same source `src/prompts/email.py`
-    reads via `get_effective_prompt`). The PREVIOUS overlay is stashed
-    on the recommendation row so the operator can roll back.
+  1. Single source of truth for metrics. `kpi_view(snapshot)` returns the
+     same integers + rates the Engagement page's KPI cards render. The
+     loop ALWAYS reads from `kpi_view()`; it never re-computes from raw
+     fields. KPI cards and the loop therefore can't disagree on bounce
+     rate, open rate, sample size, etc.
 
-Nothing here ever pushes to Instantly, regenerates already-sent emails,
-or applies a change without status='approved'. Approval is mediated by
-the Engagement page UI.
+  2. Bounce and delivery are NEVER prompt changes. They're diagnostic-
+     only states. The diagnose() function refuses to attach a
+     `proposed_addendum` to them; the persistence layer refuses to save
+     them as a `PromptRecommendation` (those rows are for prompt-edit
+     candidates only).
+
+  3. Sample-size and timing gates are PRE-CONDITIONS for proposing a
+     prompt change, not labels on a forced recommendation:
+       - sent < 50  → loop_status = "wait" (no recommendation, no row)
+       - sent 50-199 → confidence = "low" → loop_status = "draft"
+       - sent ≥ 200  → confidence = "standard" → loop_status =
+         "ready_for_approval" (Approve button live)
+       - latest send < 24h  AND bottleneck = reply_rate → "wait"
+       - latest send < 48h  AND bottleneck = reply_rate → "diagnose_only"
+
+  4. Reply-rate fix requires a HEALTHY open rate. If open rate is below
+     target, the open-rate fix is the recommendation — never both.
+
+  5. Proposed changes are SMALL ADDENDUMS, not full prompt rewrites. On
+     approval, the addendum is APPENDED to the current overlay; rollback
+     restores the previous overlay snapshot.
+
+  6. Nothing here pushes to Instantly, regenerates already-sent emails,
+     activates campaigns, or touches existing GeneratedContent rows.
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from sqlalchemy import case, func, select
@@ -38,100 +55,167 @@ from src.prompts.loader import get_effective_prompt, save_overlay
 
 log = logging.getLogger(__name__)
 
-# Default benchmarks. Override per-call from the UI if needed.
+# Default benchmarks. UI exposes these to the operator.
 DEFAULT_OPEN_RATE_TARGET = 0.30
 DEFAULT_REPLY_RATE_TARGET = 0.03
 DEFAULT_BOUNCE_RATE_MAX = 0.03
-MIN_SAMPLE_FOR_RECOMMENDATION = 50
+
+# Sample-size and timing thresholds. Constants so tests can monkey-patch.
+SAMPLE_WAIT_MAX = 50          # below this → "wait" (no recommendation)
+SAMPLE_LOW_CONF_MAX = 200     # below this but ≥ wait → "draft" (low conf)
+REPLY_WAIT_HOURS = 24         # below this, no reply-rate diagnosis at all
+REPLY_DIAGNOSE_HOURS = 48     # below this, diagnose-only on reply-rate
+
+# Loop status vocabulary — see module docstring.
+LOOP_WAIT = "wait"
+LOOP_DIAGNOSE = "diagnose_only"
+LOOP_DRAFT = "draft"
+LOOP_READY = "ready_for_approval"
 
 
-@dataclass
-class MetricSet:
-    """Parsed metrics from the latest analytics snapshot."""
-    contacted: int
-    sent: int
-    opens: int
-    replies: int
-    bounces: int
-    open_rate: float
-    reply_rate: float
-    bounce_rate: float
-    sample_size: int  # sent-emails denominator the rates were computed against
+# ---------------------------------------------------------------------------
+# KPI view — single source of truth shared with the page's KPI cards.
+# ---------------------------------------------------------------------------
 
-    @classmethod
-    def from_snapshot(cls, snap: dict[str, Any]) -> "MetricSet":
-        sent = int(snap.get("emails_sent_count") or 0)
-        opens = int(snap.get("open_count") or 0)
-        replies = int(snap.get("reply_count") or 0)
-        bounces = int(snap.get("bounced_count") or 0)
-        denom = sent if sent > 0 else 1
-        return cls(
-            contacted=int(snap.get("contacted_count") or 0),
-            sent=sent,
-            opens=opens,
-            replies=replies,
-            bounces=bounces,
-            open_rate=opens / denom,
-            reply_rate=replies / denom,
-            bounce_rate=bounces / denom,
-            sample_size=sent,
-        )
+def kpi_view(snapshot: dict[str, Any] | None) -> dict[str, Any]:
+    """Return the metrics dict the KPI cards AND the loop both read.
 
+    Keys: contacted, sent, opens, replies, bounces (all ints) plus
+    open_rate, reply_rate, bounce_rate (floats in [0, 1]). When the
+    snapshot is None or empty, every value is zero.
+
+    The Engagement page imports this and renders its KPI cards from the
+    returned dict directly, so by construction the loop and the cards
+    cannot disagree on any number.
+    """
+    if not snapshot:
+        return {
+            "contacted": 0, "sent": 0, "opens": 0, "replies": 0, "bounces": 0,
+            "open_rate": 0.0, "reply_rate": 0.0, "bounce_rate": 0.0,
+        }
+    sent = int(snapshot.get("emails_sent_count") or 0)
+    contacted = int(snapshot.get("contacted_count") or 0)
+    opens = int(snapshot.get("open_count") or 0)
+    replies = int(snapshot.get("reply_count") or 0)
+    bounces = int(snapshot.get("bounced_count") or 0)
+    denom = sent if sent > 0 else 1
+    return {
+        "contacted": contacted,
+        "sent": sent,
+        "opens": opens,
+        "replies": replies,
+        "bounces": bounces,
+        "open_rate": opens / denom,
+        "reply_rate": replies / denom,
+        "bounce_rate": bounces / denom,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Diagnosis dataclass — what the loop returns to the UI.
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Diagnosis:
-    bottleneck: str                      # open_rate|reply_rate|bounce_rate|delivery|none
-    channel: Optional[str]               # email | None
-    diagnosis: str                       # human prose
+    """One pass of the loop. The UI renders this; persistence only saves
+    it when `loop_status in {draft, ready_for_approval}` and only those
+    states expose Approve buttons."""
+
+    loop_status: str                     # wait | diagnose_only | draft | ready_for_approval
+    bottleneck: str                      # open_rate | reply_rate | bounce_rate | delivery | none
+    channel: Optional[str]               # email | None (None for non-prompt actions)
+    confidence: str                      # insufficient | low | standard
+    diagnosis: str                       # human prose, names which metric triggered
     current_metric_label: str
     current_metric_value: float
     target_metric_value: float
-    recommended_change: str              # what to do
+    recommended_change: str              # operator action — prompt edit OR ops action
     expected_impact: str
     risk_level: str                      # low | medium | high
-    proposed_prompt: Optional[str]       # full prompt text, only for prompt-changing recs
+    proposed_addendum: Optional[str]     # SHORT addendum text, appended on approval
     previous_prompt_snapshot: Optional[str]
-    sample_size: int
-    low_confidence: bool
+    sample_size: int                     # sent emails (the denominator)
+    hours_since_latest_send: Optional[float]
+
+    @property
+    def is_actionable_prompt_change(self) -> bool:
+        """True iff this diagnosis would, on approval, write to the
+        prompt overlay. Bounce + delivery are always False."""
+        return (
+            self.proposed_addendum is not None
+            and self.channel is not None
+            and self.loop_status in (LOOP_DRAFT, LOOP_READY)
+        )
 
 
 # ---------------------------------------------------------------------------
-# Prompt edit templates — generated by hand, not by an LLM. Each one appends
-# a short directive to the END of the current overlay so the user can read
-# the diff in the approval box and the existing prompt body stays intact.
+# Addendum templates — short and specific. Each one names the triggering
+# metric explicitly so the operator can see WHY in the diff preview.
 # ---------------------------------------------------------------------------
 
-_OPEN_RATE_ADDENDUM = """\
-
-# OPEN-RATE FIX — added by self-improvement loop
-Subject lines have been underperforming on open rate. Tighten as follows:
-- Subject under 4 words. Prefer 2–3.
-- Reference ONE concrete entity (company, product, role) — not a category.
-- Avoid generic angles ("quick question", "intro", "checking in", "your team").
-- Lowercase preferred. No emoji, no punctuation.
-
-BAD subjects (do not use): "Outbound help", "quick question", "your sales team", "intro".
-GOOD subjects: "servicenow play", "10 open sdrs", "ericsson fit", "telco outage angle".
-"""
-
-_REPLY_RATE_ADDENDUM = """\
-
-# REPLY-RATE FIX — added by self-improvement loop
-Body copy has been underperforming on reply rate. Tighten as follows:
-- Cut every sentence that doesn't name a specific company, role, or signal.
-- CTA must invite a ONE-WORD reply ("yes", "send it", "interested?"). Never propose a call or meeting time.
-- Lead with a CONCRETE value comparison (cost vs in-house SDR, meetings next week, specific volume).
-- Body length: 50–80 words. Anything longer reads like a vendor email.
-- Drop hedging phrases ("might be a fit", "if you're open to...", "no worries if not").
-"""
+def _open_rate_addendum(current_rate: float, target_rate: float) -> str:
+    return (
+        "# OPEN-RATE FIX — added by self-improvement loop\n"
+        f"# Triggered by: open rate {current_rate * 100:.1f}% "
+        f"(target {target_rate * 100:.0f}%).\n"
+        "# Scope: subject lines only. Body copy unchanged.\n"
+        "- Subjects under 4 words. Prefer 2 or 3.\n"
+        "- Reference one concrete entity (company, product, role) from enrichment.\n"
+        "- No generic angles (\"quick question\", \"intro\", \"checking in\").\n"
+        "- Lowercase. No emoji, no punctuation in the subject line.\n"
+    )
 
 
-def _build_email_open_rate_prompt(current: str) -> str:
-    return current.rstrip() + "\n" + _OPEN_RATE_ADDENDUM
+def _reply_rate_addendum(current_rate: float, target_rate: float) -> str:
+    return (
+        "# REPLY-RATE FIX — added by self-improvement loop\n"
+        f"# Triggered by: reply rate {current_rate * 100:.2f}% "
+        f"(target {target_rate * 100:.0f}%) with a HEALTHY open rate.\n"
+        "# Scope: body length, CTA, hedging. Subject lines unchanged.\n"
+        "- Body 50–80 words. Cut every sentence without a named entity.\n"
+        "- CTA must invite a one-word reply. No call/meeting CTAs.\n"
+        "- Lead with a concrete value comparison or a number.\n"
+        "- Remove hedging (\"might be a fit\", \"if you're open\", \"no worries if not\").\n"
+    )
 
 
-def _build_email_reply_rate_prompt(current: str) -> str:
-    return current.rstrip() + "\n" + _REPLY_RATE_ADDENDUM
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _latest_send_timestamp() -> datetime | None:
+    """MAX(delivered_at) over email GeneratedContent rows actually sent.
+
+    Used to gate the reply-rate diagnosis on the 24h/48h timing rules.
+    Reads from the local DB rather than Instantly because Instantly's
+    analytics snapshot doesn't expose per-campaign first/last send
+    timestamps in a stable shape.
+    """
+    with session_scope() as session:
+        ts = session.execute(
+            select(func.max(GeneratedContent.delivered_at)).where(
+                GeneratedContent.kind == "email",
+                GeneratedContent.delivery_status == "sent",
+            )
+        ).scalar()
+    return ts
+
+
+def _confidence_band(sample_size: int) -> str:
+    if sample_size < SAMPLE_WAIT_MAX:
+        return "insufficient"
+    if sample_size < SAMPLE_LOW_CONF_MAX:
+        return "low"
+    return "standard"
+
+
+def _loop_status_for_prompt_change(confidence: str) -> str:
+    """Map a prompt-change candidate's confidence to a loop status."""
+    if confidence == "insufficient":
+        return LOOP_WAIT
+    if confidence == "low":
+        return LOOP_DRAFT
+    return LOOP_READY
 
 
 # ---------------------------------------------------------------------------
@@ -139,175 +223,291 @@ def _build_email_reply_rate_prompt(current: str) -> str:
 # ---------------------------------------------------------------------------
 
 def diagnose(
-    metrics: MetricSet,
+    metrics: dict[str, Any],
     *,
     open_rate_target: float = DEFAULT_OPEN_RATE_TARGET,
     reply_rate_target: float = DEFAULT_REPLY_RATE_TARGET,
     bounce_rate_max: float = DEFAULT_BOUNCE_RATE_MAX,
-    contacted_expected: int | None = None,
-    low_confidence_override: bool = False,
+    local_sent_count: int | None = None,
+    now: datetime | None = None,
+    latest_send: datetime | None = None,
 ) -> Diagnosis:
-    """Pick the worst-performing bottleneck and draft a recommendation.
+    """Single entrypoint. `metrics` MUST be the dict returned by
+    `kpi_view()` so KPI cards and this function agree by construction.
 
-    Priority:
-      1. Bounce rate over max → data-hygiene action (NOT a prompt change).
-      2. Delivery count well below expected → sync/delivery investigation.
-      3. Open rate below target → subject-line addendum.
-      4. Reply rate below target → body/CTA addendum.
-      5. Everything green → no recommendation.
+    Priority (matches the spec's diagnosis rules verbatim):
+      1. Bounce rate above max → diagnose-only, list-quality action.
+      2. Open rate below target → subject-line addendum candidate.
+         Gates: sample size only (opens happen fast).
+      3. Reply rate below target AND open rate healthy → body/CTA
+         addendum candidate. Gates: sample size + 48-hour timing.
+      4. Else → "none" / green.
 
-    Returns a Diagnosis even when below the min-sample threshold; the
-    caller checks `low_confidence` and labels the UI accordingly.
+    Delivery mismatch is intentionally NOT a loop diagnosis. The page
+    surfaces sync hygiene as a top-of-page warning where it belongs;
+    the loop focuses on copy-affecting diagnoses so a delivery gap
+    doesn't crowd out an open-rate fix that the operator could act on.
+    `local_sent_count` is still accepted for backward-compat but is no
+    longer consulted here.
     """
-    sample_size = metrics.sample_size
-    low_confidence = (
-        sample_size < MIN_SAMPLE_FOR_RECOMMENDATION
-    ) or low_confidence_override
+    sent = int(metrics["sent"])
+    contacted = int(metrics["contacted"])
+    bounce_rate = float(metrics["bounce_rate"])
+    open_rate = float(metrics["open_rate"])
+    reply_rate = float(metrics["reply_rate"])
+    sample_size = sent
+    confidence = _confidence_band(sample_size)
 
-    # 1) Bounce — data hygiene, never a prompt change.
-    if metrics.sent > 0 and metrics.bounce_rate > bounce_rate_max:
+    if latest_send is None:
+        latest_send = _latest_send_timestamp()
+    if now is None:
+        now = datetime.utcnow()
+    hours_since_send: float | None = None
+    if latest_send is not None:
+        hours_since_send = max(0.0, (now - latest_send).total_seconds() / 3600.0)
+
+    # ---- 1) Bounce rate — always diagnose-only ----------------------------
+    if sent > 0 and bounce_rate > bounce_rate_max:
         return Diagnosis(
+            loop_status=LOOP_DIAGNOSE,
             bottleneck="bounce_rate",
             channel=None,
+            confidence=confidence,
             diagnosis=(
-                f"Bounce rate is {metrics.bounce_rate * 100:.1f}% "
+                f"Bounce rate is {bounce_rate * 100:.1f}% "
                 f"(target ≤ {bounce_rate_max * 100:.1f}%). "
                 "List quality / verification is the issue, not the copy."
             ),
             current_metric_label="Bounce rate",
-            current_metric_value=metrics.bounce_rate,
+            current_metric_value=bounce_rate,
             target_metric_value=bounce_rate_max,
             recommended_change=(
-                "Run all unverified leads through the email verifier before "
-                "the next push (Settings → Verify cache). Strip catch-all "
-                "domains. Do NOT change the prompt — bounces are not a copy "
-                "problem."
+                "Re-verify unverified leads before the next push (Settings → "
+                "Verify cache). Strip catch-all and disposable domains. "
+                "Do NOT change the prompt — bounces are not a copy problem."
             ),
             expected_impact="Bounce rate drops below target within one send cycle.",
             risk_level="low",
-            proposed_prompt=None,
+            proposed_addendum=None,
             previous_prompt_snapshot=None,
             sample_size=sample_size,
-            low_confidence=low_confidence,
+            hours_since_latest_send=hours_since_send,
         )
 
-    # 2) Delivery — sequence-start count well below expected.
-    if (
-        contacted_expected is not None
-        and contacted_expected > 0
-        and metrics.contacted < int(contacted_expected * 0.85)
-    ):
-        return Diagnosis(
-            bottleneck="delivery",
-            channel=None,
-            diagnosis=(
-                f"Instantly has {metrics.contacted} sequence-started leads, "
-                f"but the local DB expected ~{contacted_expected}. Likely "
-                "causes: leads in the DB with no Instantly push, paused/"
-                "stopped subseqs, or rate-limited campaign."
-            ),
-            current_metric_label="Sequences started",
-            current_metric_value=float(metrics.contacted),
-            target_metric_value=float(contacted_expected),
-            recommended_change=(
-                "Investigate the campaign in Instantly: confirm it's active, "
-                "check daily send caps, and re-push leads with delivery_status "
-                "= NULL. Do NOT change the prompt."
-            ),
-            expected_impact="Sequence-started count converges to local sent count.",
-            risk_level="low",
-            proposed_prompt=None,
-            previous_prompt_snapshot=None,
-            sample_size=sample_size,
-            low_confidence=low_confidence,
-        )
+    # Delivery mismatch is handled by the page-level sync-hygiene warning,
+    # not by this loop — see module docstring + spec rule #3. The
+    # `local_sent_count` arg stays in the signature so existing callers
+    # don't break.
 
-    # 3) Open rate — subject lines.
-    if metrics.sent > 0 and metrics.open_rate < open_rate_target:
+    # ---- Sample gate (applies only to prompt-change candidates) ----------
+    insufficient = confidence == "insufficient"
+
+    # ---- 3) Open rate — subject lines ------------------------------------
+    if sent > 0 and open_rate < open_rate_target:
+        if insufficient:
+            return Diagnosis(
+                loop_status=LOOP_WAIT,
+                bottleneck="open_rate",
+                channel="email",
+                confidence=confidence,
+                diagnosis=(
+                    f"Open rate is {open_rate * 100:.1f}% (target "
+                    f"{open_rate_target * 100:.0f}%) on only {sample_size} "
+                    f"sent. Not enough data for a strong recommendation yet."
+                ),
+                current_metric_label="Open rate",
+                current_metric_value=open_rate,
+                target_metric_value=open_rate_target,
+                recommended_change=(
+                    f"Wait for at least {SAMPLE_WAIT_MAX} sends before drafting "
+                    "a subject-line addendum."
+                ),
+                expected_impact="—",
+                risk_level="low",
+                proposed_addendum=None,
+                previous_prompt_snapshot=None,
+                sample_size=sample_size,
+                hours_since_latest_send=hours_since_send,
+            )
         current = get_effective_prompt("email", DEFAULT_EMAIL_PROMPT_BODY)
-        proposed = _build_email_open_rate_prompt(current)
         return Diagnosis(
+            loop_status=_loop_status_for_prompt_change(confidence),
             bottleneck="open_rate",
             channel="email",
+            confidence=confidence,
             diagnosis=(
-                f"Open rate is {metrics.open_rate * 100:.1f}% "
+                f"Open rate is {open_rate * 100:.1f}% on {sample_size} sent "
                 f"(target {open_rate_target * 100:.0f}%). Subject lines or "
-                "targeting angle are weak."
+                "targeting angle are weak — body copy is not in scope."
             ),
             current_metric_label="Open rate",
-            current_metric_value=metrics.open_rate,
+            current_metric_value=open_rate,
             target_metric_value=open_rate_target,
             recommended_change=(
-                "Append a SUBJECT-LINE addendum to the email prompt: enforce "
-                "≤4 words, one concrete entity, lowercase, no generic angles. "
-                "Only affects FUTURE generated emails."
+                "Append a SUBJECT-LINE addendum to the email prompt: ≤4 "
+                "words, one concrete entity, lowercase, no generic angles. "
+                "Affects FUTURE generated emails only."
             ),
-            expected_impact=(
-                f"Open rate +5 to +10 percentage points within ~{MIN_SAMPLE_FOR_RECOMMENDATION} "
-                "new sends. Already-sent emails are untouched."
-            ),
+            expected_impact="Open rate +5 to +10 percentage points on subsequent sends.",
             risk_level="medium",
-            proposed_prompt=proposed,
+            proposed_addendum=_open_rate_addendum(open_rate, open_rate_target),
             previous_prompt_snapshot=current,
             sample_size=sample_size,
-            low_confidence=low_confidence,
+            hours_since_latest_send=hours_since_send,
         )
 
-    # 4) Reply rate — body / CTA.
-    if metrics.sent > 0 and metrics.reply_rate < reply_rate_target:
+    # ---- 4) Reply rate — body / CTA. Gates: open healthy, timing, sample.
+    open_is_healthy = open_rate >= open_rate_target
+    if sent > 0 and reply_rate < reply_rate_target and open_is_healthy:
+        # Timing gates take priority over sample gates because waiting longer
+        # is cheap and the spec asks for these specific cutoffs.
+        if hours_since_send is not None and hours_since_send < REPLY_WAIT_HOURS:
+            return Diagnosis(
+                loop_status=LOOP_WAIT,
+                bottleneck="reply_rate",
+                channel="email",
+                confidence=confidence,
+                diagnosis=(
+                    f"Open rate is healthy ({open_rate * 100:.1f}%) but the "
+                    f"latest send was {hours_since_send:.1f}h ago. Replies "
+                    "typically arrive 24-72h after the first touch. Wait "
+                    "before changing the body."
+                ),
+                current_metric_label="Reply rate",
+                current_metric_value=reply_rate,
+                target_metric_value=reply_rate_target,
+                recommended_change=(
+                    f"Wait at least {REPLY_WAIT_HOURS}h after the latest send "
+                    "before drafting a body-copy change."
+                ),
+                expected_impact="—",
+                risk_level="low",
+                proposed_addendum=None,
+                previous_prompt_snapshot=None,
+                sample_size=sample_size,
+                hours_since_latest_send=hours_since_send,
+            )
+        if hours_since_send is not None and hours_since_send < REPLY_DIAGNOSE_HOURS:
+            return Diagnosis(
+                loop_status=LOOP_DIAGNOSE,
+                bottleneck="reply_rate",
+                channel="email",
+                confidence=confidence,
+                diagnosis=(
+                    f"Open rate is healthy ({open_rate * 100:.1f}%); reply rate "
+                    f"is {reply_rate * 100:.2f}% but the latest send was only "
+                    f"{hours_since_send:.1f}h ago. Diagnose only — do not "
+                    "change the body until at least "
+                    f"{REPLY_DIAGNOSE_HOURS}h have passed."
+                ),
+                current_metric_label="Reply rate",
+                current_metric_value=reply_rate,
+                target_metric_value=reply_rate_target,
+                recommended_change=(
+                    "Hold on body-copy edits. Re-evaluate after "
+                    f"{REPLY_DIAGNOSE_HOURS}h. If the rate is still low and "
+                    "open rate stays healthy, the addendum candidate will "
+                    "appear here."
+                ),
+                expected_impact="—",
+                risk_level="low",
+                proposed_addendum=None,
+                previous_prompt_snapshot=None,
+                sample_size=sample_size,
+                hours_since_latest_send=hours_since_send,
+            )
+        if insufficient:
+            return Diagnosis(
+                loop_status=LOOP_WAIT,
+                bottleneck="reply_rate",
+                channel="email",
+                confidence=confidence,
+                diagnosis=(
+                    f"Reply rate {reply_rate * 100:.2f}% on only {sample_size} "
+                    "sent. Not enough data for a strong recommendation yet."
+                ),
+                current_metric_label="Reply rate",
+                current_metric_value=reply_rate,
+                target_metric_value=reply_rate_target,
+                recommended_change=(
+                    f"Wait for at least {SAMPLE_WAIT_MAX} sends and "
+                    f"{REPLY_DIAGNOSE_HOURS}h elapsed before drafting a "
+                    "body-copy addendum."
+                ),
+                expected_impact="—",
+                risk_level="low",
+                proposed_addendum=None,
+                previous_prompt_snapshot=None,
+                sample_size=sample_size,
+                hours_since_latest_send=hours_since_send,
+            )
         current = get_effective_prompt("email", DEFAULT_EMAIL_PROMPT_BODY)
-        proposed = _build_email_reply_rate_prompt(current)
         return Diagnosis(
+            loop_status=_loop_status_for_prompt_change(confidence),
             bottleneck="reply_rate",
             channel="email",
+            confidence=confidence,
             diagnosis=(
-                f"Open rate is healthy ({metrics.open_rate * 100:.1f}%) but "
-                f"reply rate is {metrics.reply_rate * 100:.2f}% "
-                f"(target {reply_rate_target * 100:.0f}%). Body copy or CTA "
-                "is the bottleneck."
+                f"Open rate is healthy ({open_rate * 100:.1f}%) but reply "
+                f"rate is {reply_rate * 100:.2f}% on {sample_size} sent "
+                f"(target {reply_rate_target * 100:.0f}%). Body copy / CTA "
+                "is the bottleneck — subject lines are working."
             ),
             current_metric_label="Reply rate",
-            current_metric_value=metrics.reply_rate,
+            current_metric_value=reply_rate,
             target_metric_value=reply_rate_target,
             recommended_change=(
                 "Append a BODY/CTA addendum to the email prompt: tighten "
                 "length to 50–80 words, force one-word CTA, drop hedging. "
-                "Only affects FUTURE generated emails."
+                "Affects FUTURE generated emails only."
             ),
-            expected_impact=(
-                "Reply rate +1 to +2 percentage points on subsequent sends. "
-                "Already-sent emails are untouched."
-            ),
+            expected_impact="Reply rate +1 to +2 percentage points on subsequent sends.",
             risk_level="medium",
-            proposed_prompt=proposed,
+            proposed_addendum=_reply_rate_addendum(reply_rate, reply_rate_target),
             previous_prompt_snapshot=current,
             sample_size=sample_size,
-            low_confidence=low_confidence,
+            hours_since_latest_send=hours_since_send,
         )
 
+    # ---- 5) Green ---------------------------------------------------------
     return Diagnosis(
+        loop_status=LOOP_DIAGNOSE,
         bottleneck="none",
         channel=None,
+        confidence=confidence,
         diagnosis="All metrics meet or exceed the configured targets. No change recommended.",
         current_metric_label="Reply rate",
-        current_metric_value=metrics.reply_rate,
+        current_metric_value=reply_rate,
         target_metric_value=reply_rate_target,
         recommended_change="No change recommended.",
         expected_impact="—",
         risk_level="low",
-        proposed_prompt=None,
+        proposed_addendum=None,
         previous_prompt_snapshot=None,
         sample_size=sample_size,
-        low_confidence=low_confidence,
+        hours_since_latest_send=hours_since_send,
     )
 
 
 # ---------------------------------------------------------------------------
-# Persistence
+# Persistence — only for prompt-change candidates.
 # ---------------------------------------------------------------------------
 
-def save_recommendation(diag: Diagnosis, *, status: str = "pending") -> int:
-    """Persist a Diagnosis as a PromptRecommendation row. Returns row id."""
+def save_recommendation(diag: Diagnosis) -> int | None:
+    """Persist a Diagnosis IFF it's an actionable prompt-change candidate.
+
+    Returns the new row id, or None when the diagnosis is wait /
+    diagnose-only / none (those don't belong in the recommendation
+    history because they have no addendum to approve or roll back).
+    The previous module saved one for every render — that surfaced
+    bounce/delivery noise in the history.
+    """
+    if not diag.is_actionable_prompt_change:
+        return None
+    # The DB column is named `proposed_prompt`; we persist the addendum
+    # text under that column so existing migrations still apply. The
+    # approval step appends it to the current overlay (not overwrites).
+    initial_status = "ready_for_approval" if diag.loop_status == LOOP_READY else "draft"
     with session_scope() as session:
         rec = PromptRecommendation(
             bottleneck=diag.bottleneck,
@@ -319,11 +519,11 @@ def save_recommendation(diag: Diagnosis, *, status: str = "pending") -> int:
             recommended_change=diag.recommended_change,
             expected_impact=diag.expected_impact,
             risk_level=diag.risk_level,
-            proposed_prompt=diag.proposed_prompt,
+            proposed_prompt=diag.proposed_addendum,
             previous_prompt_snapshot=diag.previous_prompt_snapshot,
             sample_size=int(diag.sample_size),
-            low_confidence=bool(diag.low_confidence),
-            status=status,
+            low_confidence=(diag.confidence == "low"),
+            status=initial_status,
         )
         session.add(rec)
         session.flush()
@@ -331,13 +531,12 @@ def save_recommendation(diag: Diagnosis, *, status: str = "pending") -> int:
 
 
 def approve_recommendation(rec_id: int, *, approved_by: str) -> dict[str, Any]:
-    """Approve a recommendation and apply the prompt change (if any).
+    """Approve and APPEND the addendum to the current overlay.
 
-    Only flips status to 'approved' and writes the proposed prompt text
-    to the prompt_configs overlay. NEVER touches already-sent emails or
-    Instantly. The previous overlay is already stashed on the row, so
-    rollback is a separate action that copies previous_prompt_snapshot
-    back into the overlay.
+    The addendum is appended, not substituted, so the operator's existing
+    prompt edits are preserved. The PREVIOUS full overlay (pre-append)
+    is what gets stashed for rollback, so undo always restores to the
+    exact state before this approval.
     """
     with session_scope() as session:
         rec = session.get(PromptRecommendation, rec_id)
@@ -345,19 +544,27 @@ def approve_recommendation(rec_id: int, *, approved_by: str) -> dict[str, Any]:
             raise ValueError(f"Recommendation {rec_id} not found")
         if rec.status == "approved":
             return {"id": rec_id, "status": "approved", "already": True}
+        if not rec.channel or not rec.proposed_prompt:
+            raise ValueError(
+                "Recommendation has no addendum to apply — bounce/delivery "
+                "diagnoses cannot be approved as prompt changes."
+            )
         rec.status = "approved"
         rec.approved_by = approved_by
         rec.approved_at = datetime.utcnow()
         channel = rec.channel
-        proposed = rec.proposed_prompt
+        addendum = rec.proposed_prompt
+        # Re-read the current overlay HERE (not at diagnosis time) so a
+        # concurrent edit by the operator can't be silently overwritten.
+        previous = get_effective_prompt(channel, DEFAULT_EMAIL_PROMPT_BODY)
+        rec.previous_prompt_snapshot = previous
 
-    # Write outside the session so a write failure surfaces clearly.
-    if channel and proposed:
-        save_overlay(channel, proposed)
-        log.info(
-            "self_improvement_prompt_applied",
-            extra={"rec_id": rec_id, "channel": channel, "approved_by": approved_by},
-        )
+    appended = previous.rstrip() + "\n\n" + addendum.rstrip() + "\n"
+    save_overlay(channel, appended)
+    log.info(
+        "self_improvement_addendum_applied",
+        extra={"rec_id": rec_id, "channel": channel, "approved_by": approved_by},
+    )
     return {"id": rec_id, "status": "approved", "channel": channel}
 
 
@@ -380,12 +587,7 @@ def save_as_draft(rec_id: int) -> None:
 
 
 def rollback_recommendation(rec_id: int) -> dict[str, Any]:
-    """Restore the previous_prompt_snapshot for an approved recommendation.
-
-    Looks up the row, writes its previous_prompt_snapshot back to the
-    prompt_configs overlay, and flips status to 'rejected'. Returns a
-    summary dict so the UI can quote what changed.
-    """
+    """Restore `previous_prompt_snapshot` for an approved row."""
     with session_scope() as session:
         rec = session.get(PromptRecommendation, rec_id)
         if rec is None:
@@ -405,13 +607,10 @@ def rollback_recommendation(rec_id: int) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def performance_by_prompt_version() -> list[dict[str, Any]]:
-    """Per-prompt-version performance rollup for the experiment tracker.
-
-    Rolls up sent / opened / replied / bounced counts grouped by
-    GeneratedContent.prompt_version (with prompt_fingerprint as a
-    tiebreaker so silent edits of the same version show as separate
-    rows). Joins Engagement so only leads with a sync result count.
-    """
+    """Per-prompt-version rollup. Rows with sent < SAMPLE_WAIT_MAX are
+    labeled low-confidence; the loop never proposes a prompt change from
+    those rows (it doesn't read this table — it reads kpi_view), so the
+    label here is purely informational for the operator."""
     stmt = (
         select(
             GeneratedContent.prompt_version.label("prompt_version"),
@@ -452,13 +651,15 @@ def performance_by_prompt_version() -> list[dict[str, Any]]:
             "open_rate": opened / denom,
             "reply_rate": replied / denom,
             "bounce_rate": bounced / denom,
-            "low_confidence": sent < MIN_SAMPLE_FOR_RECOMMENDATION,
+            "low_confidence": sent < SAMPLE_WAIT_MAX,
         })
     return out
 
 
 def list_recommendations(limit: int = 20) -> list[dict[str, Any]]:
-    """Most-recent PromptRecommendation rows for the audit log."""
+    """Most-recent PromptRecommendation rows for the audit log. Only
+    actionable rows live here (wait/diagnose-only never write to this
+    table), so the history stays signal-rich."""
     with session_scope() as session:
         rows = session.execute(
             select(PromptRecommendation)
@@ -477,7 +678,7 @@ def list_recommendations(limit: int = 20) -> list[dict[str, Any]]:
                 "recommended_change": r.recommended_change,
                 "expected_impact": r.expected_impact,
                 "risk_level": r.risk_level,
-                "proposed_prompt": r.proposed_prompt,
+                "proposed_addendum": r.proposed_prompt,  # column renamed for clarity in API
                 "previous_prompt_snapshot": r.previous_prompt_snapshot,
                 "sample_size": int(r.sample_size or 0),
                 "low_confidence": bool(r.low_confidence),
@@ -488,3 +689,7 @@ def list_recommendations(limit: int = 20) -> list[dict[str, Any]]:
             }
             for r in rows
         ]
+
+
+# Re-export the constant the UI uses for its "Not enough data" copy.
+MIN_SAMPLE_FOR_RECOMMENDATION = SAMPLE_WAIT_MAX
