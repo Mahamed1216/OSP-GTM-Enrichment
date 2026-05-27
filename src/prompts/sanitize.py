@@ -337,6 +337,136 @@ def canonical_sdr_direct_pitch(first_name: str, role_phrase: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Structure 1 opening-hook stripper.
+# ---------------------------------------------------------------------------
+#
+# Structure 1 emails (intro play) should start the body directly with the
+# "Not sure if you're already working with..." question — no preamble hook
+# sentence describing what the prospect's company does. Hooks like
+#   "Mindsmith looks built for L&D teams running compliance programs."
+# leak into B/C-tier sends and read as filler. The stripper removes any
+# such sentence that lands BETWEEN the greeting and the Structure 1
+# starter.
+
+_STRUCTURE_1_STARTERS = [
+    "not sure if you're already working with",
+    "not sure if you're already partnering with",
+    "curious if you're already getting in front of",
+    "curious if you're already working with",
+    "are you already working with",
+    "are you already partnering with",
+]
+
+_STRUCTURE_2_MARKERS = [
+    "instead of hiring",
+]
+
+# Hook-line shapes the user reported. Each pattern matches an ENTIRE
+# line (after stripping leading/trailing whitespace), case-insensitive.
+# The patterns are anchored on the verb phrase so a sentence about a
+# company gets caught regardless of how many words the company name has.
+_HOOK_LINE_PATTERNS = [
+    re.compile(r"^[A-Z][\w\.\-'&]*(?:\s+\w+){0,3}\s+looks\s+built\s+for\b.*$", re.IGNORECASE),
+    re.compile(r"^[A-Z][\w\.\-'&]*(?:\s+\w+){0,3}\s+is\s+built\s+for\b.*$", re.IGNORECASE),
+    re.compile(r"^[A-Z][\w\.\-'&]*(?:\s+\w+){0,3}\s+feels\s+like\b.*$", re.IGNORECASE),
+    re.compile(r"^[A-Z][\w\.\-'&]*(?:\s+\w+){0,3}\s+looks\s+like\b.*$", re.IGNORECASE),
+    re.compile(r"^[A-Z][\w\.\-'&]*(?:\s+\w+){0,3}\s+is\s+a\s+wedge\b.*$", re.IGNORECASE),
+    re.compile(r"^[A-Z][\w\.\-'&]*(?:\s+\w+){0,3}\s+is\s+a\s+natural\s+fit\b.*$", re.IGNORECASE),
+    re.compile(r"^[A-Z][\w\.\-'&]*(?:\s+\w+){0,3}\s+is\s+a\s+clear\s+fit\b.*$", re.IGNORECASE),
+    re.compile(r"^[A-Z][\w\.\-'&]*(?:\s+\w+){0,3}\s+is\s+positioned\b.*$", re.IGNORECASE),
+    re.compile(r"^Building\s+infrastructure\s+for\b.*$", re.IGNORECASE),
+]
+
+
+def _line_is_structure_1_starter(line: str) -> bool:
+    lower = line.strip().lower()
+    return any(s in lower for s in _STRUCTURE_1_STARTERS)
+
+
+def _line_is_opening_hook(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if _line_is_structure_1_starter(stripped):
+        return False
+    return any(p.match(stripped) for p in _HOOK_LINE_PATTERNS)
+
+
+def strip_structure_1_opening_hook(body: str) -> tuple[str, str | None]:
+    """Remove a preamble hook line between the greeting and the
+    Structure 1 starter, if both are present.
+
+    Triggers only when:
+      - The body contains a Structure 1 starter
+        ("not sure if you're already working with ..." and variants).
+      - The body does NOT contain a Structure 2 marker
+        ("instead of hiring ..."). Structure 2 direct pitches are left
+        completely untouched.
+
+    Walks from the greeting forward, drops every line that matches one
+    of the hook patterns until it hits the Structure 1 starter (or a
+    non-hook line, which stops the walk to avoid accidentally eating
+    real body content). Blank lines around removed hooks are also
+    cleaned so the rendered output doesn't have orphan whitespace.
+
+    Returns (new_body, warning_or_None).
+    """
+    if not body:
+        return body, None
+    lower = body.lower()
+    if not any(s in lower for s in _STRUCTURE_1_STARTERS):
+        return body, None
+    if any(m in lower for m in _STRUCTURE_2_MARKERS):
+        return body, None
+
+    lines = body.split("\n")
+    # Find the first non-empty line — the greeting.
+    greeting_idx: int | None = None
+    for i, line in enumerate(lines):
+        if line.strip():
+            greeting_idx = i
+            break
+    if greeting_idx is None:
+        return body, None
+
+    removed_any = False
+    # Walk forward from greeting+1. Drop matched hook lines AND the
+    # blank lines that lead into them, until we either hit a non-hook
+    # line or the Structure 1 starter.
+    i = greeting_idx + 1
+    while i < len(lines):
+        # Skip blank lines but remember where we started so we can also
+        # drop them if the next non-blank line turns out to be a hook.
+        blank_start = i
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+        if i >= len(lines):
+            break
+        line = lines[i]
+        if _line_is_structure_1_starter(line):
+            # Reached the starter — leave it untouched.
+            break
+        if _line_is_opening_hook(line):
+            # Mark the blank prefix + the hook line for removal.
+            del lines[blank_start:i + 1]
+            i = blank_start
+            removed_any = True
+            continue
+        # First real content line that ISN'T a hook — stop walking.
+        # (Don't strip lines we don't recognize; that's safer than
+        # accidentally eating a sentence the writer meant to keep.)
+        break
+
+    if not removed_any:
+        return body, None
+
+    # Re-join. Collapse runs of 3+ blank lines created by removals.
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned, "Removed Structure 1 opening hook."
+
+
 def coerce_sdr_direct_pitch(
     body: str, *, first_name: str,
 ) -> tuple[str, str | None]:

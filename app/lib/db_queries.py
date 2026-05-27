@@ -439,6 +439,7 @@ def get_lead_full(lead_id: int) -> dict[str, Any] | None:
                 "company_details": enrichment.company_details,
                 "company_news": enrichment.company_news,
                 "industry_news": enrichment.industry_news,
+                "buyer_accounts": enrichment.buyer_accounts,
                 "source_status": enrichment.source_status or {},
                 "enriched_at": enrichment.enriched_at,
             }

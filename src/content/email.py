@@ -26,6 +26,7 @@ from src.prompts.sanitize import (
     detect_partner_channel_mismatch,
     detect_segment_vs_company_mismatch,
     sanitize_generated_text,
+    strip_structure_1_opening_hook,
 )
 
 log = logging.getLogger(__name__)
@@ -145,6 +146,15 @@ async def generate_email(
     )
     clean_body = coerced_body
 
+    # Structure 1 opening-hook stripper. Removes preamble sentences like
+    # "Mindsmith looks built for L&D teams..." that land between the
+    # greeting and the "Not sure if you're already working with..."
+    # starter. No-op when the body doesn't have a Structure 1 starter,
+    # or when the body is a Structure 2 direct pitch (the SDR coercer
+    # above already produced the canonical pattern in that case).
+    stripped_body, strip_warning = strip_structure_1_opening_hook(clean_body)
+    clean_body = stripped_body
+
     # Post-generation validators. These are HEURISTIC flags, not hard
     # blocks — the email still saves, but warnings ride along on
     # `signals_cited` so the operator can review on the Lead detail page
@@ -152,6 +162,8 @@ async def generate_email(
     validation_warnings: list[str] = []
     if coerce_warning:
         validation_warnings.append(coerce_warning)
+    if strip_warning:
+        validation_warnings.append(strip_warning)
     seg_warnings = detect_segment_vs_company_mismatch(
         clean_body, named_buyer_accounts=named_buyers,
     )
