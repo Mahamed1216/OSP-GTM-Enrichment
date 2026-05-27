@@ -20,7 +20,9 @@ from src.prompts.email import (
     current_email_prompt_fingerprint,
 )
 from src.prompts.sanitize import (
+    detect_banned_direct_pitch_phrases,
     detect_competitor_as_buyer,
+    detect_partner_channel_mismatch,
     detect_segment_vs_company_mismatch,
     sanitize_generated_text,
 )
@@ -51,10 +53,21 @@ async def generate_email(
         ).scalar_one_or_none()
         user_msg = format_lead_context(lead, enrichment, score)
         user_msg += "\n\nWrite the email now. Output JSON only."
-        # Snapshot buyer-account fields for the post-generation validator.
+        # Snapshot buyer-account fields for the post-generation validators.
         # Read INSIDE the session so we never touch detached attributes.
+        # Prefer the v2 fields (likely_direct_buyers, buyer_motion, partner
+        # channels) for the new validators; fall back to v1 fields for the
+        # legacy segment-vs-company validator.
         ba = (enrichment.buyer_accounts or {}) if enrichment else {}
-        named_buyers: list[str] = list(ba.get("likely_buyer_accounts") or [])
+        direct_buyers: list[str] = list(ba.get("likely_direct_buyers") or [])
+        partner_channels: list[str] = list(ba.get("likely_partner_channels") or [])
+        buyer_motion: str | None = ba.get("buyer_motion") or None
+        # Combine v2 direct + v1 accounts for the segment-mismatch validator's
+        # "named buyer accounts" lookup. v1 rows survive a schema upgrade
+        # this way.
+        named_buyers: list[str] = direct_buyers + list(
+            ba.get("likely_buyer_accounts") or []
+        )
         flagged_competitors: list[str] = list(ba.get("flagged_competitors") or [])
         company_industry = lead.industry or None
 
@@ -100,6 +113,25 @@ async def generate_email(
     if competitor_hits:
         validation_warnings.append(
             "Possible competitor named as buyer: " + ", ".join(competitor_hits)
+        )
+    # B2C / partner-channel framing validator. Surfaces both the
+    # "B2C motion but body uses buyer language" mistake and the
+    # "partner framing but CTA says 'companies like them'" mistake.
+    partner_warnings = detect_partner_channel_mismatch(
+        clean_body,
+        buyer_motion=buyer_motion,
+        likely_direct_buyers=direct_buyers,
+        likely_partner_channels=partner_channels,
+    )
+    validation_warnings.extend(partner_warnings)
+    # Banned over-explanation phrases on direct SDR/hiring pitches.
+    # These were the "real tension" / "no ramp" / "weeks not months"
+    # leaks called out in operator feedback.
+    banned_hits = detect_banned_direct_pitch_phrases(clean_body)
+    if banned_hits:
+        validation_warnings.append(
+            "Banned over-explanation phrases in body: "
+            + ", ".join(banned_hits)
         )
     # Attach as prefixed entries to signals_cited so existing UIs that
     # render the field show them without a schema change. Prefix makes

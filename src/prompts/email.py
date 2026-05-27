@@ -70,41 +70,58 @@ BAD: "I saw you just brought on John."
 
 # BUYER ACCOUNTS — WHO TO NAME
 The enrichment context includes a "## Buyer accounts (research)" block with:
-- likely_buyer_accounts (named companies)
-- likely_buyer_segments (segment labels)
-- buyer_account_confidence (low | medium | high)
-- DO NOT NAME (competitors) — companies you must never reference as buyers.
+- buyer_motion: B2B | B2C | B2B2C | marketplace | partner_led | unknown
+- likely_direct_buyers (orgs that BUY and PAY)
+- likely_partner_channels (orgs that embed / white-label / co-sell — NOT buyers)
+- likely_referral_channels (orgs that refer leads but don't buy)
+- likely_end_users (B2C consumer segments)
+- buyer_confidence / partner_confidence (low | medium | high)
+- DO NOT NAME (competitors) — never reference these as buyers.
 
-BRANCHING RULE — match the CTA wording to what you actually named:
+THREE-CASE BRANCHING — pick exactly one based on buyer_motion + which channel is strongest:
 
-CASE A: likely_buyer_accounts has ≥2 entries AND buyer_account_confidence is "medium" or "high".
-- Name those companies in the intro question.
-- CTA may use "companies like them" since you actually named companies.
-- Example: "Not sure if you're already working with JPMorgan, UnitedHealth, or Lockheed? They seem like a great fit for what AIVeda does."
-  CTA: "Happy to show you how we could make an intro to them or companies like them. Just let me know."
+CASE A — DIRECT BUYERS (B2B with confident buyer list).
+Trigger: likely_direct_buyers has ≥2 entries AND buyer_confidence is "medium" or "high".
+Frame as buyers. Use "great fit for what X does." CTA may say "companies like them" if you actually named companies.
+Example:
+"Not sure if you're already working with JPMorgan, UnitedHealth, or Lockheed? They seem like a great fit for what AIVeda does.
 
-CASE B: likely_buyer_accounts is empty OR buyer_account_confidence is "low".
-- Use likely_buyer_segments in the intro question. Do NOT invent named companies.
-- CTA MUST NOT say "companies like them" — you named no companies. Reference TEAMS instead.
-- Example: "Not sure if you're already working with financial services firms, healthcare systems, or defense contractors? They seem like a great fit for what AIVeda does."
-  CTA: "Happy to show you how we could get you in front of teams like that. Just let me know."
+Happy to show you how we could make an intro to them or companies like them. Just let me know."
 
-Hard rules — never break these:
-1. NEVER name a direct competitor as a potential buyer. The enrichment "DO NOT NAME (competitors)" list is authoritative.
-2. NEVER invent buyer company names that are not in likely_buyer_accounts.
-3. If buyer_account_confidence == "low" or likely_buyer_accounts is empty, your CTA MUST use the "teams like that" phrasing — never "companies like them".
-4. If both lists are empty, fall back to a single-target framing without naming companies or segments.
+CASE B — PARTNER / CHANNEL FRAMING.
+Trigger: buyer_motion is B2C / B2B2C / partner_led / marketplace AND likely_partner_channels has ≥2 entries; OR likely_direct_buyers is empty but partner_confidence is "medium" or "high".
+Frame as CHANNELS, not buyers. Use "partnering with" + "strong channel for what X does." CTA must say "teams like that" or "channels like that." Never say "buyers" or "great fit for what X does."
+Example (Dovly):
+"Not sure if you're already partnering with financial wellness platforms, fintechs, or employers offering financial benefits? They seem like a stronger channel for what Dovly does.
 
-BAD (Ultravox.ai, voice AI infrastructure):
+Happy to show you how we could get you in front of teams like that. Just let me know."
+
+CASE C — UNCERTAIN / SEGMENTS ONLY.
+Trigger: both likely_direct_buyers and likely_partner_channels are empty OR every confidence is "low".
+Use the LEGACY segment fields from the enrichment if present (`legacy.likely_buyer_segments`). Frame as TEAMS. CTA must say "teams like that" — never "companies like them."
+Example:
+"Curious if you're already getting in front of support, healthcare, or enterprise call-center teams building on voice agents?
+
+Happy to show you how we could get you in front of teams like that. Just let me know."
+
+Hard rules — NEVER break these:
+1. NEVER name a direct competitor as a buyer. The enrichment "DO NOT NAME (competitors)" list is authoritative.
+2. NEVER invent company names not in the enrichment lists.
+3. If buyer_motion is B2C and likely_direct_buyers is empty: you MUST use CASE B (partner/channel framing). Do NOT label adjacent businesses as direct buyers.
+4. If you used partner_channels or referral_channels: do NOT say "buyers", do NOT say "great fit for what X does" — say "stronger channel for what X does" or "strong distribution channel for what X does."
+5. If no companies were named (CASE B or C): CTA must say "teams like that" or "channels like that" — NEVER "companies like them."
+
+BAD (Dovly, B2C consumer credit app — mislabeled partners as buyers):
+"Not sure if you're already working with credit unions or mortgage lenders? They seem like a great fit for what Dovly does."
+Reason: Dovly sells to consumers; credit unions and mortgage lenders are partner/referral channels, not direct buyers.
+
+BAD (Ultravox.ai — competitors named as buyers):
 "Are you working with Bland AI, Retell AI, or ElevenLabs?"
-Reason: those are competitors, not buyers.
+Reason: competitors, not buyers.
 
 BAD (segments named, CTA mismatched):
 "Not sure if you're already working with financial services firms, healthcare systems, or defense contractors? Happy to show you how we could make an intro to them or companies like them."
-Reason: no companies were named, so "companies like them" has nothing to refer back to.
-
-GOOD (CASE B — segments + matching CTA):
-"Curious if you're already getting in front of support, healthcare, or enterprise call-center teams building on voice agents? Happy to show you how we could get you in front of teams like that. Just let me know."
+Reason: no companies named, so "companies like them" has no referent.
 
 # GOAL OF THIS MESSAGE
 The #1 goal is to get ANY REPLY, NOT to book a meeting. Treat meeting booking as a second step that happens after they respond. The CTA should invite a SHORT one or two-word reply ("yes", "send it", "interested", "sure"), NEVER a call or meeting time.
@@ -115,15 +132,28 @@ Scan the enrichment signals. Pick the strongest available angle. Priority:
 
 1. HIRING SIGNAL — read by role type, in this priority order:
 
-   1a. SDR / BDR / Sales Development Rep / "Outbound rep" hiring (STRONGEST possible signal — this is the exact function OSP replaces). If the prospect has even ONE open SDR/BDR role, lead with the direct pitch. The pitch writes itself: "I could fill the [N] SDR role(s) you have open with 0 onboarding..."
+   1a. SDR / BDR / Sales Development Rep / "Outbound rep" / "founding SDR" hiring (STRONGEST possible signal — this is the exact function OSP replaces). If the prospect has even ONE open SDR/BDR/founding-SDR role, use the SHORT DIRECT PITCH below. Do NOT explain the pain. Do NOT use "real tension", "no ramp", "no attrition risk", "weeks not months". The pitch is two short paragraphs. End on the CTA "Want to meet one of them?".
 
-   1b. Account Executive / Closer / Sales Rep hiring (5+ open roles). Use direct pitch with adjusted language: "I could feed your AE team a steady pipeline of qualified meetings starting next week..."
+   SHORT DIRECT PITCH — template (two paragraphs, no signature):
+   [First name],
 
-   1c. Generic "sales hiring" or "GTM hiring" signal (5+ open roles, role type unclear). Use direct pitch with neutral language about replacing the in-house build.
+   Instead of hiring your [open SDR req | open BDR req | founding SDR | open sales req], I can basically guarantee you more results without the onboarding time.
 
-   For ALL hiring variants: lead with the role count and specific role type from enrichment. Don't bury this.
+   We have SDRs already trained selling to your buyers. All US based. Want to meet one of them?
 
-   If hiring is split (e.g., 2 SDRs + 3 AEs + 1 VP Sales), still treat as HIRING SIGNAL and lead with the SDR count first.
+   Variations on the first line based on the specific role enrichment names:
+   - "open SDR req" / "open SDR reqs" (one or more SDR roles)
+   - "founding SDR" (exactly the founding-SDR title)
+   - "open BDR req" (BDR variant)
+   - "open sales req" (generic sales hiring, role type unclear)
+
+   1b. Account Executive / Closer / Sales Rep hiring (5+ open roles). Use the short direct pitch with adjusted first line: "Instead of hiring your open AE reqs, I can basically guarantee you a steady pipeline of qualified meetings without the onboarding time." Same second paragraph and CTA.
+
+   1c. Generic "sales hiring" or "GTM hiring" signal (5+ open roles, role type unclear). Same short pattern, swap the first line to: "Instead of hiring out your open sales reqs, I can basically guarantee you more results without the onboarding time."
+
+   For ALL hiring variants: lead with the specific role from the enrichment. Don't bury it. Keep the body to TWO paragraphs total.
+
+   If hiring is split (e.g., 2 SDRs + 3 AEs + 1 VP Sales), still treat as HIRING SIGNAL and lead with the SDR variant first.
 
 2. FUNDING / GROWTH SIGNAL: if the company recently closed funding or made a major sales/GTM hire (VP Sales, CRO, Head of Growth), lead with a growth-pressure angle — "you've raised, now you need pipeline" — then pivot to the OSP offer.
 
@@ -165,6 +195,13 @@ Stage / time language — zero tolerance:
 - "three months in" / "recently" / "just hired" / "2 weeks ago" / "early days"
 - "for a team your size" / "founders like you"
 Replace with a specific named detail or drop the time framing entirely.
+
+Pain-explanation phrases — banned on SDR/BDR/hiring direct pitches:
+- "real tension"
+- "weeks, not months" / "weeks not months"
+- "no ramp" / "no attrition risk"
+- Any "X without Y" pain-vs-relief setup beyond the one in the template.
+Use the SHORT DIRECT PITCH from Signal Prioritization #1 verbatim. Two paragraphs, no over-explaining.
 
 Closings — ABSOLUTELY FORBIDDEN:
 - "Best regards" / "Sincerely" / "Looking forward to hearing from you"
@@ -259,17 +296,27 @@ Happy to show you how we could make an intro to them or companies like them. Jus
 
 ---
 
-EXAMPLE 3 — Direct value pitch (use when prospect is hiring 5+ SDR/sales/GTM roles):
+EXAMPLE 3 — SHORT DIRECT PITCH for SDR/BDR signal (use when the prospect is hiring SDR/BDR/founding-SDR):
 
-Subject: 10 open roles
+Subject: open sdr req
 
 [First name],
 
-I could fill the 10 open roles you have tomorrow with 0 onboarding time and pretty much guarantee better results than if you hired in house.
+Instead of hiring your open SDR req, I can basically guarantee you more results without the onboarding time.
 
-Also a fraction of the cost of an in house team. We could start generating meetings and pipeline next week.
+We have SDRs already trained selling to your buyers. All US based. Want to meet one of them?
 
-Interested?
+---
+
+EXAMPLE 3b — Founding SDR variant:
+
+Subject: founding sdr role
+
+[First name],
+
+Instead of hiring your founding SDR, I can basically guarantee you more results without the onboarding time.
+
+We have SDRs already trained selling to your buyers. All US based. Want to meet one of them?
 
 ---
 

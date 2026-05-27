@@ -215,6 +215,103 @@ def detect_segment_vs_company_mismatch(
     return warnings
 
 
+_BANNED_DIRECT_PITCH_PHRASES = [
+    "real tension",
+    "weeks, not months",
+    "weeks not months",
+    "no ramp",
+    "no attrition risk",
+]
+
+
+def detect_banned_direct_pitch_phrases(body: str) -> list[str]:
+    """Flag the over-explanation phrases that leaked into SDR pitches.
+
+    These were called out as too-AI-written in operator feedback. The
+    template is two paragraphs; anything that adds "real tension" or
+    "weeks not months" indicates the model fell back to the verbose
+    pattern. Returns the list of hits (empty == clean).
+    """
+    if not body:
+        return []
+    haystack = body.lower()
+    return [p for p in _BANNED_DIRECT_PITCH_PHRASES if p in haystack]
+
+
+def detect_partner_channel_mismatch(
+    body: str,
+    *,
+    buyer_motion: str | None = None,
+    likely_direct_buyers: list[str] | None = None,
+    likely_partner_channels: list[str] | None = None,
+) -> list[str]:
+    """Flag B2C / partner-channel framing mistakes.
+
+    Two cases:
+      1. `buyer_motion` is B2C / B2B2C / partner_led / marketplace AND
+         likely_direct_buyers is empty, but the body uses buyer language
+         ("great fit for what X does", "working with"). Should have used
+         partner-channel framing instead.
+      2. Body explicitly references partner_channels (e.g. "partnering
+         with X, Y, or Z") but the CTA says "companies like them" —
+         partner framing requires "teams like that" / "channels like
+         that" CTA.
+
+    Heuristic, not a hard block. Returns warning strings the caller
+    attaches to signals_cited so the operator can review.
+    """
+    if not body:
+        return []
+    warnings: list[str] = []
+    body_lower = body.lower()
+    direct = list(likely_direct_buyers or [])
+    partners = list(likely_partner_channels or [])
+
+    is_partner_motion = (buyer_motion or "").lower() in (
+        "b2c", "b2b2c", "partner_led", "marketplace",
+    )
+
+    # Case 1: B2C-style motion but body talks about "working with" / "great fit"
+    uses_buyer_language = bool(
+        re.search(r"\bworking\s+with\b", body_lower)
+        or re.search(r"\bgreat\s+fit\s+for\s+what\b", body_lower)
+    )
+    uses_partner_language = bool(
+        re.search(r"\bpartner(?:ing)?\s+with\b", body_lower)
+        or re.search(r"\b(?:stronger|strong)\s+channel\s+for\s+what\b", body_lower)
+        or re.search(r"\bdistribution\s+channel\b", body_lower)
+    )
+    if is_partner_motion and not direct and uses_buyer_language and not uses_partner_language:
+        warnings.append(
+            f"buyer_motion={buyer_motion!r} but body uses buyer language "
+            "('working with' / 'great fit for what X does'). Switch to "
+            "partner-channel framing: 'partnering with ...' + 'stronger "
+            "channel for what X does'."
+        )
+
+    # Case 2: Partner segments named in the body but CTA uses
+    # "companies like them" — partner framing requires "teams like that"
+    # or "channels like that".
+    has_companies_like = bool(
+        re.search(r"\bcompanies\s+like\s+(?:them|that)\b", body_lower)
+    )
+    if (
+        has_companies_like
+        and uses_partner_language
+        and not any(
+            (b.lower() in body_lower)
+            for b in direct
+            if b and b.strip()
+        )
+    ):
+        warnings.append(
+            "Body uses partner-channel framing but CTA says 'companies "
+            "like them'. Partner framing requires 'teams like that' or "
+            "'channels like that'."
+        )
+    return warnings
+
+
 def sanitize_generated_text(text: str, sender_first_name: str) -> str:
     if not text:
         return text

@@ -37,6 +37,40 @@ log = logging.getLogger(__name__)
 
 
 class BuyerAccountResult(BaseModel):
+    """Structured buyer-account discovery result.
+
+    Schema evolution: v1 only had `likely_buyer_accounts` + segments. v2
+    adds `buyer_motion` plus split partner/referral/end-user channels so
+    B2C companies (e.g. Dovly — sells to consumers, partners with banks)
+    don't get their distribution channels mislabeled as direct buyers.
+
+    Field map:
+      - `buyer_motion` — what the company sells, who pays the invoice.
+        Drives the email prompt's CTA wording (buyer vs partner framing).
+      - `likely_direct_buyers` — companies/segments that buy the product.
+      - `likely_partner_channels` — orgs that partner / co-sell / embed
+        (NOT direct buyers).
+      - `likely_referral_channels` — orgs that refer leads but don't
+        buy or embed.
+      - `likely_end_users` — B2C consumer segments when buyer_motion=B2C.
+      - `likely_buyer_accounts` / `likely_buyer_segments` — legacy fields
+        kept so old code paths keep working. New code reads the split
+        fields above.
+    """
+    # v2 fields (preferred)
+    buyer_motion: Literal[
+        "B2B", "B2C", "B2B2C", "marketplace", "partner_led", "unknown"
+    ] = "unknown"
+    likely_direct_buyers: list[str] = Field(default_factory=list)
+    likely_partner_channels: list[str] = Field(default_factory=list)
+    likely_referral_channels: list[str] = Field(default_factory=list)
+    likely_end_users: list[str] = Field(default_factory=list)
+    buyer_confidence: Literal["low", "medium", "high"] = "low"
+    partner_confidence: Literal["low", "medium", "high"] = "low"
+    reasoning: str = ""
+
+    # v1 fields (legacy — kept for backward-compat with rows persisted
+    # before the schema split).
     likely_buyer_accounts: list[str] = Field(default_factory=list)
     likely_buyer_segments: list[str] = Field(default_factory=list)
     buyer_account_confidence: Literal["low", "medium", "high"] = "low"
@@ -45,42 +79,113 @@ class BuyerAccountResult(BaseModel):
 
 
 _SYSTEM_PROMPT = """\
-You classify companies into BUYERS (plausible customers) vs COMPETITORS
-for a target company. Output JSON ONLY, conforming to the schema below.
+You classify a target company's commercial relationships so downstream
+email copy uses the right framing (buyers vs partners vs end users).
+Output JSON ONLY, conforming to the schema below.
 
-Rules:
-1. A BUYER is a company that would plausibly purchase or embed the target
-   company's product. Examples: for a voice-AI infrastructure company,
-   buyers are large support / healthcare / fintech orgs that deploy voice
-   agents — NOT other voice-AI platforms.
-2. A COMPETITOR is any company offering the same core product category.
-   Never list a competitor as a buyer.
-3. For infrastructure / API / platform companies, buyers are the
-   companies that would EMBED the infrastructure, not other infra vendors.
-4. For vertical SaaS, buyers are companies operating IN that vertical
-   (e.g., healthcare SaaS → hospital systems, payer networks).
-5. Prefer 2-4 named buyer accounts when you can find them in the
-   research snippet. If you cannot, return an empty `likely_buyer_accounts`
-   and populate `likely_buyer_segments` (2-4 short segment labels) instead.
-6. Confidence:
-   - "high" — 2+ named buyers AND they are clearly NOT competitors
-     (case study, customer list, partnership reference).
-   - "medium" — 2+ named buyers but uncertain whether they are buyers or
-     competitors, OR 1 named buyer.
-   - "low" — no named buyers; fall back to segments.
-7. Any company you suspect is a COMPETITOR of the target, list under
-   `flagged_competitors` so downstream code can warn if it leaks into
-   email copy.
-8. `buyer_account_rationale` (1-2 sentences): WHY these are buyers, or
-   why you fell back to segments.
+STEP 1 — Decide buyer_motion. Who actually writes the check?
+  - "B2B"        — sells to businesses; businesses pay.
+  - "B2C"        — sells to consumers; consumers pay. (Dovly = B2C: a
+                   consumer credit app billed to individuals.)
+  - "B2B2C"      — sells through businesses to their consumers (e.g.
+                   employer benefit platforms, white-label fintech).
+  - "marketplace" — two-sided; both sides matter.
+  - "partner_led" — primary revenue routes through partners/resellers.
+  - "unknown"     — research is too thin to call.
 
-Output schema:
+STEP 2 — Populate the four channel buckets. Each item is either a
+NAMED company or a short SEGMENT label. Never list a competitor.
+
+  - likely_direct_buyers
+      Orgs/segments that BUY and PAY for the product. For B2B SaaS this
+      is the customer list. For B2C this is usually EMPTY (consumers
+      aren't worth naming individually).
+
+  - likely_partner_channels
+      Orgs that EMBED, WHITE-LABEL, CO-SELL, or DISTRIBUTE the product.
+      Not buyers. Critical for B2C and B2B2C: banks/fintechs that embed
+      a consumer credit app are partner channels, NOT direct buyers.
+
+  - likely_referral_channels
+      Orgs that send leads but don't buy/embed. E.g., mortgage lenders
+      referring users to a credit-repair app.
+
+  - likely_end_users
+      For B2C / B2B2C only. Segment labels for the consumers who use
+      the product. Empty for pure B2B.
+
+STEP 3 — Confidence calls.
+  - buyer_confidence: "high" if you found ≥2 confirmed direct buyers in
+    research; "medium" if 1 or evidence is indirect; "low" otherwise.
+  - partner_confidence: same rubric for likely_partner_channels.
+
+STEP 4 — Competitors.
+  - `flagged_competitors`: any org in the same core product category
+    as the target. Never list these elsewhere.
+
+STEP 5 — Reasoning.
+  - `reasoning` (1-2 sentences): WHY this motion + WHY these channels
+    were chosen. Name the evidence ("customer page lists Acme, Beta",
+    "no enterprise pricing — consumer billing").
+
+Critical rules:
+  1. NEVER conflate partners with direct buyers. If the product is
+     sold to consumers but BANKS or LENDERS appear in research, that's
+     almost always a partner channel — not a buyer. List them under
+     likely_partner_channels.
+  2. For B2C products, likely_direct_buyers should usually be empty.
+     The email layer will switch CTA to "channels like that" when it
+     sees that pattern.
+  3. For B2B infra / API / platform: buyers are the orgs EMBEDDING the
+     product; other infra vendors are competitors.
+  4. Backward-compat: also populate the legacy fields
+     `likely_buyer_accounts`, `likely_buyer_segments`,
+     `buyer_account_confidence`, `buyer_account_rationale` so older code
+     paths keep working. For B2C, set those to the partner-channel
+     equivalents (segments → segments, confidence = partner_confidence).
+
+Output schema (JSON, no prose):
 {
-  "likely_buyer_accounts": ["Company A", "Company B"],
-  "likely_buyer_segments": ["segment 1", "segment 2"],
-  "buyer_account_confidence": "low" | "medium" | "high",
+  "buyer_motion": "B2B | B2C | B2B2C | marketplace | partner_led | unknown",
+  "likely_direct_buyers": ["..."],
+  "likely_partner_channels": ["..."],
+  "likely_referral_channels": ["..."],
+  "likely_end_users": ["..."],
+  "buyer_confidence": "low | medium | high",
+  "partner_confidence": "low | medium | high",
+  "reasoning": "<1-2 sentences naming the evidence>",
+  "likely_buyer_accounts": ["..."],
+  "likely_buyer_segments": ["..."],
+  "buyer_account_confidence": "low | medium | high",
   "buyer_account_rationale": "<1-2 sentences>",
-  "flagged_competitors": ["Competitor X"]
+  "flagged_competitors": ["..."]
+}
+
+Worked examples:
+
+A) Voice AI infrastructure (e.g. Ultravox.ai)
+{
+  "buyer_motion": "B2B",
+  "likely_direct_buyers": ["support orgs deploying voice agents", "healthcare call centers", "fintech ops teams"],
+  "likely_partner_channels": [],
+  "likely_referral_channels": [],
+  "likely_end_users": [],
+  "buyer_confidence": "medium",
+  "partner_confidence": "low",
+  "reasoning": "Voice AI infra is embedded by enterprise support and contact-center teams; no consumer-facing motion.",
+  "flagged_competitors": ["Bland AI", "Retell AI", "ElevenLabs"]
+}
+
+B) Consumer credit app (e.g. Dovly)
+{
+  "buyer_motion": "B2C",
+  "likely_direct_buyers": [],
+  "likely_partner_channels": ["financial wellness platforms", "fintechs offering credit tools", "employers offering financial benefits"],
+  "likely_referral_channels": ["mortgage lenders", "credit unions"],
+  "likely_end_users": ["consumers repairing or building credit"],
+  "buyer_confidence": "low",
+  "partner_confidence": "medium",
+  "reasoning": "Dovly's app is sold to individuals; banks and lenders are partner/referral channels, not direct buyers."
 }
 """
 

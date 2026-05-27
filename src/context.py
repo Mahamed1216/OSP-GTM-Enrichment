@@ -74,31 +74,65 @@ def format_lead_context(
 
     ba = enrichment.buyer_accounts or {}
     if ba:
-        # Surface ALL four buyer-discovery fields the email prompt expects,
-        # plus flagged competitors so the model can avoid naming them.
-        # The email prompt branches on whether named accounts exist + the
-        # confidence — keep the formatting machine-readable enough for
-        # that branching to be unambiguous.
-        accounts = ba.get("likely_buyer_accounts") or []
-        segments = ba.get("likely_buyer_segments") or []
-        confidence = ba.get("buyer_account_confidence") or "low"
-        rationale = (ba.get("buyer_account_rationale") or "").strip()
+        # v2 fields drive the email prompt's branching. v1 fields are
+        # also surfaced for backward compat with rows persisted under
+        # the original schema.
+        motion = ba.get("buyer_motion") or "unknown"
+        direct = ba.get("likely_direct_buyers") or []
+        partners = ba.get("likely_partner_channels") or []
+        referrals = ba.get("likely_referral_channels") or []
+        end_users = ba.get("likely_end_users") or []
+        buyer_conf = ba.get("buyer_confidence") or "low"
+        partner_conf = ba.get("partner_confidence") or "low"
+        reasoning = (ba.get("reasoning") or "").strip()
         flagged = ba.get("flagged_competitors") or []
+        # v1 fields (legacy fallback for old enrichment rows).
+        legacy_accounts = ba.get("likely_buyer_accounts") or []
+        legacy_segments = ba.get("likely_buyer_segments") or []
+        legacy_conf = ba.get("buyer_account_confidence") or "low"
+        legacy_rationale = (ba.get("buyer_account_rationale") or "").strip()
+
         parts.append("\n## Buyer accounts (research)")
+        parts.append(f"- buyer_motion: {motion}")
         parts.append(
-            f"- likely_buyer_accounts: "
-            + (", ".join(accounts) if accounts else "(none)")
+            "- likely_direct_buyers: "
+            + (", ".join(direct) if direct else "(none)")
         )
         parts.append(
-            f"- likely_buyer_segments: "
-            + (", ".join(segments) if segments else "(none)")
+            "- likely_partner_channels: "
+            + (", ".join(partners) if partners else "(none)")
         )
-        parts.append(f"- buyer_account_confidence: {confidence}")
-        if rationale:
-            parts.append(f"- buyer_account_rationale: {rationale}")
+        parts.append(
+            "- likely_referral_channels: "
+            + (", ".join(referrals) if referrals else "(none)")
+        )
+        if end_users:
+            parts.append("- likely_end_users: " + ", ".join(end_users))
+        parts.append(f"- buyer_confidence: {buyer_conf}")
+        parts.append(f"- partner_confidence: {partner_conf}")
+        if reasoning:
+            parts.append(f"- reasoning: {reasoning}")
         if flagged:
             parts.append(
                 f"- DO NOT NAME (competitors): {', '.join(flagged)}"
             )
+        # Legacy block only when the v2 fields are empty (so old rows
+        # still drive the v1 email branching).
+        v2_empty = (
+            motion == "unknown" and not direct and not partners
+            and not referrals and not end_users
+        )
+        if v2_empty and (legacy_accounts or legacy_segments):
+            parts.append(
+                "- legacy.likely_buyer_accounts: "
+                + (", ".join(legacy_accounts) if legacy_accounts else "(none)")
+            )
+            parts.append(
+                "- legacy.likely_buyer_segments: "
+                + (", ".join(legacy_segments) if legacy_segments else "(none)")
+            )
+            parts.append(f"- legacy.buyer_account_confidence: {legacy_conf}")
+            if legacy_rationale:
+                parts.append(f"- legacy.buyer_account_rationale: {legacy_rationale}")
 
     return "\n".join(parts)

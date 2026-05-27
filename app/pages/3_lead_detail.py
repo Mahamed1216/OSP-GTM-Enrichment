@@ -18,9 +18,13 @@ from app.lib.db_queries import get_lead_full
 from app.lib.formatters import fmt_duration_ms, fmt_timestamp, source_status_display
 from app.lib.rating_runner import (
     delete_lead_sync,
+    full_refresh_sync,
     record_rating_sync,
     regenerate_direct_sync,
+    regenerate_email_sync,
     regenerate_sync,
+    rerun_enrichment_sync,
+    rerun_scoring_sync,
 )
 from app.styles import inject_styles
 from src.feedback.ratings import get_rating
@@ -186,6 +190,120 @@ with m2:
 with m3:
     if lead.get("email"):
         st.markdown(f"**Email**  `{lead['email']}`")
+
+st.divider()
+
+# ---------- Lead actions ----------
+# Compact panel: rerun enrichment / scoring / email / full refresh for
+# THIS lead without bouncing back to Run Pipeline. Each button tracks
+# its own in-flight flag so a failure can't permanently disable the row.
+# Buttons run synchronously inside the click handler (the underlying
+# helpers wrap async coroutines via run_async); on completion we rerun
+# the page so the tabs below reflect fresh data without a manual refresh.
+st.markdown("**Lead actions**")
+_action_cols = st.columns(4)
+_action_lead_id = int(lead["id"])
+
+_REENRICH_KEY = f"ld_action_enrich_{_action_lead_id}"
+_RESCORE_KEY = f"ld_action_score_{_action_lead_id}"
+_REGEN_KEY = f"ld_action_regen_{_action_lead_id}"
+_FULL_KEY = f"ld_action_full_{_action_lead_id}"
+
+
+def _run_with_spinner(label: str, fn, *args):
+    """Run a sync helper with a spinner + standardized error capture.
+
+    Returns (ok, result_or_error). On failure, the exact exception text
+    is propagated to the caller so the UI shows it via st.error.
+    """
+    try:
+        with st.spinner(label):
+            return True, fn(*args)
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+with _action_cols[0]:
+    if st.button("Rerun enrichment", key=_REENRICH_KEY, type="secondary"):
+        ok, result = _run_with_spinner(
+            "Rerunning enrichment…", rerun_enrichment_sync, _action_lead_id,
+        )
+        if not ok:
+            st.error(f"Enrichment failed: {result}")
+        else:
+            errored = [
+                name for name, meta in (result or {}).items()
+                if meta.get("status") == "error"
+            ]
+            if errored:
+                st.warning(
+                    "Enrichment completed with errors in: " + ", ".join(errored)
+                    + ". Open the Enrichment tab for details."
+                )
+            else:
+                st.success("Enrichment rerun complete.")
+            st.rerun()
+
+with _action_cols[1]:
+    if st.button("Rerun scoring", key=_RESCORE_KEY, type="secondary"):
+        ok, result = _run_with_spinner(
+            "Rerunning scoring…", rerun_scoring_sync, _action_lead_id,
+        )
+        if not ok:
+            st.error(f"Scoring failed: {result}")
+        else:
+            st.success(
+                f"Scored {result['score']} ({result['tier']})."
+            )
+            st.rerun()
+
+with _action_cols[2]:
+    if st.button("Regenerate email", key=_REGEN_KEY, type="secondary"):
+        ok, result = _run_with_spinner(
+            "Regenerating email…", regenerate_email_sync, _action_lead_id,
+        )
+        if not ok:
+            st.error(f"Email regeneration failed: {result}")
+        else:
+            # Point the email-tab head pointer at the new row so the
+            # Generated Content tab shows the fresh version without
+            # the operator selecting it manually.
+            st.session_state[f"ld_version_{_action_lead_id}_email"] = int(result)
+            st.success("Email regenerated with latest prompt.")
+            st.rerun()
+
+with _action_cols[3]:
+    if st.button("Run full refresh", key=_FULL_KEY, type="primary"):
+        ok, result = _run_with_spinner(
+            "Full refresh: enrichment → scoring → email…",
+            full_refresh_sync, _action_lead_id,
+        )
+        if not ok:
+            # _run_with_spinner already collapsed the exception.
+            st.error(f"Full refresh failed: {result}")
+        elif isinstance(result, dict) and result.get("failed_step"):
+            st.error(
+                f"Full refresh failed at step '{result['failed_step']}': "
+                f"{result.get('error', 'unknown error')}"
+            )
+            st.rerun()
+        else:
+            new_email = result.get("email_id") if isinstance(result, dict) else None
+            if new_email:
+                st.session_state[
+                    f"ld_version_{_action_lead_id}_email"
+                ] = int(new_email)
+            scoring = (result or {}).get("scoring") or {}
+            score_bit = (
+                f" · score {scoring['score']} ({scoring['tier']})"
+                if "score" in scoring
+                else ""
+            )
+            st.success(
+                f"Full refresh complete{score_bit}. "
+                "No Instantly push, no campaign activation."
+            )
+            st.rerun()
 
 st.divider()
 

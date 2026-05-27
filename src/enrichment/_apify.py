@@ -21,6 +21,54 @@ def apify_client() -> ApifyClientAsync:
     return ApifyClientAsync(token=settings.apify_api_token)
 
 
+def _to_dict(obj: Any) -> dict[str, Any]:
+    """Normalize an Apify SDK return value into a plain dict.
+
+    The SDK's response shape has shifted across versions:
+      - Older clients returned a dict directly.
+      - Newer clients return a Pydantic-style `Run` model.
+      - Some versions return an in-between object with neither `.get`
+        nor `model_dump` but with snake_case attributes.
+
+    The previous code did `obj.status if hasattr(obj, 'status') else obj.get('status')`,
+    which crashes with `AttributeError: 'Run' object has no attribute 'get'`
+    when the SDK returns a Run that has SOME of those attributes but
+    falls into the `.get` fallback. This helper collapses all those
+    cases into a dict so the rest of the function can read keys
+    uniformly without per-key hasattr guards.
+
+    Returns {} for None / unrecognised inputs.
+    """
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    # Pydantic v2 / dataclass / attrs models.
+    for method_name in ("model_dump", "dict", "to_dict"):
+        method = getattr(obj, method_name, None)
+        if callable(method):
+            try:
+                result = method()
+            except TypeError:
+                continue
+            if isinstance(result, dict):
+                return result
+    # Last resort: shallow attribute scan. Skip dunders and callables so
+    # bound methods don't leak into the dict.
+    result: dict[str, Any] = {}
+    for name in dir(obj):
+        if name.startswith("_"):
+            continue
+        try:
+            value = getattr(obj, name)
+        except Exception:
+            continue
+        if callable(value):
+            continue
+        result[name] = value
+    return result
+
+
 async def run_actor(actor_id: str, run_input: dict, timeout_secs: int = 180) -> list[dict[str, Any]]:
     """Run an Apify actor and return its dataset items.
 
@@ -35,17 +83,23 @@ async def run_actor(actor_id: str, run_input: dict, timeout_secs: int = 180) -> 
     if not run:
         raise ApifyRunFailed(f"{actor_id}: client returned no run object")
 
-    status = run.status if hasattr(run, 'status') else run.get("status")
+    # Normalize once. Every read below is a plain dict.get(...) — no more
+    # hasattr ladders, no more AttributeError on .get fallthrough.
+    run_d = _to_dict(run)
+
+    status = run_d.get("status")
     if status != "SUCCEEDED":
+        msg = run_d.get("status_message") or run_d.get("statusMessage")
+        run_id = run_d.get("id")
         raise ApifyRunFailed(
-            f"{actor_id}: status={status!r} "
-            f"msg={getattr(run, 'status_message', None) if hasattr(run, 'status_message') else run.get('statusMessage')!r} run_id={getattr(run, 'id', None) if hasattr(run, 'id') else run.get('id')!r}"
+            f"{actor_id}: status={status!r} msg={msg!r} run_id={run_id!r}"
         )
 
-    dataset_id = run.default_dataset_id if hasattr(run, 'default_dataset_id') else run.get("defaultDatasetId")
+    dataset_id = run_d.get("default_dataset_id") or run_d.get("defaultDatasetId")
     if not dataset_id:
+        run_id = run_d.get("id")
         raise ApifyRunFailed(
-            f"{actor_id}: SUCCEEDED but no defaultDatasetId (run_id={getattr(run, 'id', None) if hasattr(run, 'id') else run.get('id')!r})"
+            f"{actor_id}: SUCCEEDED but no defaultDatasetId (run_id={run_id!r})"
         )
 
     items_page = await client.dataset(dataset_id).list_items()
