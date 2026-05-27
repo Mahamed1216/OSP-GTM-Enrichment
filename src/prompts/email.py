@@ -68,6 +68,29 @@ GOOD: "ServiceNow partnership live. That's a meaningful new motion."
 BAD: "Three months into the VP role and you're already hiring."
 BAD: "I saw you just brought on John."
 
+# BUYER ACCOUNTS — WHO TO NAME
+When the prospect's company sells software, AI, infrastructure, services, or a platform, any companies you name in the intro play MUST be plausible BUYERS of that product, not competitors.
+
+Rules:
+- NEVER name a direct competitor as a potential customer or intro target.
+- "Direct competitor" = a company in the same product category as the prospect's company (e.g., for a voice AI infrastructure company, other voice AI infrastructure companies are competitors).
+- For AI infrastructure companies, do not name other AI infrastructure vendors as buyers.
+- For voice AI companies, do not name other voice AI platforms as buyers.
+- For sales tools / SDR tools, do not name other sales tools as buyers.
+- If you cannot confidently identify 2-3 named buyer accounts, USE THE SAFER PATTERN BELOW instead of guessing.
+
+Safer pattern (use when buyer accounts are unclear):
+- Describe the BUYER SEGMENT in plain language. Example: "support, healthcare, or enterprise call center teams using voice agents", "fintech ops teams running outbound calls", "SaaS support orgs deploying AI agents".
+- Or ask about a buyer ROLE: "teams building voice agents at larger support orgs", "RevOps leaders at growth-stage SaaS".
+- The intro play still works without specific named companies.
+
+BAD (Ultravox.ai, a voice AI infrastructure company):
+"Are you working with Bland AI, Retell AI, or ElevenLabs?"
+Reason: those are direct competitors, not buyers.
+
+GOOD:
+"Curious if you're already getting in front of support, healthcare, or enterprise call-center teams building on voice agents?"
+
 # GOAL OF THIS MESSAGE
 The #1 goal is to get ANY REPLY, NOT to book a meeting. Treat meeting booking as a second step that happens after they respond. The CTA should invite a SHORT one or two-word reply ("yes", "send it", "interested", "sure"), NEVER a call or meeting time.
 
@@ -128,10 +151,12 @@ Stage / time language — zero tolerance:
 - "for a team your size" / "founders like you"
 Replace with a specific named detail or drop the time framing entirely.
 
-Closings:
+Closings — ABSOLUTELY FORBIDDEN:
 - "Best regards" / "Sincerely" / "Looking forward to hearing from you"
 - "Thanks for your time" / "Appreciate it"
-- Any closing salutation other than the sender's first name on its own line
+- ANY sign-off, ANY signature, ANY sender name on its own line.
+- The sender's first name MUST NOT appear at the bottom of the email.
+- The email must end IMMEDIATELY after the CTA. The last line is the CTA, not a name.
 
 Post / social media references:
 - NEVER "Saw your post about X" / "I noticed you posted about X"
@@ -151,7 +176,7 @@ Corporate jargon:
 - No back-to-back rhetorical questions.
 - Subject: under 7 words. Lowercase preferred. ASCII only.
 - Body: 50-90 words for intro play, 30-60 words for direct pitch. Shorter wins.
-- Sign off with the sender's first name only, on its own line. No dash, no title, no company.
+- NO sign-off. NO sender name. NO signature line. End immediately after the CTA — the LAST line of the body is the CTA itself.
 
 # PUNCTUATION
 - NEVER em-dashes (—) or en-dashes (–). Period or comma instead.
@@ -186,8 +211,10 @@ Return JSON only. No prose before or after.
 
 signals_cited MUST contain only signals you actually based the email on. If you list a signal here, it must be reflected in the body.
 
+CRITICAL: The `body` field MUST end with the CTA. No sender name, no sign-off, no signature line. The final character of the body is the CTA's punctuation.
+
 # EXAMPLE — MATCH THIS VOICE EXACTLY
-EXAMPLE 1 — Intro play LONG FORM (B/A tier with a specific hook):
+EXAMPLE 1 — Intro play LONG FORM (B/A tier with a specific hook; the named companies are BUYERS, not competitors):
 
 Subject: servicenow play
 
@@ -201,13 +228,11 @@ I could feed your team a steady pipeline of qualified meetings at a fraction of 
 
 Interested?
 
-Mohammed
-
 ---
 
 EXAMPLE 2 — Short intro play (C-tier / thin personalization):
 
-CRITICAL: Do NOT include OSP pitch language. The intro offer IS the pitch. Two paragraphs max. CTA is casual ("Just let me know").
+CRITICAL: Do NOT include OSP pitch language. The intro offer IS the pitch. Two paragraphs max. CTA is casual ("Just let me know"). No sign-off.
 
 Subject: company a fit
 
@@ -216,8 +241,6 @@ Subject: company a fit
 Not sure if you're already working with [Company A] or [Company B]? They seem like a great fit for what you do.
 
 Happy to show you how we could make an intro to them or companies like them. Just let me know.
-
-Mohammed
 
 ---
 
@@ -233,25 +256,37 @@ Also a fraction of the cost of an in house team. We could start generating meeti
 
 Interested?
 
-Mohammed
+---
+
+EXAMPLE 4 — Buyer-segment intro (use when the prospect's company sells software/AI/infra and no specific buyer ACCOUNTS are obvious):
+
+Subject: voice agent play
+
+[First name],
+
+Voice AI infrastructure is a hot product category right now.
+
+Curious if you're already getting in front of support, healthcare, or enterprise call-center teams building on voice agents? They look like an obvious fit.
+
+I could put your team in front of a steady stream of those buyers at a fraction of the cost of an in-house SDR team. Could start next week.
+
+Worth a look?
 
 ---
 
-THE 3-EMAIL SEQUENCE (generate Email 1 only; 2 and 3 are reference):
+THE 3-EMAIL SEQUENCE (generate Email 1 only; 2 and 3 are reference). NONE of these emails end with a sender name:
 
 EMAIL 2 — reference only
 Subject: [fresh 2-4 word angle, different from Email 1]
 [First name],
 Still thinking about [target] for you. [One sentence: specific signal + why it's an obvious fit.]
 Came across a couple others this week that are the same profile. Want the list?
-Mohammed
 
 EMAIL 3 — reference only
 Subject: Can I intro you?
 [First name],
 Contrarian take: well-researched, specific outbound is actually working better than ever right now. Everyone's getting flooded with generic AI spam, so anything that references something as specific as [signal] stands out hard.
 I'm confident we could get companies like [target] on your calendar. If the timing's off, no worries. But if you're open to seeing what this looks like, just reply and I'll send it over.
-Mohammed
 """
 
 

@@ -36,6 +36,12 @@ _RUNTIME_COLUMN_ADDS: list[tuple[str, str, str]] = [
     ("prompt_recommendations", "metric_snapshot", "JSON"),
     ("prompt_recommendations", "rejected_at", "TIMESTAMP"),
     ("prompt_recommendations", "drafted_at", "TIMESTAMP"),
+    # PromptConfig audit columns added in the persistence/cleanup fix.
+    ("prompt_configs", "prompt_version", "VARCHAR(32)"),
+    ("prompt_configs", "prompt_fingerprint", "VARCHAR(64)"),
+    ("prompt_configs", "updated_by", "VARCHAR(64)"),
+    # is_active defaults to TRUE so existing rows behave the same as new ones.
+    ("prompt_configs", "is_active", "BOOLEAN DEFAULT TRUE"),
 ]
 
 # Postgres-only column widenings. SQLite ignores VARCHAR length caps so

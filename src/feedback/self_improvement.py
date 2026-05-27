@@ -593,8 +593,15 @@ def approve_recommendation(rec_id: int, *, approved_by: str) -> dict[str, Any]:
         previous = get_effective_prompt(channel, DEFAULT_EMAIL_PROMPT_BODY)
         rec.previous_prompt_snapshot = previous
 
-    appended = previous.rstrip() + "\n\n" + addendum.rstrip() + "\n"
-    save_overlay(channel, appended)
+    # Merge into a SINGLE `# SELF IMPROVEMENT ADDENDUM` section. Prior
+    # versions appended raw text to the bottom of the overlay; repeated
+    # approvals stacked addendums as new top-level sections and let
+    # `# EXAMPLE — MATCH THIS VOICE EXACTLY` accumulate ten copies in
+    # the live prompt. The controlled-section merge cannot duplicate
+    # headers no matter how many times it's run.
+    from src.prompts.cleanup import merge_self_improvement_addendum
+    merged = merge_self_improvement_addendum(previous, addendum)
+    save_overlay(channel, merged, updated_by=f"self_improvement:{approved_by}")
     log.info(
         "self_improvement_addendum_applied",
         extra={"rec_id": rec_id, "channel": channel, "approved_by": approved_by},

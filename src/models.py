@@ -266,6 +266,11 @@ class PromptConfig(Base):
     Persisted in the DB (not data/prompts_config.json) so Streamlit Cloud
     deploys don't wipe overrides — local disk is ephemeral there. One row
     per channel; saves upsert by channel.
+
+    Audit columns (`prompt_version`, `prompt_fingerprint`, `updated_by`,
+    `is_active`) are populated by `save_overlay` so the editor can show
+    "Last saved by X at Y" and the experiment tracker can correlate
+    GeneratedContent.prompt_fingerprint with the overlay that produced it.
     """
     __tablename__ = "prompt_configs"
 
@@ -277,3 +282,7 @@ class PromptConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=now_utc, onupdate=now_utc, nullable=False
     )
+    prompt_version: Mapped[Optional[str]] = mapped_column(String(32))
+    prompt_fingerprint: Mapped[Optional[str]] = mapped_column(String(64))
+    updated_by: Mapped[Optional[str]] = mapped_column(String(64))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)

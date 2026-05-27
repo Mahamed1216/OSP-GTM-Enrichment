@@ -25,9 +25,17 @@ from app.styles import inject_styles
 from src.prompts.call_script import DEFAULT_CALL_SCRIPT_PROMPT_BODY
 from src.prompts.email import DEFAULT_EMAIL_PROMPT_BODY
 from src.prompts.linkedin_msg import DEFAULT_LINKEDIN_MSG_PROMPT_BODY
+from src.prompts.cleanup import (
+    KNOWN_EMAIL_SECTIONS,
+    dedupe_email_sections,
+    section_summary,
+)
 from src.prompts.loader import (
+    clean_saved_overlay,
     get_effective_prompt,
+    get_effective_prompt_with_source,
     get_last_saved_timestamp,
+    get_overlay_metadata,
     save_overlay,
 )
 
@@ -82,7 +90,8 @@ def _last_saved_caption() -> str:
 
 def _render_channel(channel: str, label: str, default_body: str) -> None:
     with st.expander(label, expanded=False):
-        current = get_effective_prompt(channel, default_body)
+        current, source = get_effective_prompt_with_source(channel, default_body)
+        st.caption(f"Loaded from: {_SOURCE_LABELS.get(source, source)}")
         text_key = f"prompt_text_{channel}"
         edited = st.text_area(
             f"{label} system prompt",
@@ -108,6 +117,13 @@ def _render_channel(channel: str, label: str, default_body: str) -> None:
                 st.rerun()
 
 
+_SOURCE_LABELS = {
+    "database": ":green[Database]",
+    "local_json": ":orange[Local JSON fallback (dev only)]",
+    "code_default": ":gray[Code default (no overlay saved yet)]",
+}
+
+
 def _render_email_channel_sectioned(channel: str, label: str, default_body: str) -> None:
     """Email-only variant: split the body into per-H1 sub-expanders.
 
@@ -117,7 +133,50 @@ def _render_email_channel_sectioned(channel: str, label: str, default_body: str)
     other channels use.
     """
     with st.expander(label, expanded=False):
-        current = get_effective_prompt(channel, default_body)
+        current, source = get_effective_prompt_with_source(channel, default_body)
+        st.caption(f"Loaded from: {_SOURCE_LABELS.get(source, source)}")
+        meta = get_overlay_metadata(channel) if source == "database" else None
+        if meta:
+            meta_bits = []
+            if meta.get("updated_at"):
+                meta_bits.append(
+                    f"updated_at {meta['updated_at'].strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+            if meta.get("updated_by"):
+                meta_bits.append(f"by {meta['updated_by']}")
+            if meta.get("prompt_fingerprint"):
+                meta_bits.append(f"fingerprint {meta['prompt_fingerprint']}")
+            if meta_bits:
+                st.caption(":gray[" + " · ".join(meta_bits) + "]")
+
+        # Diagnose duplicates BEFORE rendering the editor so the operator
+        # sees the dedupe banner before they start editing.
+        summary = section_summary(current)
+        duplicates = [(h, c) for h, c in summary if c > 1]
+        if duplicates:
+            dup_text = ", ".join(f"{h!r} ×{c}" for h, c in duplicates)
+            st.warning(
+                f"This prompt has duplicate section headers ({dup_text}). "
+                "Click **Clean current saved prompt** to dedupe in place "
+                "— the first occurrence of each section is kept."
+            )
+            if st.button(
+                "Clean current saved prompt",
+                key=f"prompt_clean_{channel}",
+                type="secondary",
+            ):
+                try:
+                    stats = clean_saved_overlay(channel)
+                except Exception as exc:
+                    st.error(f"Cleanup failed: {exc}")
+                else:
+                    if stats:
+                        removed = ", ".join(f"{h!r} ×{c}" for h, c in stats.items())
+                        st.success(f"Removed duplicates: {removed}.")
+                    else:
+                        st.info("No duplicates found.")
+                    st.rerun()
+
         sections = parse_prompt_sections(current)
 
         st.caption(
