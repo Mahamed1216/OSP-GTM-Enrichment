@@ -173,6 +173,68 @@ class WinningExample(Base):
     promoted_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
 
 
+class InstantlyAnalyticsSnapshot(Base):
+    """Raw + parsed result of one `/campaigns/analytics` poll.
+
+    Instantly is the source of truth for the campaign-level KPIs shown on
+    the Engagement page (sent / opens / replies / bounces). The local
+    Engagement table can drift — leads pushed via the UI or imported
+    manually into Instantly never get a local `delivery_id`, so the
+    per-lead sync would silently miss them. Keeping each snapshot's raw
+    JSON also lets the self-improving loop diagnose without re-hitting
+    the API.
+    """
+    __tablename__ = "instantly_analytics_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    campaign_id: Mapped[str] = mapped_column(String(64), index=True)
+    leads_count: Mapped[int] = mapped_column(Integer, default=0)
+    contacted_count: Mapped[int] = mapped_column(Integer, default=0)
+    emails_sent_count: Mapped[int] = mapped_column(Integer, default=0)
+    open_count: Mapped[int] = mapped_column(Integer, default=0)
+    unique_open_count: Mapped[Optional[int]] = mapped_column(Integer)
+    reply_count: Mapped[int] = mapped_column(Integer, default=0)
+    bounced_count: Mapped[int] = mapped_column(Integer, default=0)
+    click_count: Mapped[int] = mapped_column(Integer, default=0)
+    unsubscribed_count: Mapped[int] = mapped_column(Integer, default=0)
+    completed_count: Mapped[int] = mapped_column(Integer, default=0)
+    raw: Mapped[dict] = mapped_column(JSON, default=dict)
+    synced_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
+
+
+class PromptRecommendation(Base):
+    """Self-improvement-loop recommendation, gated on human approval.
+
+    The loop diagnoses a bottleneck (open / reply / bounce / delivery)
+    from the latest analytics snapshot, drafts a recommendation, and
+    persists it here. No prompt is ever modified until status flips to
+    `approved`; on approval, `proposed_prompt` is written to the
+    `prompt_configs` overlay table so only FUTURE generations pick it up.
+    The previous overlay text is stashed in `previous_prompt_snapshot`
+    so the operator can roll back.
+    """
+    __tablename__ = "prompt_recommendations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bottleneck: Mapped[str] = mapped_column(String(32))  # open_rate|reply_rate|bounce_rate|delivery
+    channel: Mapped[Optional[str]] = mapped_column(String(32))  # email|None for non-prompt actions
+    diagnosis: Mapped[str] = mapped_column(Text)
+    current_metric_label: Mapped[str] = mapped_column(String(64))
+    current_metric_value: Mapped[float] = mapped_column(Float, default=0.0)
+    target_metric_value: Mapped[float] = mapped_column(Float, default=0.0)
+    recommended_change: Mapped[str] = mapped_column(Text)
+    expected_impact: Mapped[str] = mapped_column(Text)
+    risk_level: Mapped[str] = mapped_column(String(16))  # low | medium | high
+    proposed_prompt: Mapped[Optional[str]] = mapped_column(Text)
+    previous_prompt_snapshot: Mapped[Optional[str]] = mapped_column(Text)
+    sample_size: Mapped[int] = mapped_column(Integer, default=0)
+    low_confidence: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending|approved|rejected|draft
+    approved_by: Mapped[Optional[str]] = mapped_column(String(64))
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+
+
 class PromptConfig(Base):
     """User-edited overrides for the three content-generation system prompts.
 

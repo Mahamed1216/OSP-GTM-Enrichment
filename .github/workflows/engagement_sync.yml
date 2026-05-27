@@ -2,18 +2,19 @@ name: Daily Engagement Sync
 
 on:
   schedule:
-    - cron: '0 12 * * 1-5'
-    # 12:00 UTC = 8:00 AM EDT (UTC-4, May–Nov).
-    # When clocks change to EST (UTC-5, Nov–Mar), update to '0 13 * * 1-5'.
+    # Weekdays at 9 AM Eastern. Two crons covers DST without doubling up
+    # the actual work — `scripts/sync_instantly_engagement.py` is idempotent,
+    # but the second cron only fires when its window matches local 9 AM.
+    - cron: '0 13 * * 1-5'   # 13:00 UTC = 9 AM EDT (Mar–Nov)
+    - cron: '0 14 * * 1-5'   # 14:00 UTC = 9 AM EST (Nov–Mar)
   workflow_dispatch:
-    # Allows manual trigger from the Actions tab at any time.
+    # Manual trigger from the Actions tab. Useful when re-running after
+    # changing INSTANTLY_API_KEY / INSTANTLY_CAMPAIGN_ID secrets.
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout repo
@@ -33,4 +34,5 @@ jobs:
           INSTANTLY_API_KEY: ${{ secrets.INSTANTLY_API_KEY }}
           INSTANTLY_CAMPAIGN_ID: ${{ secrets.INSTANTLY_CAMPAIGN_ID }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: python scripts/pull_engagement.py
+          SYNC_SECRET: ${{ secrets.SYNC_SECRET }}
+        run: python scripts/sync_instantly_engagement.py

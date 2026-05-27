@@ -9,7 +9,14 @@ from sqlalchemy import and_, case, func, select
 
 from src.db import session_scope
 from src.feedback.ratings import get_rating_trends, get_unrated_content
-from src.models import Engagement, Enrichment, GeneratedContent, Lead, Score
+from src.models import (
+    Engagement,
+    Enrichment,
+    GeneratedContent,
+    InstantlyAnalyticsSnapshot,
+    Lead,
+    Score,
+)
 
 
 def _email_content_subq():
@@ -517,6 +524,61 @@ def get_lead_full(lead_id: int) -> dict[str, Any] | None:
             "contents": contents_list,
             "engagements": engagements_list,
         }
+
+
+def latest_instantly_snapshot() -> dict[str, Any] | None:
+    """Most-recent Instantly analytics snapshot, as a plain dict.
+
+    Returns None when no snapshot exists yet (e.g. the GitHub Actions job
+    hasn't run since the table was added). Caller uses this for the
+    "Source: Instantly campaign analytics" KPI row and the debug expander.
+    """
+    with session_scope() as session:
+        snap = session.execute(
+            select(InstantlyAnalyticsSnapshot)
+            .order_by(InstantlyAnalyticsSnapshot.synced_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if snap is None:
+            return None
+        return {
+            "id": snap.id,
+            "campaign_id": snap.campaign_id,
+            "leads_count": int(snap.leads_count or 0),
+            "contacted_count": int(snap.contacted_count or 0),
+            "emails_sent_count": int(snap.emails_sent_count or 0),
+            "open_count": int(snap.open_count or 0),
+            "unique_open_count": (
+                int(snap.unique_open_count)
+                if snap.unique_open_count is not None
+                else None
+            ),
+            "reply_count": int(snap.reply_count or 0),
+            "bounced_count": int(snap.bounced_count or 0),
+            "click_count": int(snap.click_count or 0),
+            "unsubscribed_count": int(snap.unsubscribed_count or 0),
+            "completed_count": int(snap.completed_count or 0),
+            "raw": snap.raw or {},
+            "synced_at": snap.synced_at,
+        }
+
+
+def local_sent_count() -> int:
+    """Count of email GeneratedContent rows with delivery_status='sent'.
+
+    Used to surface the Instantly-vs-local discrepancy on the Engagement
+    page. Mirrors the count behind the "Sent folder" list.
+    """
+    with session_scope() as session:
+        return int(
+            session.execute(
+                select(func.count(GeneratedContent.id)).where(
+                    GeneratedContent.kind == "email",
+                    GeneratedContent.delivery_status == "sent",
+                )
+            ).scalar()
+            or 0
+        )
 
 
 def last_sync_time() -> datetime | None:

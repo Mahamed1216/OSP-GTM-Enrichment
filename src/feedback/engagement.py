@@ -21,7 +21,7 @@ from sqlalchemy import select
 
 from src.config import settings
 from src.db import session_scope
-from src.models import Engagement, GeneratedContent
+from src.models import Engagement, GeneratedContent, InstantlyAnalyticsSnapshot
 from src.retry import retry_api
 
 log = logging.getLogger(__name__)
@@ -133,6 +133,131 @@ async def _iter_campaign_leads() -> AsyncIterator[dict]:
             starting_after = payload.get("next_starting_after")
             if not starting_after or not items:
                 return
+
+
+@retry_api
+async def fetch_campaign_analytics(campaign_id: str) -> dict:
+    """GET /api/v2/campaigns/analytics — campaign-level Instantly metrics.
+
+    Returns the FIRST analytics record for `campaign_id`. Instantly's API
+    returns a list (one entry per requested campaign) under that endpoint;
+    we request one campaign at a time and unwrap to a single dict so the
+    caller doesn't need to know the array shape.
+
+    Field names below are Instantly's own — never normalise here so the
+    debug expander can render the response verbatim.
+    """
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.get(
+            f"{_API_BASE}/campaigns/analytics",
+            headers=_auth_headers(),
+            params={"campaign_id": campaign_id},
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+    # Instantly's analytics endpoint returns a list of per-campaign records.
+    if isinstance(payload, list):
+        return payload[0] if payload else {}
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def _coerce_int(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _coerce_optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_analytics(raw: dict) -> dict:
+    """Map Instantly's analytics response to our snapshot columns.
+
+    Instantly v2 keys observed on this endpoint:
+      leads_count, contacted_count (sequence started),
+      emails_sent_count, open_count, link_click_count,
+      reply_count, bounced_count, unsubscribed_count, completed_count,
+      unique_opened_count (sometimes absent).
+    Any missing key defaults to 0 — never raises.
+    """
+    return {
+        "leads_count": _coerce_int(raw.get("leads_count")),
+        "contacted_count": _coerce_int(
+            raw.get("contacted_count")
+            or raw.get("sequence_started_count")
+        ),
+        "emails_sent_count": _coerce_int(raw.get("emails_sent_count")),
+        "open_count": _coerce_int(raw.get("open_count") or raw.get("opened_count")),
+        "unique_open_count": _coerce_optional_int(
+            raw.get("unique_opened_count") or raw.get("unique_open_count")
+        ),
+        "reply_count": _coerce_int(raw.get("reply_count") or raw.get("replied_count")),
+        "bounced_count": _coerce_int(
+            raw.get("bounced_count")
+            or raw.get("bounce_count")
+        ),
+        "click_count": _coerce_int(
+            raw.get("link_click_count")
+            or raw.get("click_count")
+        ),
+        "unsubscribed_count": _coerce_int(raw.get("unsubscribed_count")),
+        "completed_count": _coerce_int(raw.get("completed_count")),
+    }
+
+
+async def sync_campaign_analytics() -> dict:
+    """Pull campaign-level analytics from Instantly and persist a snapshot.
+
+    Returns a dict with parsed metrics + raw response + the snapshot id
+    so the UI can quote a "Last synced from Instantly" timestamp and
+    render the raw JSON in the debug expander.
+    """
+    campaign_id = settings.instantly_campaign_id
+    if not settings.instantly_api_key or not campaign_id:
+        raise RuntimeError(
+            "INSTANTLY_API_KEY or INSTANTLY_CAMPAIGN_ID not set — "
+            "cannot sync campaign analytics"
+        )
+    raw = await fetch_campaign_analytics(campaign_id)
+    parsed = _parse_analytics(raw)
+    snapshot_id: int
+    synced_at = datetime.utcnow()
+    with session_scope() as session:
+        snapshot = InstantlyAnalyticsSnapshot(
+            campaign_id=campaign_id,
+            raw=raw or {},
+            synced_at=synced_at,
+            **parsed,
+        )
+        session.add(snapshot)
+        session.flush()
+        snapshot_id = snapshot.id
+    log.info(
+        "instantly_analytics_synced",
+        extra={
+            "campaign_id": campaign_id,
+            "snapshot_id": snapshot_id,
+            **parsed,
+        },
+    )
+    return {
+        "snapshot_id": snapshot_id,
+        "campaign_id": campaign_id,
+        "synced_at": synced_at,
+        "raw": raw,
+        **parsed,
+    }
 
 
 async def sync_engagement() -> dict:
