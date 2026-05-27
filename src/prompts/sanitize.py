@@ -467,6 +467,57 @@ def strip_structure_1_opening_hook(body: str) -> tuple[str, str | None]:
     return cleaned, "Removed Structure 1 opening hook."
 
 
+_BRAND_ONLY_RE = re.compile(
+    r"^[A-Z][\w\.\-'&]*(?:\s+[A-Z][\w\.\-'&]*){0,3}$"
+)
+
+
+def prune_stale_named_signals(
+    body: str, signals_cited: list[str] | None,
+) -> tuple[list[str], list[str]]:
+    """Drop bare brand-name entries from `signals_cited` that aren't
+    present in the body.
+
+    A signal entry that's just a brand name (Titlecase, 1-4 tokens, e.g.
+    "Stack AI", "Zendesk", "JPMorgan") is a "named customer" signal.
+    The user spec: if the customer isn't actually named in the body
+    (because the named-buyer coercer rewrote the intro, or the LLM
+    cited it without using it), it doesn't belong in `signals_cited`
+    either.
+
+    Descriptive entries ("10+ open roles", "ServiceNow integration
+    live", "founding SDR hire", "validator:Removed Structure 1 opening
+    hook.") are NOT pruned — only the strictly-brand-shaped entries
+    that fail the body substring check.
+
+    Returns (kept_signals, dropped_signals).
+    """
+    if not signals_cited:
+        return [], []
+    body_lower = (body or "").lower()
+    kept: list[str] = []
+    dropped: list[str] = []
+    for raw in signals_cited:
+        s = (raw or "").strip()
+        if not s:
+            continue
+        # Don't touch validator: entries — they're our own warnings,
+        # not LLM-cited signals.
+        if s.startswith("validator:"):
+            kept.append(s)
+            continue
+        # Brand-only entries get the body-presence check.
+        if _BRAND_ONLY_RE.match(s):
+            if s.lower() in body_lower:
+                kept.append(s)
+            else:
+                dropped.append(s)
+            continue
+        # Descriptive signal — keep regardless.
+        kept.append(s)
+    return kept, dropped
+
+
 def coerce_structure_1_named_buyers(
     body: str,
     *,

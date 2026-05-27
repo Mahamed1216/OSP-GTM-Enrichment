@@ -118,6 +118,39 @@ NAMED company or a short SEGMENT label. Never list a competitor.
       is the customer list. For B2C this is usually EMPTY (consumers
       aren't worth naming individually).
 
+  BUYER SEGMENT QUALITY — applies to every segment string you put in
+  `likely_buyer_segments`, `likely_direct_buyers`, or
+  `likely_partner_channels`. The email layer uses these strings
+  verbatim in "Not sure if you're already working with ...?", so they
+  must read like REAL MARKET CATEGORIES, not abstract AI phrases.
+
+  BANNED segment phrasings — never use these:
+    * "enterprise data teams"
+    * "LLM pipeline builders"
+    * "teams building AI workflows"
+    * "companies using AI"
+    * "AI products"
+    * "AI agent platforms" (too broad — name the SPECIFIC vertical, like
+      "AI search companies" or "AI agent builders for sales/recruiting")
+    * Any "<adjective> teams" / "<adjective> builders" construction
+      that doesn't name a concrete product category.
+
+  REQUIRED — pick segments that name a concrete market category. Use
+  the named-product-category style of these (these are reference
+  examples — pick whatever fits the target's actual market):
+    * "AI search companies"
+    * "sales intelligence platforms"
+    * "market research tools"
+    * "data enrichment platforms"
+    * "recruiting intelligence platforms"
+    * "customer support platforms"
+    * "vertical SaaS companies in <vertical>"
+    * "AI agent builders for <function>"
+    * "contact-center platforms"
+    * "underwriting / lending platforms"
+  Each segment should be the kind of label that would appear in a G2
+  category page or a "competitors" SimilarWeb panel.
+
   - likely_partner_channels
       Orgs that EMBED, WHITE-LABEL, CO-SELL, or DISTRIBUTE the product.
       Not buyers. Critical for B2C and B2B2C: banks/fintechs that embed
@@ -228,6 +261,24 @@ B) Consumer credit app (e.g. Dovly) — pure B2C, NO B2B motion evidence found
   "buyer_confidence": "low",
   "partner_confidence": "medium",
   "reasoning": "Dovly's app is sold to individuals; banks and lenders are partner/referral channels, not direct buyers.",
+  "explicit_b2b_motion_evidence": []
+}
+
+B-fallback) Web-scraping API for AI agents (e.g. Firecrawl) — only 1 strong named buyer surfaced, segments must be concrete market categories
+{
+  "buyer_motion": "B2B",
+  "likely_direct_buyers": ["Stack AI", "sales intelligence platforms", "market research tools", "data enrichment platforms", "AI search companies", "AI agent builders for sales/recruiting"],
+  "likely_partner_channels": [],
+  "likely_referral_channels": [],
+  "likely_end_users": [],
+  "buyer_confidence": "low",
+  "partner_confidence": "low",
+  "reasoning": "Customer case studies surfaced Stack AI; couldn't confirm a second named account at high confidence, so fell back to concrete market categories that match Firecrawl's embedding ICP.",
+  "flagged_competitors": ["Apify", "Bright Data", "ScrapingBee"],
+  "likely_buyer_accounts": [],
+  "likely_buyer_segments": ["AI search companies", "sales intelligence platforms", "market research tools", "data enrichment platforms", "AI agent builders for sales/recruiting"],
+  "buyer_account_confidence": "low",
+  "buyer_account_rationale": "Only 1 high-confidence named buyer (Stack AI); falling back to 5 concrete market categories so the email layer can use the segment template + 'teams like that' CTA.",
   "explicit_b2b_motion_evidence": []
 }
 

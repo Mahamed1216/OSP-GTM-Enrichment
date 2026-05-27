@@ -26,6 +26,7 @@ from src.prompts.sanitize import (
     detect_competitor_as_buyer,
     detect_partner_channel_mismatch,
     detect_segment_vs_company_mismatch,
+    prune_stale_named_signals,
     sanitize_generated_text,
     strip_structure_1_opening_hook,
 )
@@ -229,10 +230,24 @@ async def generate_email(
             "Banned over-explanation phrases in body: "
             + ", ".join(banned_hits)
         )
+    # Drop stale named-customer signals — bare brand entries in
+    # `signals_cited` ("Stack AI", "Zendesk") that aren't present in
+    # the final body. The named-buyer coercer above may have rewritten
+    # the intro; LLM-cited customer names that didn't make it into the
+    # rewritten body shouldn't ride along in signals_cited either.
+    pruned_signals, dropped_signals = prune_stale_named_signals(
+        clean_body, list(result.signals_cited or []),
+    )
+    if dropped_signals:
+        validation_warnings.append(
+            "Pruned stale named-customer signals not present in body: "
+            + ", ".join(dropped_signals)
+        )
+
     # Attach as prefixed entries to signals_cited so existing UIs that
     # render the field show them without a schema change. Prefix makes
     # them filterable downstream.
-    signals_with_warnings = list(result.signals_cited or []) + [
+    signals_with_warnings = pruned_signals + [
         f"validator:{w}" for w in validation_warnings
     ]
 
