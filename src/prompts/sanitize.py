@@ -601,6 +601,134 @@ def coerce_structure_1_named_buyers(
     )
 
 
+# Known industry stems used to extract a clean "X" out of noisy segment
+# strings like "financial services analytics teams". First match wins,
+# longest first so "financial services" beats "services".
+_INDUSTRY_STEMS = [
+    "financial services",
+    "consumer goods",
+    "market research",
+    "real estate",
+    "supply chain",
+    "public sector",
+    "higher education",
+    "professional services",
+    "life sciences",
+    "non-profit", "nonprofit",
+    "healthcare", "fintech", "insurance", "retail", "manufacturing",
+    "education", "legal", "logistics", "media", "ecommerce", "biotech",
+    "pharma", "automotive", "energy", "hospitality", "telecom",
+    "construction", "agriculture", "government", "aerospace", "gaming",
+    "sports", "cybersecurity",
+]
+_INDUSTRY_STEMS_BY_LEN = sorted(_INDUSTRY_STEMS, key=len, reverse=True)
+
+# Functional/role qualifiers we can promote into the "similar <X> teams"
+# slot. Ordered by specificity — earlier wins when more than one matches.
+_TEAM_QUALIFIERS = [
+    "data science",
+    "machine learning",
+    "revenue operations",
+    "rev ops",
+    "revops",
+    "go to market",
+    "go-to-market",
+    "gtm",
+    "people operations",
+    "product marketing",
+    "demand generation",
+    "customer success",
+    "data engineering",
+    "platform engineering",
+    "site reliability",
+    "trust and safety",
+    "growth",
+    "analytics",
+    "compliance",
+    "security",
+    "marketing",
+    "sales",
+    "engineering",
+    "operations",
+    "finance",
+    "product",
+    "research",
+    "design",
+]
+
+# Generic structural / role nouns that get stripped off the tail of a
+# segment when we're trying to recover the bare industry name. We keep
+# this conservative — only the suffix forms we've actually seen leak
+# into segment strings.
+_SEGMENT_TAIL_NOISE_RE = re.compile(
+    r"\s+("
+    r"teams?|platforms?|companies|organi[sz]ations?|firms?|businesses|"
+    r"operations?|products?|systems?|services?|tools?|solutions?|"
+    r"vendors?|providers?|builders?|functions?|departments?|orgs?"
+    r")(?:\s+with\s+.+)?$",
+    re.IGNORECASE,
+)
+_VERTICAL_SAAS_LEAD_RE = re.compile(
+    r"^vertical\s+saas\s+(?:companies?\s+)?(?:in|for)\s+", re.IGNORECASE,
+)
+
+
+def _clean_segment_to_industry(seg: str) -> str | None:
+    """Reduce a noisy segment string to a bare industry name.
+
+    Examples:
+      "financial services analytics teams"        -> "financial services"
+      "market research platforms"                 -> "market research"
+      "vertical SaaS companies in analytics"      -> "analytics"
+      "healthcare organizations"                  -> "healthcare"
+      "data engineering teams"                    -> None  (functional, not an industry)
+
+    Returns None when no industry stem can be extracted — the caller
+    treats those as un-renderable for the hybrid intro and falls back
+    to the lightly-stripped raw segment.
+    """
+    if not seg:
+        return None
+    s = seg.strip().lower()
+    # Wrapper-category strippers run FIRST so "vertical SaaS companies
+    # in analytics" yields "analytics", not "saas".
+    s = _VERTICAL_SAAS_LEAD_RE.sub("", s)
+    # Try a known industry stem on the cleaned string.
+    for stem in _INDUSTRY_STEMS_BY_LEN:
+        if stem in s:
+            return stem
+    # Strip trailing role/structure nouns like "teams", "platforms",
+    # "companies" along with any "with ..." qualifier tail.
+    s = _SEGMENT_TAIL_NOISE_RE.sub("", s).strip()
+    # If after cleanup nothing meaningful remains, give up.
+    if not s or len(s) < 3:
+        return None
+    return s
+
+
+def _extract_team_qualifier(segments: list[str]) -> str | None:
+    """Pick a shared functional qualifier from the raw segment list.
+
+    "similar <qualifier> teams in <A> and <B>" reads more concrete than
+    bare "similar teams in <A> and <B>". The qualifier must show up in
+    at least one input segment — we don't invent a function we can't
+    point to. When multiple qualifiers match, the earlier entry in
+    `_TEAM_QUALIFIERS` (more specific) wins.
+    """
+    joined = " | ".join((s or "").lower() for s in segments)
+    if not joined:
+        return None
+    for q in _TEAM_QUALIFIERS:
+        if q in joined:
+            # Normalise display form for known quirky cases.
+            if q in {"rev ops", "revops", "revenue operations"}:
+                return "RevOps"
+            if q in {"gtm", "go-to-market", "go to market"}:
+                return "GTM"
+            return q
+    return None
+
+
 def coerce_structure_1_single_named_buyer(
     body: str,
     *,
@@ -610,25 +738,30 @@ def coerce_structure_1_single_named_buyer(
 ) -> tuple[str, str | None]:
     """Hybrid Structure 1 rewrite — 1 named buyer + 2 segments.
 
-    Used when buyer discovery surfaced exactly ONE high-confidence buyer
-    company. Forcing a fake second name would be dishonest; ignoring the
-    real one wastes the strongest signal we have. The hybrid format keeps
-    the named anchor and adds two segments for breadth.
+    Used when buyer discovery surfaced exactly ONE eligible buyer
+    company (medium-or-better confidence in the caller, never a flagged
+    competitor). Forcing a fake second name would be dishonest;
+    ignoring the real one wastes the strongest signal we have. The
+    hybrid format keeps the named anchor and adds two segments for
+    breadth.
 
     Triggers when:
       - The body has a Structure 1 starter ("Not sure if you're already
         working with ...") AND no Structure 2 marker ("Instead of
         hiring ...").
       - `named_buyer` is non-empty AND not already present in the body.
-      - `segments` has at least 2 entries (joined as "<A> and <B>"; only
-        the first two are used).
+      - At least 2 distinct industry-stem segments can be recovered
+        from the `segments` list. Each segment is normalised via
+        `_clean_segment_to_industry` first; if cleanup yields fewer
+        than 2 distinct entries the coercer falls back to the raw
+        segment strings so we still produce a useful intro.
 
     Action — replace everything from the Structure 1 starter line to
     end-of-body with:
 
         Not sure if you're already working with teams at <Named>, or
-        similar teams in <segA> and <segB>? They seem like a great
-        fit for what <Lead Company> does.
+        similar [<qualifier>] teams in <A> and <B>? They seem like a
+        great fit for what <Lead Company> does.
 
         Happy to show you how we could get you in front of teams like
         that. Just let me know.
@@ -640,10 +773,32 @@ def coerce_structure_1_single_named_buyer(
     name = (named_buyer or "").strip()
     if not name:
         return body, None
-    cleaned_segments = [s.strip() for s in (segments or []) if s and s.strip()]
-    if len(cleaned_segments) < 2:
+    raw_segments = [s.strip() for s in (segments or []) if s and s.strip()]
+    if len(raw_segments) < 2:
         return body, None
-    seg_a, seg_b = cleaned_segments[0], cleaned_segments[1]
+
+    # Try cleaned industry stems first; de-dup while preserving order.
+    cleaned: list[str] = []
+    for raw in raw_segments:
+        ind = _clean_segment_to_industry(raw)
+        if ind and ind not in cleaned:
+            cleaned.append(ind)
+    if len(cleaned) < 2:
+        # Cleanup couldn't recover 2 distinct industries — fall back to
+        # the raw segment strings (still better than dropping the named
+        # buyer entirely). De-dup case-insensitive.
+        fallback: list[str] = []
+        seen_lc: set[str] = set()
+        for raw in raw_segments:
+            key = raw.lower()
+            if key not in seen_lc:
+                seen_lc.add(key)
+                fallback.append(raw)
+        if len(fallback) < 2:
+            return body, None
+        seg_a, seg_b = fallback[0], fallback[1]
+    else:
+        seg_a, seg_b = cleaned[0], cleaned[1]
 
     lower = body.lower()
     if not any(s in lower for s in _STRUCTURE_1_STARTERS):
@@ -655,11 +810,18 @@ def coerce_structure_1_single_named_buyer(
     if name.lower() in lower:
         return body, None
 
+    qualifier = _extract_team_qualifier(raw_segments)
+    similar_clause = (
+        f"similar {qualifier} teams in {seg_a} and {seg_b}"
+        if qualifier else
+        f"similar teams in {seg_a} and {seg_b}"
+    )
+
     company = (lead_company or "").strip() or "the team"
     new_intro = (
         f"Not sure if you're already working with teams at {name}, or "
-        f"similar teams in {seg_a} and {seg_b}? They seem like a great "
-        f"fit for what {company} does."
+        f"{similar_clause}? They seem like a great fit for what "
+        f"{company} does."
     )
     new_cta = (
         "Happy to show you how we could get you in front of teams like "
@@ -685,8 +847,7 @@ def coerce_structure_1_single_named_buyer(
         preamble.pop()
     new_lines = preamble + ["", new_intro, "", new_cta]
     return "\n".join(new_lines), (
-        f"Rewrote Structure 1 intro to hybrid (1 named buyer + 2 segments): "
-        f"named={name}, segments=({seg_a}, {seg_b})."
+        "Rewrote Structure 1 email to include single named buyer."
     )
 
 

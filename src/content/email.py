@@ -218,14 +218,18 @@ async def generate_email(
     clean_body = named_buyer_body
 
     # Hybrid Structure 1 coercer — fires when buyer discovery surfaced
-    # EXACTLY ONE high-confidence named buyer (the 2-buyer coercer above
-    # is a no-op in that case because it needs a pair). Don't force a
-    # fake second name; don't ignore the real one. Skip when the single
-    # candidate is flagged as a competitor — those are never buyers.
+    # EXACTLY ONE named buyer at medium-or-better confidence (the 2-buyer
+    # coercer above is a no-op in that case because it needs a pair).
+    # Don't force a fake second name; don't ignore the real one. Skip
+    # when the single candidate is flagged as a competitor.
+    #
+    # Confidence policy: medium and high are eligible. Low is rejected
+    # because the named pick is then a guess — segment-only framing is
+    # safer.
     single_named_buyer_warning: str | None = None
     if (
         len(explicit_buyer_accounts) == 1
-        and buyer_confidence == "high"
+        and buyer_confidence in ("medium", "high")
         and explicit_buyer_accounts[0].strip()
     ):
         candidate = explicit_buyer_accounts[0].strip()
