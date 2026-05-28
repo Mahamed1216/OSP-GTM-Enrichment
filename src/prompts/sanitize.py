@@ -601,6 +601,95 @@ def coerce_structure_1_named_buyers(
     )
 
 
+def coerce_structure_1_single_named_buyer(
+    body: str,
+    *,
+    lead_company: str,
+    named_buyer: str,
+    segments: list[str],
+) -> tuple[str, str | None]:
+    """Hybrid Structure 1 rewrite — 1 named buyer + 2 segments.
+
+    Used when buyer discovery surfaced exactly ONE high-confidence buyer
+    company. Forcing a fake second name would be dishonest; ignoring the
+    real one wastes the strongest signal we have. The hybrid format keeps
+    the named anchor and adds two segments for breadth.
+
+    Triggers when:
+      - The body has a Structure 1 starter ("Not sure if you're already
+        working with ...") AND no Structure 2 marker ("Instead of
+        hiring ...").
+      - `named_buyer` is non-empty AND not already present in the body.
+      - `segments` has at least 2 entries (joined as "<A> and <B>"; only
+        the first two are used).
+
+    Action — replace everything from the Structure 1 starter line to
+    end-of-body with:
+
+        Not sure if you're already working with teams at <Named>, or
+        similar teams in <segA> and <segB>? They seem like a great
+        fit for what <Lead Company> does.
+
+        Happy to show you how we could get you in front of teams like
+        that. Just let me know.
+
+    Returns (body, warning_or_None). Greeting is preserved untouched.
+    """
+    if not body:
+        return body, None
+    name = (named_buyer or "").strip()
+    if not name:
+        return body, None
+    cleaned_segments = [s.strip() for s in (segments or []) if s and s.strip()]
+    if len(cleaned_segments) < 2:
+        return body, None
+    seg_a, seg_b = cleaned_segments[0], cleaned_segments[1]
+
+    lower = body.lower()
+    if not any(s in lower for s in _STRUCTURE_1_STARTERS):
+        return body, None
+    if any(m in lower for m in _STRUCTURE_2_MARKERS):
+        return body, None
+
+    # Already correct: the LLM picked up the named buyer on its own.
+    if name.lower() in lower:
+        return body, None
+
+    company = (lead_company or "").strip() or "the team"
+    new_intro = (
+        f"Not sure if you're already working with teams at {name}, or "
+        f"similar teams in {seg_a} and {seg_b}? They seem like a great "
+        f"fit for what {company} does."
+    )
+    new_cta = (
+        "Happy to show you how we could get you in front of teams like "
+        "that. Just let me know."
+    )
+
+    lines = body.split("\n")
+    greeting_idx = 0
+    for i, line in enumerate(lines):
+        if line.strip():
+            greeting_idx = i
+            break
+    starter_idx: int | None = None
+    for i in range(greeting_idx + 1, len(lines)):
+        if any(s in lines[i].lower() for s in _STRUCTURE_1_STARTERS):
+            starter_idx = i
+            break
+    if starter_idx is None:
+        return body, None
+
+    preamble = lines[:starter_idx]
+    while preamble and not preamble[-1].strip():
+        preamble.pop()
+    new_lines = preamble + ["", new_intro, "", new_cta]
+    return "\n".join(new_lines), (
+        f"Rewrote Structure 1 intro to hybrid (1 named buyer + 2 segments): "
+        f"named={name}, segments=({seg_a}, {seg_b})."
+    )
+
+
 def coerce_sdr_direct_pitch(
     body: str, *, first_name: str,
 ) -> tuple[str, str | None]:

@@ -22,6 +22,7 @@ from src.prompts.email import (
 from src.prompts.sanitize import (
     coerce_sdr_direct_pitch,
     coerce_structure_1_named_buyers,
+    coerce_structure_1_single_named_buyer,
     detect_banned_direct_pitch_phrases,
     detect_competitor_as_buyer,
     detect_partner_channel_mismatch,
@@ -93,6 +94,35 @@ async def generate_email(
             explicit_buyer_accounts = [
                 n for n in direct_buyers if brand_re.match((n or "").strip())
             ]
+        # Confidence rating governs whether we anchor on the single
+        # named buyer. v2 uses `buyer_confidence`; v1 used
+        # `buyer_account_confidence`. Either being "high" is enough.
+        buyer_confidence: str = (
+            (ba.get("buyer_confidence") or ba.get("buyer_account_confidence") or "low")
+        ).strip().lower()
+        # Buyer SEGMENT pool for the hybrid "1 named buyer + 2 segments"
+        # rewrite. Prefer v1 `likely_buyer_segments` (segment-only
+        # strings); fall back to segment-shaped entries in
+        # `likely_direct_buyers` (lowercased / multi-word non-brand
+        # items) so v2-only rows still get hybrid coverage.
+        import re as _re_seg
+        _brand_only_re = _re_seg.compile(
+            r"^[A-Z][\w\.\-'&]*(?:\s+[A-Z][\w\.\-'&]*){0,3}$"
+        )
+        buyer_segments: list[str] = [
+            s.strip()
+            for s in list(ba.get("likely_buyer_segments") or [])
+            if s and s.strip()
+        ]
+        if len(buyer_segments) < 2:
+            backfill = [
+                s.strip()
+                for s in direct_buyers
+                if s and s.strip() and not _brand_only_re.match(s.strip())
+            ]
+            for seg in backfill:
+                if seg not in buyer_segments:
+                    buyer_segments.append(seg)
         company_industry = lead.industry or None
         lead_first_name = (lead.first_name or "").strip()
         lead_company = (lead.company or "").strip()
@@ -187,6 +217,29 @@ async def generate_email(
     )
     clean_body = named_buyer_body
 
+    # Hybrid Structure 1 coercer — fires when buyer discovery surfaced
+    # EXACTLY ONE high-confidence named buyer (the 2-buyer coercer above
+    # is a no-op in that case because it needs a pair). Don't force a
+    # fake second name; don't ignore the real one. Skip when the single
+    # candidate is flagged as a competitor — those are never buyers.
+    single_named_buyer_warning: str | None = None
+    if (
+        len(explicit_buyer_accounts) == 1
+        and buyer_confidence == "high"
+        and explicit_buyer_accounts[0].strip()
+    ):
+        candidate = explicit_buyer_accounts[0].strip()
+        competitor_hit_set = {c.strip().lower() for c in flagged_competitors if c}
+        if candidate.lower() not in competitor_hit_set:
+            single_body, single_warning = coerce_structure_1_single_named_buyer(
+                clean_body,
+                lead_company=lead_company,
+                named_buyer=candidate,
+                segments=buyer_segments,
+            )
+            clean_body = single_body
+            single_named_buyer_warning = single_warning
+
     # Post-generation validators. These are HEURISTIC flags, not hard
     # blocks — the email still saves, but warnings ride along on
     # `signals_cited` so the operator can review on the Lead detail page
@@ -198,6 +251,8 @@ async def generate_email(
         validation_warnings.append(strip_warning)
     if named_buyer_warning:
         validation_warnings.append(named_buyer_warning)
+    if single_named_buyer_warning:
+        validation_warnings.append(single_named_buyer_warning)
     seg_warnings = detect_segment_vs_company_mismatch(
         clean_body, named_buyer_accounts=named_buyers,
     )
