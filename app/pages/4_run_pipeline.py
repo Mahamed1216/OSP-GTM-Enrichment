@@ -90,6 +90,7 @@ def _run_pipeline_thread(
     run_email: bool,
     run_call_script: bool,
     run_linkedin_msg: bool,
+    force_refresh: bool,
     progress_dict: dict,
 ) -> None:
     """Background-thread driver: walks lead_ids and updates a shared dict.
@@ -109,6 +110,72 @@ def _run_pipeline_thread(
             progress_dict["errors"].append(
                 f"Lead {u.lead_id} ({u.phase}): {u.error}"
             )
+        # Per-lead per-phase outcome ledger so the UI can render the
+        # "Enrichment refreshed / Scoring refreshed / Email regenerated"
+        # feed without re-querying the DB.
+        ledger: dict = progress_dict.setdefault("per_lead", {})
+        per: dict = ledger.setdefault(int(u.lead_id), {})
+        payload = u.payload or {}
+        if not u.ok:
+            per[u.phase] = {"status": "failed", "detail": u.error or ""}
+            return
+        if u.phase == "enrichment":
+            per["enrichment"] = {
+                "status": "refreshed" if force_refresh else "ran",
+                "detail": "",
+            }
+        elif u.phase == "scoring":
+            if payload.get("skipped"):
+                per["scoring"] = {
+                    "status": "skipped",
+                    "detail": str(payload.get("reason") or ""),
+                }
+            else:
+                per["scoring"] = {
+                    "status": "refreshed" if payload.get("refreshed") else "ran",
+                    "detail": f"score={payload.get('score')} tier={payload.get('tier')}",
+                }
+        elif u.phase == "content":
+            regenerated = list(payload.get("regenerated_kinds") or [])
+            skipped_kinds = list(payload.get("skipped_kinds") or [])
+            failed_kinds = list(payload.get("failed_kinds") or [])
+            if "email" in regenerated:
+                per["email"] = {
+                    "status": "regenerated" if payload.get("forced") else "generated",
+                    "detail": "",
+                }
+            elif "email" in skipped_kinds:
+                per["email"] = {"status": "skipped", "detail": "already present"}
+            if "call_script" in regenerated:
+                per["call_script"] = {
+                    "status": "regenerated" if payload.get("forced") else "generated",
+                    "detail": "",
+                }
+            elif "call_script" in skipped_kinds:
+                per["call_script"] = {"status": "skipped", "detail": "already present"}
+            if "linkedin_msg" in regenerated:
+                per["linkedin_msg"] = {
+                    "status": "regenerated" if payload.get("forced") else "generated",
+                    "detail": "",
+                }
+            elif "linkedin_msg" in skipped_kinds:
+                per["linkedin_msg"] = {"status": "skipped", "detail": "already present"}
+            if "email" in failed_kinds:
+                per["email"] = {"status": "failed", "detail": ""}
+            if "call_script" in failed_kinds:
+                per["call_script"] = {"status": "failed", "detail": ""}
+            if "linkedin_msg" in failed_kinds:
+                per["linkedin_msg"] = {"status": "failed", "detail": ""}
+        elif u.phase == "delivery":
+            if payload.get("delivered"):
+                per["delivery"] = {"status": "delivered", "detail": ""}
+            elif payload.get("skip_reason"):
+                per["delivery"] = {
+                    "status": "skipped",
+                    "detail": str(payload.get("skip_reason") or ""),
+                }
+            elif payload.get("dry_run"):
+                per["delivery"] = {"status": "dry-run", "detail": ""}
 
     try:
         total = len(lead_ids)
@@ -125,6 +192,7 @@ def _run_pipeline_thread(
                     run_email=run_email,
                     run_call_script=run_call_script,
                     run_linkedin_msg=run_linkedin_msg,
+                    force_refresh=force_refresh,
                     on_update=_collect,
                 )
             except Exception as exc:
@@ -617,6 +685,21 @@ with sc5:
         key="run_linkedin_msg",
     )
 
+force_refresh = st.checkbox(
+    "Force refresh selected steps",
+    value=False,
+    key="run_force_refresh",
+    help=(
+        "Bypasses the 'already exists' skip guards for every checked step. "
+        "Enrichment overwrites the existing row and bumps `enriched_at`. "
+        "Scoring re-runs even if a Score row exists and bumps `scored_at`. "
+        "Content kinds (email/call_script/linkedin_msg) generate a new "
+        "GeneratedContent row and mark the previous active row as superseded — "
+        "the old row stays as version history. Instantly delivery and call/DM "
+        "boxes are still gated by their own checkboxes."
+    ),
+)
+
 running = bool(st.session_state.get("pipeline_running"))
 
 bcol1, bcol2 = st.columns([1, 1])
@@ -709,6 +792,8 @@ if selected_ids and not running:
         "errors": [],
         "summary": None,
         "lead_ids": list(selected_ids),
+        "per_lead": {},
+        "force_refresh": bool(force_refresh),
     }
     st.session_state["pipeline_progress"] = progress
     st.session_state["pipeline_running"] = True
@@ -723,6 +808,7 @@ if selected_ids and not running:
             bool(run_email),
             bool(run_call_script),
             bool(run_linkedin_msg),
+            bool(force_refresh),
             progress,
         ),
         daemon=True,
@@ -741,6 +827,48 @@ if running:
     st.write(
         f"Processing {total} lead(s) — IDs: `{lead_ids_for_run}`"
     )
+    if prog.get("force_refresh"):
+        st.info("Force refresh mode: skip guards bypassed for every checked step.")
+
+    # Per-lead per-step status feed. The collector in the worker thread
+    # writes one entry per phase outcome; we read it here on each rerun so
+    # the operator can see "Lead 340 — Enrichment refreshed / Scoring
+    # refreshed / Email regenerated" as the pipeline progresses.
+    per_lead: dict = prog.get("per_lead") or {}
+    if per_lead:
+        _STEP_LABEL = {
+            "enrichment": "Enrichment",
+            "scoring": "Scoring",
+            "email": "Email",
+            "call_script": "Call script",
+            "linkedin_msg": "LinkedIn DM",
+            "delivery": "Delivery",
+        }
+        _STATUS_GLYPH = {
+            "refreshed": "🔄",
+            "regenerated": "🔄",
+            "ran": "✅",
+            "generated": "✅",
+            "skipped": "⏭",
+            "delivered": "📬",
+            "dry-run": "🧪",
+            "failed": "❌",
+        }
+        with st.expander(f"Per-lead step status ({len(per_lead)} lead(s))", expanded=True):
+            for lid in sorted(per_lead.keys()):
+                lines = [f"**Lead {lid}**"]
+                steps: dict = per_lead[lid]
+                for step in ("enrichment", "scoring", "email", "call_script", "linkedin_msg", "delivery"):
+                    info = steps.get(step)
+                    if not info:
+                        continue
+                    glyph = _STATUS_GLYPH.get(info["status"], "•")
+                    label = _STEP_LABEL[step]
+                    status = info["status"]
+                    detail = info.get("detail") or ""
+                    suffix = f" — {detail}" if detail else ""
+                    lines.append(f"  {glyph} {label} {status}{suffix}")
+                st.markdown("\n\n".join(lines))
 
     if not done:
         pct = current / total if total > 0 else 0.0

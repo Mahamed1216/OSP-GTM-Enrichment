@@ -11,7 +11,7 @@ from src.context import format_lead_context
 from src.db import session_scope
 from src.icp_config import load_icp_config
 from src.llm import generate_json
-from src.models import Enrichment, Lead, Score
+from src.models import Enrichment, Lead, Score, now_utc
 from src.prompts.scoring import build_system as build_scoring_system
 
 log = logging.getLogger(__name__)
@@ -73,6 +73,7 @@ def _persist_skip_score(lead_id: int) -> ScoreResult:
             existing.rationale = result.rationale
             existing.signals_used = result.signals_used
             existing.model = "rule:b2c_skip"
+            existing.scored_at = now_utc()
         else:
             session.add(Score(
                 lead_id=lead_id,
@@ -146,6 +147,7 @@ async def score_lead(lead_id: int) -> ScoreResult:
             existing.rationale = result.rationale
             existing.signals_used = result.signals_used
             existing.model = settings.scoring_model
+            existing.scored_at = now_utc()
         else:
             session.add(Score(
                 lead_id=lead_id,

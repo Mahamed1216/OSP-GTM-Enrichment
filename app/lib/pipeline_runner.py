@@ -61,12 +61,16 @@ def _emit(on_update: Callable[[PhaseUpdate], None] | None, update: PhaseUpdate) 
 async def _phase_enrich(
     lead_ids: list[int],
     on_update: Callable[[PhaseUpdate], None] | None,
+    *,
+    force_refresh: bool = False,
 ) -> None:
     total = len(lead_ids)
     for idx, lid in enumerate(lead_ids, start=1):
         try:
             payload = await enrich_lead(lid)
-            _emit(on_update, PhaseUpdate("enrichment", lid, idx, total, True, None, payload))
+            extra = {"refreshed": True} if force_refresh else {}
+            merged: dict[str, Any] = {**(payload or {}), **extra} if isinstance(payload, dict) else extra
+            _emit(on_update, PhaseUpdate("enrichment", lid, idx, total, True, None, merged or payload))
         except Exception as exc:
             _emit(on_update, PhaseUpdate("enrichment", lid, idx, total, False, str(exc)))
 
@@ -74,9 +78,14 @@ async def _phase_enrich(
 async def _phase_score(
     lead_ids: list[int],
     on_update: Callable[[PhaseUpdate], None] | None,
+    *,
+    force_refresh: bool = False,
 ) -> None:
     total = len(lead_ids)
-    already_scored = get_scored_lead_ids(lead_ids)
+    # Force mode bypasses the "already scored" guard so the Score row's
+    # scored_at moves forward and any tier/rationale changes from the new
+    # enrichment propagate.
+    already_scored = set() if force_refresh else get_scored_lead_ids(lead_ids)
     for idx, lid in enumerate(lead_ids, start=1):
         if lid in already_scored:
             _emit(
@@ -93,11 +102,51 @@ async def _phase_score(
                 on_update,
                 PhaseUpdate(
                     "scoring", lid, idx, total, True,
-                    payload={"score": result.score, "tier": result.tier},
+                    payload={
+                        "score": result.score,
+                        "tier": result.tier,
+                        "refreshed": bool(force_refresh),
+                    },
                 ),
             )
         except Exception as exc:
             _emit(on_update, PhaseUpdate("scoring", lid, idx, total, False, str(exc)))
+
+
+def _supersede_previous_active(lead_id: int, kind: str) -> bool:
+    """After a fresh GeneratedContent row was inserted for (lead_id, kind),
+    mark the prior active row as superseded by it.
+
+    Picks the two most-recent non-superseded rows for the lead/kind and
+    points the older one at the newer one. Returns True when a supersede
+    pointer was actually written (i.e. an older active row existed).
+    """
+    with session_scope() as s:
+        rows = s.execute(
+            select(GeneratedContent.id)
+            .where(
+                GeneratedContent.lead_id == lead_id,
+                GeneratedContent.kind == kind,
+                GeneratedContent.superseded_by_id.is_(None),
+            )
+            .order_by(GeneratedContent.id.desc())
+        ).all()
+        ids = [int(r[0]) for r in rows]
+        if len(ids) < 2:
+            return False
+        new_id, old_id = ids[0], ids[1]
+        old_row = s.get(GeneratedContent, old_id)
+        if old_row is not None:
+            old_row.superseded_by_id = new_id
+            return True
+    return False
+
+
+_KIND_GENERATOR = {
+    "email": generate_email,
+    "call_script": generate_call_script,
+    "linkedin_msg": generate_linkedin_msg,
+}
 
 
 async def _phase_content(
@@ -107,6 +156,7 @@ async def _phase_content(
     run_email: bool = True,
     run_call_script: bool = True,
     run_linkedin_msg: bool = True,
+    force_refresh: bool = False,
 ) -> None:
     """Per lead, generate the enabled content kinds in parallel.
 
@@ -114,34 +164,52 @@ async def _phase_content(
     exists for the lead, that kind is skipped (no API call). A lead with email
     but no call_script re-attempts only call_script. Kinds disabled by their
     ``run_*`` flag are skipped without calling the generator.
+
+    ``force_refresh=True`` bypasses the per-kind "already exists" guard for
+    every enabled kind. A new GeneratedContent row is generated and the
+    prior active row is wired with ``superseded_by_id`` so the version
+    chain and ratings stay intact.
     """
     total = len(lead_ids)
-    already_email = get_content_lead_ids(lead_ids, "email") if run_email else set()
-    already_call = get_content_lead_ids(lead_ids, "call_script") if run_call_script else set()
-    already_li = get_content_lead_ids(lead_ids, "linkedin_msg") if run_linkedin_msg else set()
+    # In force mode, the "already exists" filter is a no-op — we want to
+    # regenerate every enabled kind regardless.
+    already_email = (
+        get_content_lead_ids(lead_ids, "email")
+        if run_email and not force_refresh else set()
+    )
+    already_call = (
+        get_content_lead_ids(lead_ids, "call_script")
+        if run_call_script and not force_refresh else set()
+    )
+    already_li = (
+        get_content_lead_ids(lead_ids, "linkedin_msg")
+        if run_linkedin_msg and not force_refresh else set()
+    )
     for idx, lid in enumerate(lead_ids, start=1):
-        tasks: list = []
+        # Track which kinds we'll actually generate so we can wire supersede
+        # pointers and report per-kind status after the gather.
+        kinds_to_run: list[str] = []
         skipped_kinds: list[str] = []
         if not run_email:
             skipped_kinds.append("email")
         elif lid in already_email:
             skipped_kinds.append("email")
         else:
-            tasks.append(generate_email(lid))
+            kinds_to_run.append("email")
         if not run_call_script:
             skipped_kinds.append("call_script")
         elif lid in already_call:
             skipped_kinds.append("call_script")
         else:
-            tasks.append(generate_call_script(lid))
+            kinds_to_run.append("call_script")
         if not run_linkedin_msg:
             skipped_kinds.append("linkedin_msg")
         elif lid in already_li:
             skipped_kinds.append("linkedin_msg")
         else:
-            tasks.append(generate_linkedin_msg(lid))
+            kinds_to_run.append("linkedin_msg")
 
-        if not tasks:
+        if not kinds_to_run:
             _emit(
                 on_update,
                 PhaseUpdate(
@@ -151,15 +219,50 @@ async def _phase_content(
             )
             continue
 
+        tasks = [_KIND_GENERATOR[k](lid) for k in kinds_to_run]
         try:
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            errors = [r for r in results if isinstance(r, Exception)]
-            ok = not errors
-            err_msg = "; ".join(f"{type(e).__name__}: {e}" for e in errors) if errors else None
-            payload = {"skipped_kinds": skipped_kinds} if skipped_kinds else None
-            _emit(on_update, PhaseUpdate("content", lid, idx, total, ok, err_msg, payload))
         except Exception as exc:
             _emit(on_update, PhaseUpdate("content", lid, idx, total, False, str(exc)))
+            continue
+
+        regenerated_kinds: list[str] = []
+        failed_kinds: list[str] = []
+        errors: list[Exception] = []
+        for kind, res in zip(kinds_to_run, results):
+            if isinstance(res, Exception):
+                failed_kinds.append(kind)
+                errors.append(res)
+                continue
+            # In force mode, the generator just inserted a new active row
+            # alongside the previous active row — wire the supersede pointer
+            # so the version chain stays clean and the Lead Detail page
+            # surfaces the fresh row as the active one.
+            if force_refresh:
+                try:
+                    _supersede_previous_active(lid, kind)
+                except Exception as exc:
+                    # Failing to wire the pointer is not a content-gen
+                    # failure — the new row IS in the DB. Log via payload
+                    # so the UI shows it but the kind still counts as
+                    # refreshed.
+                    errors.append(exc)
+            regenerated_kinds.append(kind)
+
+        ok = not failed_kinds
+        err_msg = (
+            "; ".join(f"{type(e).__name__}: {e}" for e in errors) if errors else None
+        )
+        payload: dict[str, Any] = {}
+        if regenerated_kinds:
+            payload["regenerated_kinds"] = regenerated_kinds
+        if skipped_kinds:
+            payload["skipped_kinds"] = skipped_kinds
+        if failed_kinds:
+            payload["failed_kinds"] = failed_kinds
+        if force_refresh:
+            payload["forced"] = True
+        _emit(on_update, PhaseUpdate("content", lid, idx, total, ok, err_msg, payload or None))
 
 
 async def _phase_deliver(
@@ -434,6 +537,7 @@ def process_single_lead(
     run_email: bool = True,
     run_call_script: bool = True,
     run_linkedin_msg: bool = True,
+    force_refresh: bool = False,
     on_update: Callable[[PhaseUpdate], None] | None = None,
 ) -> None:
     """Run enrich → score → content → deliver for a single lead, in order.
@@ -449,10 +553,10 @@ def process_single_lead(
     — caller can rely on it returning even if a phase failed for this lead.
     """
     if run_enrichment:
-        run_async(_phase_enrich([lead_id], on_update))
+        run_async(_phase_enrich([lead_id], on_update, force_refresh=force_refresh))
 
     if run_scoring:
-        run_async(_phase_score([lead_id], on_update))
+        run_async(_phase_score([lead_id], on_update, force_refresh=force_refresh))
 
     if run_email or run_call_script or run_linkedin_msg:
         eligible = _send_eligible_lead_ids([lead_id])
@@ -463,6 +567,7 @@ def process_single_lead(
                 run_email=run_email,
                 run_call_script=run_call_script,
                 run_linkedin_msg=run_linkedin_msg,
+                force_refresh=force_refresh,
             ))
             if run_email:
                 have_email = _has_email_content_lead_ids(eligible)
@@ -480,6 +585,7 @@ def run_phased_pipeline(
     run_email: bool = True,
     run_call_script: bool = True,
     run_linkedin_msg: bool = True,
+    force_refresh: bool = False,
 ) -> dict[str, Any]:
     """Run the full pipeline per-lead and return a summary dict.
 
@@ -507,6 +613,7 @@ def run_phased_pipeline(
             run_email=run_email,
             run_call_script=run_call_script,
             run_linkedin_msg=run_linkedin_msg,
+            force_refresh=force_refresh,
             on_update=on_update,
         )
 

@@ -23,7 +23,7 @@ from src.enrichment.company_details import fetch_company_details
 from src.enrichment.linkedin_profile import fetch_linkedin_profile
 from src.enrichment.news import fetch_company_news, fetch_industry_news
 from src.icp_config import load_icp_config
-from src.models import Enrichment, Lead
+from src.models import Enrichment, Lead, now_utc
 
 log = logging.getLogger(__name__)
 
@@ -171,6 +171,11 @@ async def enrich_lead(lead_id: int) -> dict:
             existing.industry_news = payload.get("industry_news")
             existing.buyer_accounts = payload.get("buyer_accounts")
             existing.source_status = status
+            # Re-runs overwrite source payloads, so the timestamp must move
+            # too — otherwise the Lead Detail page still shows the old
+            # "Last enriched" value and the operator can't tell whether the
+            # refresh actually happened.
+            existing.enriched_at = now_utc()
         else:
             session.add(Enrichment(
                 lead_id=lead_id,
