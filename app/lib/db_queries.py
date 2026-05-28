@@ -360,6 +360,27 @@ def get_content_pending_lead_ids() -> list[int]:
     return [r[0] for r in rows]
 
 
+def get_lead_ids_by_tiers(tiers: list[str]) -> list[int]:
+    """Return lead IDs whose Score.tier is in `tiers`, ascending by lead id.
+
+    Same tier source as the Leads table (`list_leads` joins `Score` 1:1 with
+    `Lead`). Leads without a Score row are excluded — they have no tier.
+    """
+    if not tiers:
+        return []
+    normalized = [t.upper() for t in tiers if t]
+    if not normalized:
+        return []
+    with session_scope() as session:
+        rows = session.execute(
+            select(Lead.id)
+            .join(Score, Score.lead_id == Lead.id)
+            .where(Score.tier.in_(normalized))
+            .order_by(Lead.id.asc())
+        ).all()
+    return [r[0] for r in rows]
+
+
 def get_leads_with_content_by_tier(tiers: list[str]) -> list[int]:
     """Return lead IDs whose Score.tier is in `tiers` AND that have at least
     one active (non-superseded) GeneratedContent row. Used by the bulk

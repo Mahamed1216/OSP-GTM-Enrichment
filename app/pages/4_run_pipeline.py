@@ -18,6 +18,7 @@ from app.lib.db_queries import (
     get_all_lead_ids,
     get_content_lead_ids,
     get_content_pending_lead_ids,
+    get_lead_ids_by_tiers,
     get_leads_with_content_by_tier,
     get_scored_lead_ids,
     get_unenriched_lead_ids,
@@ -434,6 +435,125 @@ with qs3:
     ):
         st.session_state["_staged_ids"] = ", ".join(str(i) for i in _content_pending_ids)
         st.rerun()
+
+# ---------------------------------------------------------------
+# Select leads by tier
+# ---------------------------------------------------------------
+st.markdown("**Select leads by tier**")
+st.caption(
+    "Populate the lead-ID field above with every lead in the chosen tier(s). "
+    "The manual ID input still works — this just rewrites it."
+)
+
+selected_tier_set: list[str] = st.multiselect(
+    "Tiers",
+    options=["A", "B", "C", "D"],
+    default=[],
+    key="tier_select_tiers",
+    label_visibility="collapsed",
+    disabled=bool(st.session_state.get("pipeline_running")),
+)
+
+# Precompute counts so the buttons can advertise sizes and gate disabled state.
+try:
+    _tier_id_cache: dict[str, list[int]] = {
+        t: get_lead_ids_by_tiers([t]) for t in ["A", "B", "C", "D"]
+    }
+except Exception as exc:
+    st.error(f"Could not load tier counts: {exc}")
+    _tier_id_cache = {"A": [], "B": [], "C": [], "D": []}
+
+
+def _stage_tier_ids(tiers: list[str]) -> None:
+    """Sort, stage into the lead-IDs input, and surface a confirmation banner."""
+    seen: set[int] = set()
+    merged: list[int] = []
+    for t in tiers:
+        for lid in _tier_id_cache.get(t.upper(), []):
+            if lid not in seen:
+                seen.add(lid)
+                merged.append(lid)
+    merged.sort()
+    st.session_state["_staged_ids"] = ", ".join(str(i) for i in merged)
+    st.session_state["_tier_load_msg"] = {
+        "ids": merged,
+        "tiers": [t.upper() for t in tiers],
+    }
+
+
+ts1, ts2, ts3, ts4 = st.columns(4)
+with ts1:
+    if st.button(
+        f"Set to selected tiers ({sum(len(_tier_id_cache[t]) for t in selected_tier_set)})",
+        key="set_selected_tiers",
+        disabled=not selected_tier_set or bool(st.session_state.get("pipeline_running")),
+        help="Populate the lead-ID field with every lead in the chosen tier(s).",
+    ):
+        missing = [t for t in selected_tier_set if not _tier_id_cache.get(t)]
+        if missing:
+            st.warning(f"No leads found for tier(s): {', '.join(missing)}")
+        any_present = [t for t in selected_tier_set if _tier_id_cache.get(t)]
+        if any_present:
+            _stage_tier_ids(any_present)
+            st.rerun()
+with ts2:
+    if st.button(
+        f"Set to A tier ({len(_tier_id_cache['A'])})",
+        key="set_tier_a",
+        disabled=not _tier_id_cache["A"] or bool(st.session_state.get("pipeline_running")),
+    ):
+        _stage_tier_ids(["A"])
+        st.rerun()
+with ts3:
+    if st.button(
+        f"Set to B tier ({len(_tier_id_cache['B'])})",
+        key="set_tier_b",
+        disabled=not _tier_id_cache["B"] or bool(st.session_state.get("pipeline_running")),
+    ):
+        _stage_tier_ids(["B"])
+        st.rerun()
+with ts4:
+    if st.button(
+        f"Set to C tier ({len(_tier_id_cache['C'])})",
+        key="set_tier_c",
+        disabled=not _tier_id_cache["C"] or bool(st.session_state.get("pipeline_running")),
+    ):
+        _stage_tier_ids(["C"])
+        st.rerun()
+
+# Post-stage confirmation. Survives one rerun via session_state so the user
+# sees it after we trigger st.rerun() to apply the new lead-IDs input value.
+_tier_load_msg = st.session_state.pop("_tier_load_msg", None)
+if _tier_load_msg:
+    _loaded_ids = _tier_load_msg["ids"]
+    _loaded_tiers = ", ".join(_tier_load_msg["tiers"])
+    st.success(f"Loaded {len(_loaded_ids)} lead IDs for tier(s): {_loaded_tiers}")
+    if _loaded_ids:
+        if len(_loaded_ids) <= 200:
+            preview_str = ", ".join(str(i) for i in _loaded_ids)
+        else:
+            preview_str = (
+                ", ".join(str(i) for i in _loaded_ids[:200])
+                + f", plus {len(_loaded_ids) - 200} more"
+            )
+        with st.expander(f"Preview lead IDs ({len(_loaded_ids)})", expanded=False):
+            st.code(preview_str, language=None)
+
+# Live selection counts. The "Selected tier leads" count tracks the
+# multiselect (advisory — they may not have clicked a Set button yet);
+# "Selected IDs" parses whatever is currently in the lead-ID input.
+_selected_tier_ids_count = sum(
+    len(_tier_id_cache[t]) for t in selected_tier_set
+)
+try:
+    _selected_id_count = len(
+        parse_lead_ids(st.session_state.get("lead_ids_input", "") or "")
+    )
+except ValueError:
+    _selected_id_count = 0
+cc_l, cc_r = st.columns(2)
+cc_l.caption(f"**Selected tier leads:** {_selected_tier_ids_count}")
+cc_r.caption(f"**Selected IDs:** {_selected_id_count}")
 
 c1, c2 = st.columns(2)
 with c1:
