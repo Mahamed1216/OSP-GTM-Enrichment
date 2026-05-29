@@ -65,6 +65,7 @@ from src.feedback.self_improvement import (
     approve_recommendation,
     diagnose,
     kpi_view,
+    latest_send_info,
     list_recommendations,
     performance_by_prompt_version,
     reject_recommendation,
@@ -419,6 +420,38 @@ with st.expander("Sync debug — raw Instantly analytics + DB comparison"):
             hide_index=True,
             width="stretch",
         )
+        # Latest-send source breakdown — proves the loop's "Since latest send"
+        # is reading Instantly per-lead activity, not stale local DB delivery
+        # rows. Bug this guards against: local sent_count drifts above the
+        # Instantly sequence-started number, so MAX(delivered_at) over local
+        # rows can lag the real campaign send time by many hours.
+        st.markdown("**Latest send source**")
+        try:
+            _send_info = latest_send_info()
+        except Exception as exc:
+            st.warning(f"Could not resolve latest-send info: {exc}")
+            _send_info = None
+        if _send_info is not None:
+            _instantly_ts = _send_info.get("latest_instantly_send_at")
+            _local_ts = _send_info.get("latest_local_delivery_send_at")
+            _chosen_ts = _send_info.get("timestamp")
+            _source = _send_info.get("source") or "—"
+            _hours = (
+                None if _chosen_ts is None
+                else max(0.0, (datetime.utcnow() - _chosen_ts).total_seconds() / 3600.0)
+            )
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {"field": "latest_instantly_send_at", "value": _format_timestamp(_instantly_ts)},
+                        {"field": "latest_local_delivery_send_at", "value": _format_timestamp(_local_ts)},
+                        {"field": "latest_send_source_used", "value": _source},
+                        {"field": "hours_since_latest_send", "value": "—" if _hours is None else f"{_hours:.1f}h"},
+                    ]
+                ),
+                hide_index=True,
+                width="stretch",
+            )
         st.markdown("**Raw Instantly analytics response**")
         st.json(_snapshot.get("raw") or {})
 

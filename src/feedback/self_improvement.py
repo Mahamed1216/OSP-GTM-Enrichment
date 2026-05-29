@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from sqlalchemy import case, func, select
@@ -51,6 +51,11 @@ from src.models import (
     InstantlyAnalyticsSnapshot,
     PromptRecommendation,
 )
+
+# Latest-send source labels — exposed for the Engagement debug panel.
+SEND_SOURCE_INSTANTLY = "instantly"
+SEND_SOURCE_LOCAL = "local"
+SEND_SOURCE_NONE = "none"
 from src.prompts.email import DEFAULT_EMAIL_PROMPT_BODY
 from src.prompts.loader import get_effective_prompt, save_overlay
 
@@ -137,6 +142,12 @@ class Diagnosis:
     previous_prompt_snapshot: Optional[str]
     sample_size: int                     # sent emails (the denominator)
     hours_since_latest_send: Optional[float]
+    # Which timestamp source produced `hours_since_latest_send`. Prefer
+    # SEND_SOURCE_INSTANTLY (per-lead Engagement.raw.timestamp_last_contact)
+    # whenever any sent Engagement row carries a timestamp; fall back to
+    # SEND_SOURCE_LOCAL (max GeneratedContent.delivered_at) only when no
+    # Instantly timestamps exist. SEND_SOURCE_NONE → no sends recorded.
+    latest_send_source: Optional[str] = None
 
     @property
     def is_actionable_prompt_change(self) -> bool:
@@ -184,22 +195,129 @@ def _reply_rate_addendum(current_rate: float, target_rate: float) -> str:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _latest_send_timestamp() -> datetime | None:
-    """MAX(delivered_at) over email GeneratedContent rows actually sent.
+def _parse_instantly_ts(value: Any) -> datetime | None:
+    """Normalize an Instantly per-lead timestamp into a naive-UTC datetime.
 
-    Used to gate the reply-rate diagnosis on the 24h/48h timing rules.
-    Reads from the local DB rather than Instantly because Instantly's
-    analytics snapshot doesn't expose per-campaign first/last send
-    timestamps in a stable shape.
+    Instantly returns ISO-8601 strings like '2026-05-29T13:42:11.123Z' or
+    '2026-05-29T13:42:11+00:00' on `timestamp_last_contact`. We compare
+    against `datetime.utcnow()` (naive) elsewhere in this module, so any
+    tz-aware value is converted to UTC and stripped of tzinfo to keep
+    arithmetic consistent. Returns None on anything we can't parse.
     """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+    if isinstance(value, (int, float)):
+        # Epoch seconds — unlikely but cheap to handle.
+        try:
+            return datetime.utcfromtimestamp(float(value))
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    return None
+
+
+def latest_send_info() -> dict[str, Any]:
+    """Resolve the latest-send timestamp from Instantly first, local DB second.
+
+    Why both: local `GeneratedContent.delivered_at` only fires when an
+    email leaves THIS app via the push button. Manual Instantly imports
+    and replays never get a local row, so the local MAX(delivered_at) can
+    lag the real campaign send time by days (the bug this helper fixes:
+    UI showed "Since latest send: 17.3h" while Instantly had sent events
+    a few hours old).
+
+    Per-lead `Engagement.raw.timestamp_last_contact` is populated by
+    `sync_engagement()` from the Instantly leads API for every lead in
+    the campaign — not just locally-pushed ones — so MAX over that field
+    tracks Instantly's actual send activity.
+
+    Returns:
+      {
+        "timestamp": datetime | None,             # the value the loop should use
+        "source": "instantly" | "local" | "none", # which branch produced it
+        "latest_instantly_send_at": datetime | None,
+        "latest_local_delivery_send_at": datetime | None,
+      }
+    All datetimes are naive UTC, matching the rest of this module.
+    """
+    instantly_ts: datetime | None = None
+    local_ts: datetime | None = None
+
     with session_scope() as session:
-        ts = session.execute(
+        local_ts = session.execute(
             select(func.max(GeneratedContent.delivered_at)).where(
                 GeneratedContent.kind == "email",
                 GeneratedContent.delivery_status == "sent",
             )
         ).scalar()
-    return ts
+
+        # Pull every sent-row's raw JSON and pick the max contact timestamp
+        # in Python — JSON-extract syntax differs across SQLite/Postgres and
+        # the row count is bounded by campaign size (~hundreds).
+        raw_rows = session.execute(
+            select(Engagement.raw).where(Engagement.sent.is_(True))
+        ).all()
+
+    for (raw,) in raw_rows:
+        if not isinstance(raw, dict):
+            continue
+        candidate = _parse_instantly_ts(
+            raw.get("timestamp_last_contact")
+            or raw.get("timestamp_last_touch")
+        )
+        if candidate is None:
+            continue
+        if instantly_ts is None or candidate > instantly_ts:
+            instantly_ts = candidate
+
+    if instantly_ts is not None:
+        chosen = instantly_ts
+        source = SEND_SOURCE_INSTANTLY
+    elif local_ts is not None:
+        chosen = local_ts
+        source = SEND_SOURCE_LOCAL
+    else:
+        chosen = None
+        source = SEND_SOURCE_NONE
+
+    return {
+        "timestamp": chosen,
+        "source": source,
+        "latest_instantly_send_at": instantly_ts,
+        "latest_local_delivery_send_at": local_ts,
+    }
+
+
+def _latest_send_timestamp() -> datetime | None:
+    """Back-compat shim — returns the same `datetime | None` callers expect.
+
+    Internally now prefers Instantly's per-lead `timestamp_last_contact`
+    over the local DB delivery rows. See `latest_send_info()` for the
+    full source breakdown the Engagement debug panel renders.
+    """
+    return latest_send_info()["timestamp"]
+
+
+def _source_label(source: str | None) -> str:
+    if source == SEND_SOURCE_INSTANTLY:
+        return "Instantly"
+    if source == SEND_SOURCE_LOCAL:
+        return "local DB"
+    return "the latest send record"
 
 
 def _confidence_band(sample_size: int) -> str:
@@ -259,8 +377,15 @@ def diagnose(
     sample_size = sent
     confidence = _confidence_band(sample_size)
 
+    # Resolve latest-send timestamp + source. We always call
+    # latest_send_info() so the returned Diagnosis carries `latest_send_source`
+    # even when the caller passed an explicit `latest_send` override (tests).
+    send_info = latest_send_info()
     if latest_send is None:
-        latest_send = _latest_send_timestamp()
+        latest_send = send_info["timestamp"]
+        send_source = send_info["source"]
+    else:
+        send_source = "override"
     if now is None:
         now = datetime.utcnow()
     hours_since_send: float | None = None
@@ -293,6 +418,7 @@ def diagnose(
             previous_prompt_snapshot=None,
             sample_size=sample_size,
             hours_since_latest_send=hours_since_send,
+            latest_send_source=send_source,
         )
 
     # Delivery mismatch is handled by the page-level sync-hygiene warning,
@@ -329,6 +455,7 @@ def diagnose(
                 previous_prompt_snapshot=None,
                 sample_size=sample_size,
                 hours_since_latest_send=hours_since_send,
+                latest_send_source=send_source,
             )
         current = get_effective_prompt("email", DEFAULT_EMAIL_PROMPT_BODY)
         return Diagnosis(
@@ -355,6 +482,7 @@ def diagnose(
             previous_prompt_snapshot=current,
             sample_size=sample_size,
             hours_since_latest_send=hours_since_send,
+            latest_send_source=send_source,
         )
 
     # ---- 4) Reply rate — body / CTA. Gates: open healthy, timing, sample.
@@ -370,9 +498,9 @@ def diagnose(
                 confidence=confidence,
                 diagnosis=(
                     f"Open rate is healthy ({open_rate * 100:.1f}%) but the "
-                    f"latest send was {hours_since_send:.1f}h ago. Replies "
-                    "typically arrive 24-72h after the first touch. Wait "
-                    "before changing the body."
+                    f"latest send from {_source_label(send_source)} was "
+                    f"{hours_since_send:.1f}h ago. Replies typically arrive "
+                    "24-72h after the first touch. Wait before changing the body."
                 ),
                 current_metric_label="Reply rate",
                 current_metric_value=reply_rate,
@@ -387,6 +515,7 @@ def diagnose(
                 previous_prompt_snapshot=None,
                 sample_size=sample_size,
                 hours_since_latest_send=hours_since_send,
+                latest_send_source=send_source,
             )
         if hours_since_send is not None and hours_since_send < REPLY_DIAGNOSE_HOURS:
             return Diagnosis(
@@ -396,9 +525,9 @@ def diagnose(
                 confidence=confidence,
                 diagnosis=(
                     f"Open rate is healthy ({open_rate * 100:.1f}%); reply rate "
-                    f"is {reply_rate * 100:.2f}% but the latest send was only "
-                    f"{hours_since_send:.1f}h ago. Diagnose only — do not "
-                    "change the body until at least "
+                    f"is {reply_rate * 100:.2f}% but the latest send from "
+                    f"{_source_label(send_source)} was only {hours_since_send:.1f}h "
+                    "ago. Diagnose only — do not change the body until at least "
                     f"{REPLY_DIAGNOSE_HOURS}h have passed."
                 ),
                 current_metric_label="Reply rate",
@@ -416,6 +545,7 @@ def diagnose(
                 previous_prompt_snapshot=None,
                 sample_size=sample_size,
                 hours_since_latest_send=hours_since_send,
+                latest_send_source=send_source,
             )
         if insufficient:
             return Diagnosis(
@@ -441,6 +571,7 @@ def diagnose(
                 previous_prompt_snapshot=None,
                 sample_size=sample_size,
                 hours_since_latest_send=hours_since_send,
+                latest_send_source=send_source,
             )
         current = get_effective_prompt("email", DEFAULT_EMAIL_PROMPT_BODY)
         return Diagnosis(
@@ -468,6 +599,7 @@ def diagnose(
             previous_prompt_snapshot=current,
             sample_size=sample_size,
             hours_since_latest_send=hours_since_send,
+            latest_send_source=send_source,
         )
 
     # ---- 5) Green ---------------------------------------------------------
@@ -487,6 +619,7 @@ def diagnose(
         previous_prompt_snapshot=None,
         sample_size=sample_size,
         hours_since_latest_send=hours_since_send,
+        latest_send_source=send_source,
     )
 
 
