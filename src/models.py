@@ -207,6 +207,11 @@ class InstantlyAnalyticsSnapshot(Base):
     positive_reply_count: Mapped[Optional[int]] = mapped_column(Integer)
     opportunity_count: Mapped[Optional[int]] = mapped_column(Integer)
     conversion_count: Mapped[Optional[int]] = mapped_column(Integer)
+    # Which raw JSON key produced the positive_reply_count / opportunity_count.
+    # e.g. "analytics:positive_reply_count", "leads:status=2", "leads:no_match".
+    # NULL for rows created before this column was added.
+    raw_positive_reply_source: Mapped[Optional[str]] = mapped_column(String(128))
+    raw_opportunity_source: Mapped[Optional[str]] = mapped_column(String(128))
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
     synced_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
 

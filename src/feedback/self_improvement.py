@@ -107,6 +107,8 @@ def kpi_view(snapshot: dict[str, Any] | None) -> dict[str, Any]:
     sent = int(snapshot.get("emails_sent_count") or 0)
     contacted = int(snapshot.get("contacted_count") or 0)
     opens = int(snapshot.get("open_count") or 0)
+    unique_opens_raw = snapshot.get("unique_open_count")
+    unique_opens = int(unique_opens_raw) if unique_opens_raw is not None else None
     replies = int(snapshot.get("reply_count") or 0)
     bounces = int(snapshot.get("bounced_count") or 0)
     # Positive engagement — None means "not reported by Instantly" vs 0.
@@ -117,20 +119,37 @@ def kpi_view(snapshot: dict[str, Any] | None) -> dict[str, Any]:
     # Use the higher of positive_replies vs opportunities to avoid double-
     # counting when Instantly reports the same intent under both fields.
     positive_signals = max(positive_replies, opportunities)
-    denom = sent if sent > 0 else 1
+
+    # Open rate: Instantly UI shows unique_opens / contacted (sequence started).
+    # The app previously used total opens / emails_sent_count which can differ
+    # significantly (total opens includes multiple opens per lead; emails_sent
+    # counts multi-step sequences). Prefer the Instantly-UI-matching formula.
+    if unique_opens is not None and contacted > 0:
+        open_rate = unique_opens / contacted
+        open_rate_source = "unique_opens/contacted"   # matches Instantly UI
+    elif sent > 0:
+        open_rate = opens / sent
+        open_rate_source = "total_opens/sent"         # fallback
+    else:
+        open_rate = 0.0
+        open_rate_source = "no_data"
+
+    send_denom = sent if sent > 0 else 1
     return {
         "contacted": contacted,
         "sent": sent,
         "opens": opens,
+        "unique_opens": unique_opens,             # None if not reported
         "replies": replies,
         "bounces": bounces,
         "positive_replies": positive_replies,
         "opportunities": opportunities,
         "positive_signals": positive_signals,
-        "open_rate": opens / denom,
-        "reply_rate": replies / denom,
-        "bounce_rate": bounces / denom,
-        "positive_reply_rate": positive_signals / denom,
+        "open_rate": open_rate,
+        "open_rate_source": open_rate_source,
+        "reply_rate": replies / send_denom,
+        "bounce_rate": bounces / send_denom,
+        "positive_reply_rate": positive_signals / send_denom,
     }
 
 

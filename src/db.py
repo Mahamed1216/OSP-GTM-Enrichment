@@ -53,6 +53,9 @@ _RUNTIME_COLUMN_ADDS: list[tuple[str, str, str]] = [
     ("instantly_analytics_snapshots", "positive_reply_count", "INTEGER"),
     ("instantly_analytics_snapshots", "opportunity_count", "INTEGER"),
     ("instantly_analytics_snapshots", "conversion_count", "INTEGER"),
+    # Which raw JSON key / fallback path produced the positive counts.
+    ("instantly_analytics_snapshots", "raw_positive_reply_source", "VARCHAR(128)"),
+    ("instantly_analytics_snapshots", "raw_opportunity_source", "VARCHAR(128)"),
     # FK to the snapshot a PromptRecommendation was based on, for staleness
     # detection when a newer sync arrives before the operator acts.
     ("prompt_recommendations", "analytics_snapshot_id", "INTEGER"),

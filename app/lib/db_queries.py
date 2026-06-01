@@ -617,6 +617,9 @@ def latest_instantly_snapshot() -> dict[str, Any] | None:
                 snap.conversion_count,
                 "conversion_count", "conversions_count", "conversions",
             ),
+            # Source attribution — which raw field or fallback produced the counts.
+            "raw_positive_reply_source": getattr(snap, "raw_positive_reply_source", None),
+            "raw_opportunity_source": getattr(snap, "raw_opportunity_source", None),
             "raw": raw,
             "synced_at": snap.synced_at,
         }

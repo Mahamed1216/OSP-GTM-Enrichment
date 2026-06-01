@@ -47,6 +47,7 @@ from src.content.winners import (
 )
 from src.feedback.engagement import (
     CampaignAnalyticsMismatch,
+    search_positive_fields,
     sync_campaign_analytics,
     sync_engagement,
 )
@@ -352,7 +353,8 @@ c1, c2, c3, c4, c5 = st.columns(5)
 with c1:
     kpi_card("Sent", f"{sent_remote:,}")
 with c2:
-    kpi_card("Open rate", _format_pct(opens, sent_remote))
+    _open_rate_pct = _metrics.get("open_rate", 0.0) * 100
+    kpi_card("Open rate", f"{_open_rate_pct:.1f}%")
 with c3:
     kpi_card(
         "Reply rate",
@@ -370,14 +372,24 @@ with c4:
 with c5:
     kpi_card("Bounce rate", _format_pct(bounces, sent_remote))
 
-if _snapshot is not None and contacted and contacted != sent_remote:
-    st.caption(
-        f"Instantly sequence started: {contacted:,} · "
-        f"emails sent: {sent_remote:,} · "
-        f"unique opens: "
-        f"{_snapshot.get('unique_open_count') if _snapshot.get('unique_open_count') is not None else '—'} "
-        f"· clicks: {int(_snapshot.get('click_count') or 0):,}"
-    )
+_open_rate_source = _metrics.get("open_rate_source", "")
+_unique_opens = _metrics.get("unique_opens")
+if _snapshot is not None:
+    _open_note_parts = [
+        f"Sequence started: {contacted:,}",
+        f"Emails sent (total): {sent_remote:,}",
+        f"Total opens: {_metrics.get('opens', 0):,}",
+    ]
+    if _unique_opens is not None:
+        _open_note_parts.append(f"Unique opens: {_unique_opens:,}")
+    if _open_rate_source:
+        _formula_label = (
+            "unique opens / sequence started (matches Instantly UI)"
+            if _open_rate_source == "unique_opens/contacted"
+            else "total opens / emails sent"
+        )
+        _open_note_parts.append(f"Open rate formula: {_formula_label}")
+    st.caption("  ·  ".join(_open_note_parts))
 
 # Sync-hygiene warning: surfaced ONLY here, never as a self-improvement
 # recommendation. The loop's delivery branch is informational; this
@@ -395,9 +407,6 @@ with st.expander("Sync debug — raw Instantly analytics + DB comparison"):
         st.info("No analytics snapshot yet. Hit \"Sync engagement from Instantly\".")
     else:
         _raw = _snapshot.get("raw") or {}
-        # The snapshot's `raw` field holds ONLY the matched record (set by
-        # sync_campaign_analytics), so derived ids/names here are the
-        # selected campaign — never an account-wide aggregate.
         _selected_id = (
             _raw.get("campaign_id")
             or _raw.get("id")
@@ -416,79 +425,103 @@ with st.expander("Sync debug — raw Instantly analytics + DB comparison"):
                 "Selected campaign id does not match the configured "
                 "INSTANTLY_CAMPAIGN_ID. The snapshot may be stale — re-sync."
             )
-        st.markdown("**Raw Instantly analytics fields**")
-        _raw_fields = [
-            {"field": k, "raw value": v}
-            for k, v in sorted((_snapshot.get("raw") or {}).items())
-        ]
-        if _raw_fields:
-            st.dataframe(pd.DataFrame(_raw_fields), hide_index=True, use_container_width=True)
-        else:
-            st.caption("No raw fields available.")
 
-        st.markdown("**Metric · Instantly raw · Stored snapshot · Displayed KPI**")
-        _snap = _snapshot or {}
+        # ---- Open rate breakdown ----
+        st.markdown("**Open rate breakdown**")
+        _or_source = _metrics.get("open_rate_source", "—")
+        _or_pct = _metrics.get("open_rate", 0.0) * 100
+        _total_opens = _metrics.get("opens", 0)
+        _uopens = _metrics.get("unique_opens")
         st.dataframe(
-            pd.DataFrame(
-                [
-                    {
-                        "Metric": "Sequence started",
-                        "Instantly raw": (_snapshot.get("raw") or {}).get("contacted_count") or contacted,
-                        "Stored snapshot": _snap.get("contacted_count", "—"),
-                        "Displayed KPI": contacted,
-                    },
-                    {
-                        "Metric": "Emails sent",
-                        "Instantly raw": (_snapshot.get("raw") or {}).get("emails_sent_count") or sent_remote,
-                        "Stored snapshot": _snap.get("emails_sent_count", "—"),
-                        "Displayed KPI": sent_remote,
-                    },
-                    {
-                        "Metric": "Opens",
-                        "Instantly raw": (_snapshot.get("raw") or {}).get("open_count", "—"),
-                        "Stored snapshot": _snap.get("open_count", "—"),
-                        "Displayed KPI": opens,
-                    },
-                    {
-                        "Metric": "Replies (total)",
-                        "Instantly raw": (_snapshot.get("raw") or {}).get("reply_count", "—"),
-                        "Stored snapshot": _snap.get("reply_count", "—"),
-                        "Displayed KPI": replies,
-                    },
-                    {
-                        "Metric": "Positive replies",
-                        "Instantly raw": (_snapshot.get("raw") or {}).get("positive_reply_count", "—"),
-                        "Stored snapshot": _snap.get("positive_reply_count", "—"),
-                        "Displayed KPI": _metrics.get("positive_replies", "—"),
-                    },
-                    {
-                        "Metric": "Opportunities",
-                        "Instantly raw": (_snapshot.get("raw") or {}).get("opportunity_count", "—"),
-                        "Stored snapshot": _snap.get("opportunity_count", "—"),
-                        "Displayed KPI": opportunities,
-                    },
-                    {
-                        "Metric": "Bounces",
-                        "Instantly raw": (_snapshot.get("raw") or {}).get("bounced_count", "—"),
-                        "Stored snapshot": _snap.get("bounced_count", "—"),
-                        "Displayed KPI": bounces,
-                    },
-                    {
-                        "Metric": "Local sent (DB)",
-                        "Instantly raw": "—",
-                        "Stored snapshot": "—",
-                        "Displayed KPI": _local_sent,
-                    },
-                ]
-            ),
+            pd.DataFrame([
+                {"field": "total_opens (open_count)", "value": _total_opens},
+                {"field": "unique_opens (unique_open_count)", "value": "—" if _uopens is None else _uopens},
+                {"field": "contacted / sequence_started", "value": contacted},
+                {"field": "emails_sent_count", "value": sent_remote},
+                {"field": "formula used", "value": _or_source},
+                {"field": "displayed open rate", "value": f"{_or_pct:.2f}%"},
+                {"field": "Instantly UI open rate (expected)", "value": "39.06% (unique_opens/contacted)"},
+            ]),
             hide_index=True,
             use_container_width=True,
         )
-        # Latest-send source breakdown — proves the loop's "Since latest send"
-        # is reading Instantly per-lead activity, not stale local DB delivery
-        # rows. Bug this guards against: local sent_count drifts above the
-        # Instantly sequence-started number, so MAX(delivered_at) over local
-        # rows can lag the real campaign send time by many hours.
+
+        # ---- Positive reply / opportunity attribution ----
+        st.markdown("**Positive reply / opportunity source**")
+        _pos_reply_src = _snapshot.get("raw_positive_reply_source") or "—"
+        _opp_src = _snapshot.get("raw_opportunity_source") or "—"
+        st.dataframe(
+            pd.DataFrame([
+                {"field": "positive_reply_count (stored)", "value": _snapshot.get("positive_reply_count", "—")},
+                {"field": "opportunity_count (stored)", "value": _snapshot.get("opportunity_count", "—")},
+                {"field": "raw_positive_reply_source", "value": _pos_reply_src},
+                {"field": "raw_opportunity_source", "value": _opp_src},
+                {"field": "positive_signals (displayed KPI)", "value": positive_signals},
+            ]),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        # ---- Recursive positive-keyword search ----
+        st.markdown("**Positive-keyword field search (raw analytics JSON)**")
+        _pos_hits = search_positive_fields(_raw)
+        if _pos_hits:
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "Raw key": k,
+                        "Raw value": v,
+                        "Normalized metric target": (
+                            "positive_reply_count" if "positive" in k.lower() and "reply" in k.lower()
+                            else "opportunity_count" if "opportunit" in k.lower()
+                            else "reply_count" if "reply" in k.lower() or "repli" in k.lower()
+                            else "status" if "status" in k.lower()
+                            else "conversion_count" if "convers" in k.lower()
+                            else "(informational)"
+                        ),
+                    }
+                    for k, v in sorted(_pos_hits.items())
+                ]),
+                hide_index=True,
+                use_container_width=True,
+            )
+        else:
+            st.caption(
+                "No positive-engagement keys found in the raw analytics JSON. "
+                "Instantly may not expose opportunity count via the analytics endpoint — "
+                "the leads fallback (iterating per-lead statuses) is the source."
+            )
+
+        # ---- Full raw analytics JSON fields (all keys) ----
+        st.markdown("**All raw Instantly analytics keys**")
+        if _raw:
+            st.dataframe(
+                pd.DataFrame([{"field": k, "raw value": v} for k, v in sorted(_raw.items())]),
+                hide_index=True,
+                use_container_width=True,
+            )
+        else:
+            st.caption("No raw response available.")
+
+        # ---- Metric · Instantly raw · Stored snapshot · Displayed KPI ----
+        st.markdown("**Metric comparison table**")
+        st.dataframe(
+            pd.DataFrame([
+                {"Metric": "Sequence started",      "Instantly raw": _raw.get("contacted_count", "—"),      "Stored snapshot": _snapshot.get("contacted_count", "—"),      "Displayed KPI": contacted},
+                {"Metric": "Emails sent (total)",   "Instantly raw": _raw.get("emails_sent_count", "—"),    "Stored snapshot": _snapshot.get("emails_sent_count", "—"),    "Displayed KPI": sent_remote},
+                {"Metric": "Total opens",            "Instantly raw": _raw.get("open_count", "—"),           "Stored snapshot": _snapshot.get("open_count", "—"),           "Displayed KPI": _total_opens},
+                {"Metric": "Unique opens",           "Instantly raw": _raw.get("unique_opened_count") or _raw.get("unique_open_count", "—"), "Stored snapshot": _snapshot.get("unique_open_count", "—"), "Displayed KPI": "—" if _uopens is None else _uopens},
+                {"Metric": "Replies (total)",        "Instantly raw": _raw.get("reply_count", "—"),          "Stored snapshot": _snapshot.get("reply_count", "—"),          "Displayed KPI": replies},
+                {"Metric": "Positive replies",       "Instantly raw": _raw.get("positive_reply_count", "—"),"Stored snapshot": _snapshot.get("positive_reply_count", "—"), "Displayed KPI": _metrics.get("positive_replies", "—")},
+                {"Metric": "Opportunities",          "Instantly raw": _raw.get("opportunity_count", "—"),    "Stored snapshot": _snapshot.get("opportunity_count", "—"),    "Displayed KPI": opportunities},
+                {"Metric": "Bounces",                "Instantly raw": _raw.get("bounced_count", "—"),        "Stored snapshot": _snapshot.get("bounced_count", "—"),        "Displayed KPI": bounces},
+                {"Metric": "Local sent (DB)",        "Instantly raw": "—",                                   "Stored snapshot": "—",                                        "Displayed KPI": _local_sent},
+            ]),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        # ---- Latest-send source breakdown ----
         st.markdown("**Latest send source**")
         try:
             _send_info = latest_send_info()
@@ -505,19 +538,15 @@ with st.expander("Sync debug — raw Instantly analytics + DB comparison"):
                 else max(0.0, (datetime.utcnow() - _chosen_ts).total_seconds() / 3600.0)
             )
             st.dataframe(
-                pd.DataFrame(
-                    [
-                        {"field": "latest_instantly_send_at", "value": _format_timestamp(_instantly_ts)},
-                        {"field": "latest_local_delivery_send_at", "value": _format_timestamp(_local_ts)},
-                        {"field": "latest_send_source_used", "value": _source},
-                        {"field": "hours_since_latest_send", "value": "—" if _hours is None else f"{_hours:.1f}h"},
-                    ]
-                ),
+                pd.DataFrame([
+                    {"field": "latest_instantly_send_at",      "value": _format_timestamp(_instantly_ts)},
+                    {"field": "latest_local_delivery_send_at", "value": _format_timestamp(_local_ts)},
+                    {"field": "latest_send_source_used",       "value": _source},
+                    {"field": "hours_since_latest_send",       "value": "—" if _hours is None else f"{_hours:.1f}h"},
+                ]),
                 hide_index=True,
-                width="stretch",
+                use_container_width=True,
             )
-        st.markdown("**Raw Instantly analytics response**")
-        st.json(_snapshot.get("raw") or {})
 
 st.divider()
 

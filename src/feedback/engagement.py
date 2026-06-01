@@ -30,6 +30,27 @@ _TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 _API_BASE = "https://api.instantly.ai/api/v2"
 _PAGE_SIZE = 100
 
+# ---------------------------------------------------------------------------
+# Keyword sets for positive-engagement field detection.
+# ---------------------------------------------------------------------------
+
+# Keywords used to find relevant fields recursively in the Instantly raw JSON.
+POSITIVE_KEYWORDS: frozenset[str] = frozenset({
+    "opportunity", "opportunities", "positive", "reply", "replies",
+    "interested", "booked", "conversion", "conversions", "status",
+    "lead_status", "interest", "booking", "won", "qualified",
+})
+
+# Instantly integer status codes that represent positive lead engagement.
+# -1 = bounced, 0 = not contacted, 1 = active/in-sequence, 2+ = positive.
+_POSITIVE_STATUS_INTS: frozenset[int] = frozenset({2, 3, 4, 5, 6})
+
+# Instantly string status values that represent positive lead engagement.
+_POSITIVE_STATUS_STRS: frozenset[str] = frozenset({
+    "interested", "meeting_booked", "opportunity", "customer",
+    "positive", "booked", "converted", "won", "qualified", "hot",
+})
+
 
 def _auth_headers() -> dict[str, str]:
     return {
@@ -243,6 +264,95 @@ async def fetch_campaign_analytics(campaign_id: str) -> dict:
     return matched
 
 
+def search_positive_fields(raw: Any, _prefix: str = "") -> dict[str, Any]:
+    """Recursively search a raw Instantly JSON value for positive-engagement fields.
+
+    Walks dicts and the first few items of lists. Returns {dotted.key: value}
+    for every key whose name contains one of POSITIVE_KEYWORDS (case-insensitive).
+    Used by the debug expander to expose what fields Instantly actually sends,
+    so we don't have to guess field names.
+    """
+    results: dict[str, Any] = {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            full_key = f"{_prefix}.{key}" if _prefix else key
+            if any(kw in key.lower() for kw in POSITIVE_KEYWORDS):
+                results[full_key] = value
+            nested = search_positive_fields(value, full_key)
+            results.update(nested)
+    elif isinstance(raw, list):
+        for i, item in enumerate(raw[:3]):  # cap at first 3 list entries
+            nested = search_positive_fields(item, f"{_prefix}[{i}]")
+            results.update(nested)
+    return results
+
+
+def _classify_positive_lead(raw: dict) -> str | None:
+    """Return 'field=value' when a lead record signals positive engagement, else None.
+
+    Checks status codes/strings, boolean interest flags, and category labels
+    from the Instantly per-lead payload so the fallback counter works even when
+    the analytics endpoint doesn't expose a dedicated opportunity field.
+    """
+    # Integer or string status fields
+    for field in (
+        "status", "lead_status", "email_status", "interest_status",
+        "reply_status", "campaign_status",
+    ):
+        val = raw.get(field)
+        if val is None:
+            continue
+        if isinstance(val, int) and val in _POSITIVE_STATUS_INTS:
+            return f"{field}={val}"
+        if isinstance(val, str) and val.strip().lower() in _POSITIVE_STATUS_STRS:
+            return f"{field}={val.strip()}"
+    # Boolean interest/opportunity flags
+    for field in (
+        "is_interested", "has_opportunity", "opportunity",
+        "is_opportunity", "interested", "is_booked",
+    ):
+        if _truthy(raw.get(field)):
+            return f"{field}=true"
+    # Category or label lists
+    for field in ("categories", "labels", "tags"):
+        cats = raw.get(field)
+        if isinstance(cats, list):
+            for cat in cats:
+                if isinstance(cat, str) and cat.strip().lower() in _POSITIVE_STATUS_STRS:
+                    return f"{field}={cat.strip()}"
+    return None
+
+
+async def count_positive_campaign_leads() -> tuple[int, str]:
+    """Count leads with positive-engagement statuses in the configured campaign.
+
+    Iterates every lead in the campaign via the paginated leads API and
+    classifies each one using `_classify_positive_lead`. Used as a fallback
+    when the campaign analytics endpoint doesn't expose a positive_reply_count
+    or opportunity_count field.
+
+    Returns (count, source_description) where source_description lists the
+    field:value combinations that triggered the positive classification,
+    e.g. "status=2, status=4".
+    """
+    count = 0
+    source_set: set[str] = set()
+    try:
+        async for raw in _iter_campaign_leads():
+            hit = _classify_positive_lead(raw)
+            if hit is not None:
+                count += 1
+                source_set.add(hit)
+    except Exception as exc:
+        log.warning(
+            "count_positive_leads_failed",
+            extra={"error": f"{type(exc).__name__}: {exc}"},
+        )
+        return 0, f"error:{type(exc).__name__}"
+    source = ", ".join(sorted(source_set)) if source_set else "no_match"
+    return count, source
+
+
 def _coerce_int(value: Any) -> int:
     if value is None:
         return 0
@@ -259,6 +369,20 @@ def _coerce_optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _first_present(d: dict, *keys: str) -> Any:
+    """Return the value for the first key that exists in d (even if value is 0 or False).
+
+    Differs from `d.get(a) or d.get(b)` which skips falsy values — we need
+    to distinguish "key present with value 0" from "key absent".
+    """
+    _sentinel = object()
+    for key in keys:
+        v = d.get(key, _sentinel)
+        if v is not _sentinel:
+            return v
+    return None
 
 
 def _parse_analytics(raw: dict) -> dict:
@@ -302,19 +426,13 @@ def _parse_analytics(raw: dict) -> dict:
         # lets the DB column stay NULL (informative: "not reported") vs 0
         # ("reported and zero").
         "positive_reply_count": _coerce_optional_int(
-            raw.get("positive_reply_count")
-            or raw.get("positive_replies_count")
-            or raw.get("interested_count")
+            _first_present(raw, "positive_reply_count", "positive_replies_count", "interested_count")
         ),
         "opportunity_count": _coerce_optional_int(
-            raw.get("opportunity_count")
-            or raw.get("opportunities_count")
-            or raw.get("opportunities")
+            _first_present(raw, "opportunity_count", "opportunities_count", "opportunities")
         ),
         "conversion_count": _coerce_optional_int(
-            raw.get("conversion_count")
-            or raw.get("conversions_count")
-            or raw.get("conversions")
+            _first_present(raw, "conversion_count", "conversions_count", "conversions")
         ),
     }
 
@@ -384,6 +502,65 @@ async def sync_campaign_analytics() -> dict:
         or None
     )
 
+    # --- Positive reply / opportunity resolution ---
+    # Step 1: try dynamic field detection from raw analytics response.
+    # _parse_analytics uses fixed field-name guesses; _search_positive_fields
+    # walks every key so we find the real field name regardless of Instantly's
+    # API versioning. We only override when _parse_analytics found nothing.
+    raw_positive_reply_source: str | None = None
+    raw_opportunity_source: str | None = None
+    positive_hits = search_positive_fields(matched)
+
+    if parsed.get("positive_reply_count") is None:
+        for full_key, val in positive_hits.items():
+            kl = full_key.lower()
+            if "positive" in kl and ("reply" in kl or "repli" in kl):
+                try:
+                    parsed["positive_reply_count"] = int(val)
+                    raw_positive_reply_source = f"analytics:{full_key}"
+                    break
+                except (TypeError, ValueError):
+                    pass
+    else:
+        raw_positive_reply_source = "analytics:positive_reply_count"
+
+    if parsed.get("opportunity_count") is None:
+        for full_key, val in positive_hits.items():
+            if "opportunit" in full_key.lower():
+                try:
+                    parsed["opportunity_count"] = int(val)
+                    raw_opportunity_source = f"analytics:{full_key}"
+                    break
+                except (TypeError, ValueError):
+                    pass
+    else:
+        raw_opportunity_source = "analytics:opportunity_count"
+
+    # Step 2: if analytics still has no positive signal, fall back to
+    # iterating every lead and counting those with positive statuses.
+    # This is the reliable path — Instantly shows "Opportunities: 1"
+    # in the UI but may not expose that count via the analytics API.
+    if (
+        parsed.get("positive_reply_count") is None
+        and parsed.get("opportunity_count") is None
+    ):
+        try:
+            leads_positive, leads_source = await count_positive_campaign_leads()
+            parsed["opportunity_count"] = leads_positive
+            raw_opportunity_source = f"leads:{leads_source}"
+            log.info(
+                "positive_leads_fallback_used",
+                extra={"count": leads_positive, "source": leads_source},
+            )
+        except Exception as exc:
+            log.warning(
+                "positive_leads_fallback_failed",
+                extra={"error": f"{type(exc).__name__}: {exc}"},
+            )
+
+    parsed["raw_positive_reply_source"] = raw_positive_reply_source
+    parsed["raw_opportunity_source"] = raw_opportunity_source
+
     snapshot_id: int
     synced_at = datetime.utcnow()
     with session_scope() as session:
@@ -394,7 +571,14 @@ async def sync_campaign_analytics() -> dict:
             campaign_id=campaign_id,
             raw=matched or {},
             synced_at=synced_at,
-            **parsed,
+            **{k: v for k, v in parsed.items() if k in {
+                "leads_count", "contacted_count", "emails_sent_count",
+                "open_count", "unique_open_count", "reply_count",
+                "bounced_count", "click_count", "unsubscribed_count",
+                "completed_count", "positive_reply_count", "opportunity_count",
+                "conversion_count", "raw_positive_reply_source",
+                "raw_opportunity_source",
+            }},
         )
         session.add(snapshot)
         session.flush()
@@ -407,7 +591,9 @@ async def sync_campaign_analytics() -> dict:
             "selected_campaign_id": selected_id,
             "returned_campaign_ids": returned_ids,
             "snapshot_id": snapshot_id,
-            **parsed,
+            "positive_reply_count": parsed.get("positive_reply_count"),
+            "opportunity_count": parsed.get("opportunity_count"),
+            "raw_opportunity_source": raw_opportunity_source,
         },
     )
     return {
@@ -415,6 +601,7 @@ async def sync_campaign_analytics() -> dict:
         "campaign_id": campaign_id,
         "synced_at": synced_at,
         "raw": matched,
+        "positive_hits": positive_hits,
         "requested_campaign_id": campaign_id,
         "returned_campaign_ids": returned_ids,
         "selected_campaign_id": selected_id,
