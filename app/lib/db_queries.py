@@ -557,6 +557,11 @@ def latest_instantly_snapshot() -> dict[str, Any] | None:
     Returns None when no snapshot exists yet (e.g. the GitHub Actions job
     hasn't run since the table was added). Caller uses this for the
     "Source: Instantly campaign analytics" KPI row and the debug expander.
+
+    For positive_reply_count / opportunity_count / conversion_count, prefers
+    the dedicated model column (populated on new rows) then falls back to
+    extracting from the raw JSON dict for rows created before the schema
+    addition so no data is lost across the migration.
     """
     with session_scope() as session:
         snap = session.execute(
@@ -566,6 +571,21 @@ def latest_instantly_snapshot() -> dict[str, Any] | None:
         ).scalar_one_or_none()
         if snap is None:
             return None
+        raw = snap.raw or {}
+
+        def _col_or_raw(col_val: Any, *raw_keys: str) -> int | None:
+            """Return model column value if not None, else try raw dict keys."""
+            if col_val is not None:
+                return int(col_val)
+            for key in raw_keys:
+                v = raw.get(key)
+                if v is not None:
+                    try:
+                        return int(v)
+                    except (TypeError, ValueError):
+                        pass
+            return None
+
         return {
             "id": snap.id,
             "campaign_id": snap.campaign_id,
@@ -583,7 +603,21 @@ def latest_instantly_snapshot() -> dict[str, Any] | None:
             "click_count": int(snap.click_count or 0),
             "unsubscribed_count": int(snap.unsubscribed_count or 0),
             "completed_count": int(snap.completed_count or 0),
-            "raw": snap.raw or {},
+            # v2 positive-engagement fields. None means "not reported by Instantly"
+            # (absent from the API response), distinct from 0 ("reported as zero").
+            "positive_reply_count": _col_or_raw(
+                snap.positive_reply_count,
+                "positive_reply_count", "positive_replies_count", "interested_count",
+            ),
+            "opportunity_count": _col_or_raw(
+                snap.opportunity_count,
+                "opportunity_count", "opportunities_count", "opportunities",
+            ),
+            "conversion_count": _col_or_raw(
+                snap.conversion_count,
+                "conversion_count", "conversions_count", "conversions",
+            ),
+            "raw": raw,
             "synced_at": snap.synced_at,
         }
 

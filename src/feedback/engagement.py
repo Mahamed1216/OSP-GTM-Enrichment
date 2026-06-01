@@ -269,7 +269,9 @@ def _parse_analytics(raw: dict) -> dict:
       emails_sent_count, open_count, link_click_count,
       reply_count, bounced_count, unsubscribed_count, completed_count,
       unique_opened_count (sometimes absent).
-    Any missing key defaults to 0 — never raises.
+    v2 also exposes positive_reply_count / opportunity_count / conversion_count
+    when positive engagement has been recorded. Any missing key defaults to
+    0 (or None for optional fields) — never raises.
     """
     return {
         "leads_count": _coerce_int(raw.get("leads_count")),
@@ -293,6 +295,27 @@ def _parse_analytics(raw: dict) -> dict:
         ),
         "unsubscribed_count": _coerce_int(raw.get("unsubscribed_count")),
         "completed_count": _coerce_int(raw.get("completed_count")),
+        # Positive engagement — separate from generic reply_count.
+        # Instantly may call these "positive_reply_count", "opportunity_count",
+        # "opportunities", or "interested_count" depending on API version.
+        # _coerce_optional_int returns None when the key is absent, which
+        # lets the DB column stay NULL (informative: "not reported") vs 0
+        # ("reported and zero").
+        "positive_reply_count": _coerce_optional_int(
+            raw.get("positive_reply_count")
+            or raw.get("positive_replies_count")
+            or raw.get("interested_count")
+        ),
+        "opportunity_count": _coerce_optional_int(
+            raw.get("opportunity_count")
+            or raw.get("opportunities_count")
+            or raw.get("opportunities")
+        ),
+        "conversion_count": _coerce_optional_int(
+            raw.get("conversion_count")
+            or raw.get("conversions_count")
+            or raw.get("conversions")
+        ),
     }
 
 

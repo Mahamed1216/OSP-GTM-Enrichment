@@ -47,6 +47,15 @@ _RUNTIME_COLUMN_ADDS: list[tuple[str, str, str]] = [
     # generator falls back to the buyer-segment branch when this is
     # null, so old rows don't break).
     ("enrichments", "buyer_accounts", "JSON"),
+    # Instantly positive-reply / opportunity / conversion counts — tracked
+    # separately from total reply_count. NULL for rows created before this
+    # column was added; the raw JSON field still holds the original values.
+    ("instantly_analytics_snapshots", "positive_reply_count", "INTEGER"),
+    ("instantly_analytics_snapshots", "opportunity_count", "INTEGER"),
+    ("instantly_analytics_snapshots", "conversion_count", "INTEGER"),
+    # FK to the snapshot a PromptRecommendation was based on, for staleness
+    # detection when a newer sync arrives before the operator acts.
+    ("prompt_recommendations", "analytics_snapshot_id", "INTEGER"),
 ]
 
 # Postgres-only column widenings. SQLite ignores VARCHAR length caps so

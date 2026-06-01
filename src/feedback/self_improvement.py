@@ -87,8 +87,11 @@ def kpi_view(snapshot: dict[str, Any] | None) -> dict[str, Any]:
     """Return the metrics dict the KPI cards AND the loop both read.
 
     Keys: contacted, sent, opens, replies, bounces (all ints) plus
-    open_rate, reply_rate, bounce_rate (floats in [0, 1]). When the
-    snapshot is None or empty, every value is zero.
+    open_rate, reply_rate, bounce_rate (floats in [0, 1]).
+    Also includes positive_replies, opportunities, positive_signals (the
+    higher of the two, to avoid double-counting), and positive_reply_rate.
+
+    When the snapshot is None or empty, every value is zero / None.
 
     The Engagement page imports this and renders its KPI cards from the
     returned dict directly, so by construction the loop and the cards
@@ -97,13 +100,23 @@ def kpi_view(snapshot: dict[str, Any] | None) -> dict[str, Any]:
     if not snapshot:
         return {
             "contacted": 0, "sent": 0, "opens": 0, "replies": 0, "bounces": 0,
+            "positive_replies": 0, "opportunities": 0, "positive_signals": 0,
             "open_rate": 0.0, "reply_rate": 0.0, "bounce_rate": 0.0,
+            "positive_reply_rate": 0.0,
         }
     sent = int(snapshot.get("emails_sent_count") or 0)
     contacted = int(snapshot.get("contacted_count") or 0)
     opens = int(snapshot.get("open_count") or 0)
     replies = int(snapshot.get("reply_count") or 0)
     bounces = int(snapshot.get("bounced_count") or 0)
+    # Positive engagement — None means "not reported by Instantly" vs 0.
+    positive_replies_raw = snapshot.get("positive_reply_count")
+    opportunities_raw = snapshot.get("opportunity_count")
+    positive_replies = int(positive_replies_raw or 0)
+    opportunities = int(opportunities_raw or 0)
+    # Use the higher of positive_replies vs opportunities to avoid double-
+    # counting when Instantly reports the same intent under both fields.
+    positive_signals = max(positive_replies, opportunities)
     denom = sent if sent > 0 else 1
     return {
         "contacted": contacted,
@@ -111,9 +124,13 @@ def kpi_view(snapshot: dict[str, Any] | None) -> dict[str, Any]:
         "opens": opens,
         "replies": replies,
         "bounces": bounces,
+        "positive_replies": positive_replies,
+        "opportunities": opportunities,
+        "positive_signals": positive_signals,
         "open_rate": opens / denom,
         "reply_rate": replies / denom,
         "bounce_rate": bounces / denom,
+        "positive_reply_rate": positive_signals / denom,
     }
 
 
@@ -374,6 +391,7 @@ def diagnose(
     bounce_rate = float(metrics["bounce_rate"])
     open_rate = float(metrics["open_rate"])
     reply_rate = float(metrics["reply_rate"])
+    positive_signals = int(metrics.get("positive_signals") or 0)
     sample_size = sent
     confidence = _confidence_band(sample_size)
 
@@ -490,6 +508,14 @@ def diagnose(
     if sent > 0 and reply_rate < reply_rate_target and open_is_healthy:
         # Timing gates take priority over sample gates because waiting longer
         # is cheap and the spec asks for these specific cutoffs.
+        # Build a suffix that notes positive signals (opportunities/interests)
+        # so the operator knows positive signal exists even if reply_rate is low.
+        _pos_note = (
+            f" {positive_signals} positive signal(s) / opportunity(ies) recorded."
+            if positive_signals > 0
+            else ""
+        )
+
         if hours_since_send is not None and hours_since_send < REPLY_WAIT_HOURS:
             return Diagnosis(
                 loop_status=LOOP_WAIT,
@@ -500,7 +526,7 @@ def diagnose(
                     f"Open rate is healthy ({open_rate * 100:.1f}%) but the "
                     f"latest send from {_source_label(send_source)} was "
                     f"{hours_since_send:.1f}h ago. Replies typically arrive "
-                    "24-72h after the first touch. Wait before changing the body."
+                    f"24-72h after the first touch. Wait before changing the body.{_pos_note}"
                 ),
                 current_metric_label="Reply rate",
                 current_metric_value=reply_rate,
@@ -528,7 +554,7 @@ def diagnose(
                     f"is {reply_rate * 100:.2f}% but the latest send from "
                     f"{_source_label(send_source)} was only {hours_since_send:.1f}h "
                     "ago. Diagnose only — do not change the body until at least "
-                    f"{REPLY_DIAGNOSE_HOURS}h have passed."
+                    f"{REPLY_DIAGNOSE_HOURS}h have passed.{_pos_note}"
                 ),
                 current_metric_label="Reply rate",
                 current_metric_value=reply_rate,
@@ -631,6 +657,7 @@ def save_recommendation(
     diag: Diagnosis,
     *,
     metric_snapshot: dict[str, Any] | None = None,
+    snapshot_id: int | None = None,
 ) -> int | None:
     """Persist a Diagnosis IFF it's an actionable prompt-change candidate.
 
@@ -674,6 +701,7 @@ def save_recommendation(
                 loop_status=diag.loop_status,
                 confidence=diag.confidence,
                 metric_snapshot=metric_snapshot,
+                analytics_snapshot_id=snapshot_id,
                 drafted_at=drafted_at,
             )
             session.add(rec)
@@ -872,6 +900,7 @@ def list_recommendations(limit: int = 20) -> list[dict[str, Any]]:
                 "drafted_at": r.drafted_at,
                 "created_at": r.created_at,
                 "metric_snapshot": r.metric_snapshot,
+                "analytics_snapshot_id": r.analytics_snapshot_id,
             }
             for r in rows
         ]

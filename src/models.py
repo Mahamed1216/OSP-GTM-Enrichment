@@ -201,6 +201,12 @@ class InstantlyAnalyticsSnapshot(Base):
     click_count: Mapped[int] = mapped_column(Integer, default=0)
     unsubscribed_count: Mapped[int] = mapped_column(Integer, default=0)
     completed_count: Mapped[int] = mapped_column(Integer, default=0)
+    # v2 fields — Instantly tracks positive replies (interested/booked)
+    # and opportunities separately from total reply_count. NULL when the
+    # snapshot was created before this schema addition (raw still holds them).
+    positive_reply_count: Mapped[Optional[int]] = mapped_column(Integer)
+    opportunity_count: Mapped[Optional[int]] = mapped_column(Integer)
+    conversion_count: Mapped[Optional[int]] = mapped_column(Integer)
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
     synced_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
 
@@ -256,6 +262,10 @@ class PromptRecommendation(Base):
     # recommendation was drafted" without joining back to the snapshot
     # table (which may have rolled forward since).
     metric_snapshot: Mapped[Optional[dict]] = mapped_column(JSON)
+    # FK to the InstantlyAnalyticsSnapshot row this recommendation was based on.
+    # NULL for rows created before this column was added. Used to detect staleness
+    # when a newer snapshot arrives before the operator approves or rejects.
+    analytics_snapshot_id: Mapped[Optional[int]] = mapped_column(Integer)
     approved_by: Mapped[Optional[str]] = mapped_column(String(64))
     approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     rejected_at: Mapped[Optional[datetime]] = mapped_column(DateTime)

@@ -345,19 +345,29 @@ contacted = _metrics["contacted"]
 opens = _metrics["opens"]
 replies = _metrics["replies"]
 bounces = _metrics["bounces"]
+positive_signals = _metrics.get("positive_signals", 0)
+opportunities = _metrics.get("opportunities", 0)
 
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 with c1:
     kpi_card("Sent", f"{sent_remote:,}")
 with c2:
+    kpi_card("Open rate", _format_pct(opens, sent_remote))
+with c3:
     kpi_card(
         "Reply rate",
         _format_pct(replies, sent_remote),
         numeric_font="serif",
     )
-with c3:
-    kpi_card("Open rate", _format_pct(opens, sent_remote))
 with c4:
+    # Show positive replies / opportunities from Instantly — this is the
+    # "interested / booked / opportunity" count, separate from total replies.
+    _pos_label = (
+        "Opportunities" if opportunities > 0 and opportunities >= _metrics.get("positive_replies", 0)
+        else "Positive replies"
+    )
+    kpi_card(_pos_label, str(positive_signals) if positive_signals else "—")
+with c5:
     kpi_card("Bounce rate", _format_pct(bounces, sent_remote))
 
 if _snapshot is not None and contacted and contacted != sent_remote:
@@ -406,19 +416,73 @@ with st.expander("Sync debug — raw Instantly analytics + DB comparison"):
                 "Selected campaign id does not match the configured "
                 "INSTANTLY_CAMPAIGN_ID. The snapshot may be stale — re-sync."
             )
-        st.markdown("**Local vs Instantly comparison**")
+        st.markdown("**Raw Instantly analytics fields**")
+        _raw_fields = [
+            {"field": k, "raw value": v}
+            for k, v in sorted((_snapshot.get("raw") or {}).items())
+        ]
+        if _raw_fields:
+            st.dataframe(pd.DataFrame(_raw_fields), hide_index=True, use_container_width=True)
+        else:
+            st.caption("No raw fields available.")
+
+        st.markdown("**Metric · Instantly raw · Stored snapshot · Displayed KPI**")
+        _snap = _snapshot or {}
         st.dataframe(
             pd.DataFrame(
                 [
-                    {"metric": "sent / sequence started", "local DB": _local_sent, "Instantly": contacted},
-                    {"metric": "emails sent", "local DB": _local_sent, "Instantly": sent_remote},
-                    {"metric": "opens", "local DB": "(per-lead)", "Instantly": opens},
-                    {"metric": "replies", "local DB": "(per-lead)", "Instantly": replies},
-                    {"metric": "bounces", "local DB": "(per-lead)", "Instantly": bounces},
+                    {
+                        "Metric": "Sequence started",
+                        "Instantly raw": (_snapshot.get("raw") or {}).get("contacted_count") or contacted,
+                        "Stored snapshot": _snap.get("contacted_count", "—"),
+                        "Displayed KPI": contacted,
+                    },
+                    {
+                        "Metric": "Emails sent",
+                        "Instantly raw": (_snapshot.get("raw") or {}).get("emails_sent_count") or sent_remote,
+                        "Stored snapshot": _snap.get("emails_sent_count", "—"),
+                        "Displayed KPI": sent_remote,
+                    },
+                    {
+                        "Metric": "Opens",
+                        "Instantly raw": (_snapshot.get("raw") or {}).get("open_count", "—"),
+                        "Stored snapshot": _snap.get("open_count", "—"),
+                        "Displayed KPI": opens,
+                    },
+                    {
+                        "Metric": "Replies (total)",
+                        "Instantly raw": (_snapshot.get("raw") or {}).get("reply_count", "—"),
+                        "Stored snapshot": _snap.get("reply_count", "—"),
+                        "Displayed KPI": replies,
+                    },
+                    {
+                        "Metric": "Positive replies",
+                        "Instantly raw": (_snapshot.get("raw") or {}).get("positive_reply_count", "—"),
+                        "Stored snapshot": _snap.get("positive_reply_count", "—"),
+                        "Displayed KPI": _metrics.get("positive_replies", "—"),
+                    },
+                    {
+                        "Metric": "Opportunities",
+                        "Instantly raw": (_snapshot.get("raw") or {}).get("opportunity_count", "—"),
+                        "Stored snapshot": _snap.get("opportunity_count", "—"),
+                        "Displayed KPI": opportunities,
+                    },
+                    {
+                        "Metric": "Bounces",
+                        "Instantly raw": (_snapshot.get("raw") or {}).get("bounced_count", "—"),
+                        "Stored snapshot": _snap.get("bounced_count", "—"),
+                        "Displayed KPI": bounces,
+                    },
+                    {
+                        "Metric": "Local sent (DB)",
+                        "Instantly raw": "—",
+                        "Stored snapshot": "—",
+                        "Displayed KPI": _local_sent,
+                    },
                 ]
             ),
             hide_index=True,
-            width="stretch",
+            use_container_width=True,
         )
         # Latest-send source breakdown — proves the loop's "Since latest send"
         # is reading Instantly per-lead activity, not stale local DB delivery
@@ -547,6 +611,14 @@ else:
                 "—" if hours is None else f"{hours:.1f}h",
             )
 
+        # Show positive_reply_rate alongside the main metric when available.
+        if positive_signals > 0 and sent_remote > 0:
+            _pos_rate_pct = positive_signals / sent_remote * 100
+            st.caption(
+                f"Positive reply rate (opportunities): "
+                f"{_pos_rate_pct:.2f}% ({positive_signals} of {sent_remote:,} sent)"
+            )
+
         st.markdown(f"**Bottleneck:** `{diag.bottleneck}` · **Confidence:** {diag.confidence}")
         st.markdown(f"**Diagnosis:** {diag.diagnosis}")
         st.markdown(f"**Recommended action:** {diag.recommended_change}")
@@ -575,7 +647,9 @@ else:
             pending_rec_key = f"sil_pending_rec_{sig}"
             if pending_rec_key not in st.session_state:
                 st.session_state[pending_rec_key] = save_recommendation(
-                    diag, metric_snapshot=_metrics,
+                    diag,
+                    metric_snapshot=_metrics,
+                    snapshot_id=_snapshot.get("id") if _snapshot else None,
                 )
             rec_id = st.session_state[pending_rec_key]
 
@@ -657,27 +731,94 @@ else:
 # ---------- Recommendation history ----------
 with st.expander("Recommendation history & rollback"):
     recs = _recommendations_cached()
+
+    # Staleness reference values from the current snapshot.
+    _current_snap_id = _snapshot.get("id") if _snapshot else None
+    _current_sent = _metrics.get("sent", 0)
+    _current_snap_ts = _snapshot.get("synced_at") if _snapshot else None
+    _current_opps = _metrics.get("positive_signals", 0)
+
+    # "Recalculate from latest data" — clears all pending recommendation keys
+    # so the next page render creates a new recommendation from current metrics.
+    if _snapshot is not None:
+        if st.button(
+            "Recalculate recommendation from latest Instantly data",
+            key="sil_recalculate",
+            help=(
+                "Clears cached recommendation and re-diagnoses using the "
+                "latest analytics snapshot. Does not sync — hit "
+                "'Sync engagement from Instantly' first for fresh data."
+            ),
+        ):
+            for k in list(st.session_state.keys()):
+                if k.startswith("sil_pending_rec_"):
+                    del st.session_state[k]
+            st.cache_data.clear()
+            st.rerun()
+
     if not recs:
         st.caption("No recommendations yet.")
     else:
         for rec in recs:
+            # --- Staleness check ---
+            rec_snap_id = rec.get("analytics_snapshot_id")
+            rec_sent = int(rec.get("sample_size") or 0)
+
+            is_stale = False
+            stale_reason = ""
+            if rec_snap_id and _current_snap_id and rec_snap_id < _current_snap_id:
+                is_stale = True
+                stale_reason = "a newer analytics snapshot exists"
+            elif rec_sent > 0 and _current_sent > 0:
+                drift = abs(_current_sent - rec_sent) / max(rec_sent, 1)
+                if drift > 0.10:
+                    is_stale = True
+                    stale_reason = (
+                        f"sent count changed from {rec_sent:,} → {_current_sent:,} "
+                        f"({drift * 100:.0f}% drift)"
+                    )
+
             status_icon = {
                 "approved": "✓",
                 "rejected": "✗",
                 "draft": "·",
                 "ready_for_approval": "⏳",
             }.get(rec["status"], "?")
+
+            if is_stale and rec["status"] in ("ready_for_approval", "draft"):
+                status_label = "Stale recommendation"
+            else:
+                status_label = rec["status"].replace("_", " ").capitalize()
+
             header = (
-                f"{status_icon} {rec['status'].replace('_', ' ').capitalize()} · "
+                f"{status_icon} {status_label} · "
                 f"{rec['bottleneck']} · "
                 f"{rec['current_metric_label']} "
                 f"{rec['current_metric_value'] * 100:.1f}% → "
-                f"target {rec['target_metric_value'] * 100:.1f}% · "
-                f"sample {rec['sample_size']} · "
-                f"{_format_timestamp(rec['created_at'])}"
+                f"target {rec['target_metric_value'] * 100:.1f}%"
             )
+
             with st.container(border=True):
                 st.markdown(header)
+
+                # Snapshot provenance row
+                _rec_snap_ts = (rec.get("metric_snapshot") or {}).get("_snap_ts") if rec.get("metric_snapshot") else None
+                _based_on = f"sample {rec_sent:,}"
+                if _current_snap_ts:
+                    _based_on += f"  ·  created {_format_timestamp(rec['created_at'])}"
+                st.caption(f"Based on: {_based_on}")
+                if _current_snap_id:
+                    _curr_info = f"sample {_current_sent:,}"
+                    if _current_opps:
+                        _curr_info += f", {_current_opps} opportunity/ies"
+                    st.caption(f"Current snapshot: {_curr_info}  ·  synced {_format_timestamp(_current_snap_ts)}")
+
+                if is_stale:
+                    st.warning(
+                        f"This recommendation was based on older campaign data "
+                        f"({stale_reason}). Recalculate before approving."
+                    )
+
                 st.caption(rec["diagnosis"])
                 if rec.get("proposed_addendum"):
                     with st.expander("Addendum that was proposed"):
@@ -705,6 +846,12 @@ with st.expander("Recommendation history & rollback"):
                             st.cache_data.clear()
                             st.success("Rolled back to previous prompt overlay.")
                             st.rerun()
+
+                # Approval disabled for stale pending recommendations.
+                if is_stale and rec["status"] in ("ready_for_approval", "draft"):
+                    st.caption(
+                        ":orange[Approval disabled — recalculate from latest data first.]"
+                    )
 
 # ---------- Prompt experiment tracker ----------
 with st.expander("Prompt experiment tracker — performance by prompt version"):
