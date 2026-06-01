@@ -21,9 +21,13 @@ from src.prompts.email import (
 )
 from src.prompts.sanitize import (
     coerce_sdr_direct_pitch,
+    coerce_structure_1_direct_plus_lookalike,
+    coerce_structure_1_lookalike_accounts,
     coerce_structure_1_named_buyers,
     coerce_structure_1_single_named_buyer,
+    coerce_structure_1_trigger_segment,
     detect_banned_direct_pitch_phrases,
+    detect_broad_buyer_fallback,
     detect_competitor_as_buyer,
     detect_partner_channel_mismatch,
     detect_segment_vs_company_mismatch,
@@ -78,54 +82,50 @@ async def generate_email(
             ba.get("likely_buyer_accounts") or []
         )
         flagged_competitors: list[str] = list(ba.get("flagged_competitors") or [])
-        # Explicit `likely_buyer_accounts` field from buyer discovery v2
-        # — the canonical "2 named buyers" pair for Structure 1 CASE A.
-        # Fall back to v2 `likely_direct_buyers` (filtered to titlecase
-        # brand-shaped entries) when the dedicated field is empty, so old
-        # enrichment rows still drive the coercer.
-        explicit_buyer_accounts: list[str] = list(
-            ba.get("likely_buyer_accounts") or []
-        )
+
+        # v3 buyer fallback ladder fields.
+        # `buyer_fallback_mode` is None for enrichment rows created before v3.
+        # When None, fall back to the old explicit_buyer_accounts logic below.
+        buyer_fallback_mode: str | None = ba.get("buyer_fallback_mode") or None
+        v3_direct: list[str] = [
+            a.strip() for a in (ba.get("direct_buyer_accounts") or []) if a and a.strip()
+        ]
+        v3_lookalike: list[str] = [
+            a.strip() for a in (ba.get("lookalike_buyer_accounts") or []) if a and a.strip()
+        ]
+        v3_trigger: list[str] = [
+            s.strip() for s in (ba.get("trigger_based_buyer_segments") or []) if s and s.strip()
+        ]
+
+        # Legacy coercer inputs (used when buyer_fallback_mode is None).
+        import re as _re
+        _brand_re = _re.compile(r"^[A-Z][\w\.\-'&]*(?:\s+[A-Z][\w\.\-'&]*){0,3}$")
+        explicit_buyer_accounts: list[str] = list(ba.get("likely_buyer_accounts") or [])
         if not explicit_buyer_accounts:
-            # Heuristic backfill: from direct_buyers, prefer items that
-            # look like brand names (Titlecase, no plural noun-phrase shape).
-            import re as _re
-            brand_re = _re.compile(r"^[A-Z][\w\.\-'&]*(?:\s+[A-Z][\w\.\-'&]*){0,3}$")
             explicit_buyer_accounts = [
-                n for n in direct_buyers if brand_re.match((n or "").strip())
+                n for n in direct_buyers if _brand_re.match((n or "").strip())
             ]
-        # Confidence rating governs whether we anchor on the single
-        # named buyer. v2 uses `buyer_confidence`; v1 used
-        # `buyer_account_confidence`. Either being "high" is enough.
         buyer_confidence: str = (
             (ba.get("buyer_confidence") or ba.get("buyer_account_confidence") or "low")
         ).strip().lower()
-        # Buyer SEGMENT pool for the hybrid "1 named buyer + 2 segments"
-        # rewrite. Prefer v1 `likely_buyer_segments` (segment-only
-        # strings); fall back to segment-shaped entries in
-        # `likely_direct_buyers` (lowercased / multi-word non-brand
-        # items) so v2-only rows still get hybrid coverage.
-        import re as _re_seg
-        _brand_only_re = _re_seg.compile(
-            r"^[A-Z][\w\.\-'&]*(?:\s+[A-Z][\w\.\-'&]*){0,3}$"
-        )
         buyer_segments: list[str] = [
-            s.strip()
-            for s in list(ba.get("likely_buyer_segments") or [])
-            if s and s.strip()
+            s.strip() for s in list(ba.get("likely_buyer_segments") or []) if s and s.strip()
         ]
         if len(buyer_segments) < 2:
             backfill = [
-                s.strip()
-                for s in direct_buyers
-                if s and s.strip() and not _brand_only_re.match(s.strip())
+                s.strip() for s in direct_buyers
+                if s and s.strip() and not _brand_re.match(s.strip())
             ]
             for seg in backfill:
                 if seg not in buyer_segments:
                     buyer_segments.append(seg)
+
         company_industry = lead.industry or None
         lead_first_name = (lead.first_name or "").strip()
         lead_company = (lead.company or "").strip()
+
+        # Flag for needs_review short-circuit (resolved after session closes).
+        is_needs_buyer_research = (buyer_fallback_mode == "needs_review")
 
     # ICP-skip short-circuit: tier "D" means scoring already decided
     # this is a poor OSP fit (typically B2C without B2B motion). Skip
@@ -154,6 +154,39 @@ async def generate_email(
             subject=skip_subject or "(skip)",
             body=skip_body,
             signals_cited=skip_signals,
+        )
+
+    # Needs-buyer-research short-circuit: enrichment ran but could not find
+    # any direct buyer accounts, lookalike accounts, or trigger-based segments.
+    # Saving a normal email here would use broad team fallbacks that read as
+    # AI-written and obvious. Save a NEEDS REVIEW marker instead and return.
+    if is_needs_buyer_research:
+        nr_subject = ""
+        nr_body = (
+            "NEEDS REVIEW: No direct buyer account, lookalike buyer account, "
+            "or trigger based buyer segment found."
+        )
+        nr_signals = ["Needs buyer research"]
+        with session_scope() as session:
+            session.add(GeneratedContent(
+                lead_id=lead_id,
+                kind="email",
+                subject=nr_subject,
+                body=nr_body,
+                signals_cited=nr_signals,
+                prompt_version=PROMPT_VERSION,
+                prompt_fingerprint=current_email_prompt_fingerprint(),
+                model="rule:needs_buyer_research",
+                skip_reason="needs_buyer_research",
+            ))
+        log.info(
+            "email_needs_buyer_research",
+            extra={"lead_id": lead_id},
+        )
+        return EmailResult(
+            subject=nr_subject or "(needs review)",
+            body=nr_body,
+            signals_cited=nr_signals,
         )
 
     winners = load_top_winners_for("email", k=3)
@@ -204,45 +237,72 @@ async def generate_email(
     stripped_body, strip_warning = strip_structure_1_opening_hook(clean_body)
     clean_body = stripped_body
 
-    # Named-buyer coercer: when buyer discovery surfaced ≥2 high-conf
-    # buyer companies but the model wrote a segment-only Structure 1
-    # intro (e.g. "community banks, commercial lenders, broker
-    # networks"), rewrite the intro + CTA to use the 2 named buyers
-    # verbatim. No-op when there aren't 2 named buyers OR when both
-    # names already appear in the body OR when the body is Structure 2.
-    named_buyer_body, named_buyer_warning = coerce_structure_1_named_buyers(
-        clean_body,
-        lead_company=lead_company,
-        buyer_accounts=explicit_buyer_accounts,
-    )
-    clean_body = named_buyer_body
-
-    # Hybrid Structure 1 coercer — fires when buyer discovery surfaced
-    # EXACTLY ONE named buyer at medium-or-better confidence (the 2-buyer
-    # coercer above is a no-op in that case because it needs a pair).
-    # Don't force a fake second name; don't ignore the real one. Skip
-    # when the single candidate is flagged as a competitor.
-    #
-    # Confidence policy: medium and high are eligible. Low is rejected
-    # because the named pick is then a guess — segment-only framing is
-    # safer.
+    # Buyer coercer — route to the appropriate Structure 1 rewrite based on
+    # buyer_fallback_mode. For v3 enrichment rows the mode is explicit; for
+    # old rows (buyer_fallback_mode is None) fall through to the legacy
+    # coercers so backward compat is preserved.
+    named_buyer_warning: str | None = None
     single_named_buyer_warning: str | None = None
-    if (
-        len(explicit_buyer_accounts) == 1
-        and buyer_confidence in ("medium", "high")
-        and explicit_buyer_accounts[0].strip()
-    ):
-        candidate = explicit_buyer_accounts[0].strip()
-        competitor_hit_set = {c.strip().lower() for c in flagged_competitors if c}
-        if candidate.lower() not in competitor_hit_set:
-            single_body, single_warning = coerce_structure_1_single_named_buyer(
-                clean_body,
-                lead_company=lead_company,
-                named_buyer=candidate,
-                segments=buyer_segments,
-            )
-            clean_body = single_body
-            single_named_buyer_warning = single_warning
+
+    if buyer_fallback_mode == "direct_accounts" and len(v3_direct) >= 2:
+        # CASE 1: 2 confirmed direct buyer accounts.
+        coerced, named_buyer_warning = coerce_structure_1_named_buyers(
+            clean_body, lead_company=lead_company, buyer_accounts=v3_direct[:2],
+        )
+        clean_body = coerced
+
+    elif buyer_fallback_mode == "direct_plus_lookalike" and v3_direct and v3_lookalike:
+        # CASE 2: 1 confirmed direct buyer + 1 lookalike.
+        coerced, named_buyer_warning = coerce_structure_1_direct_plus_lookalike(
+            clean_body,
+            lead_company=lead_company,
+            direct_buyer=v3_direct[0],
+            lookalike_buyer=v3_lookalike[0],
+        )
+        clean_body = coerced
+
+    elif buyer_fallback_mode == "lookalike_accounts" and len(v3_lookalike) >= 2:
+        # CASE 3: 2 lookalike accounts (no confirmed direct buyer).
+        coerced, named_buyer_warning = coerce_structure_1_lookalike_accounts(
+            clean_body, lead_company=lead_company, lookalike_accounts=v3_lookalike[:2],
+        )
+        clean_body = coerced
+
+    elif buyer_fallback_mode == "trigger_segment" and v3_trigger:
+        # CASE 4: trigger-based segment only.
+        coerced, named_buyer_warning = coerce_structure_1_trigger_segment(
+            clean_body, lead_company=lead_company, trigger_segment=v3_trigger[0],
+        )
+        clean_body = coerced
+
+    else:
+        # buyer_fallback_mode is None (old enrichment row) — use legacy coercers.
+        # Named-buyer coercer: rewrite intro + CTA to use the 2 named buyers
+        # verbatim. No-op when there aren't 2 named buyers OR when both names
+        # already appear in the body OR when the body is Structure 2.
+        coerced, named_buyer_warning = coerce_structure_1_named_buyers(
+            clean_body, lead_company=lead_company, buyer_accounts=explicit_buyer_accounts,
+        )
+        clean_body = coerced
+
+        # Hybrid coercer — fires when buyer discovery surfaced EXACTLY ONE
+        # named buyer at medium-or-better confidence. Skip when the single
+        # candidate is flagged as a competitor.
+        if (
+            len(explicit_buyer_accounts) == 1
+            and buyer_confidence in ("medium", "high")
+            and explicit_buyer_accounts[0].strip()
+        ):
+            candidate = explicit_buyer_accounts[0].strip()
+            competitor_hit_set = {c.strip().lower() for c in flagged_competitors if c}
+            if candidate.lower() not in competitor_hit_set:
+                single_body, single_named_buyer_warning = coerce_structure_1_single_named_buyer(
+                    clean_body,
+                    lead_company=lead_company,
+                    named_buyer=candidate,
+                    segments=buyer_segments,
+                )
+                clean_body = single_body
 
     # Post-generation validators. These are HEURISTIC flags, not hard
     # blocks — the email still saves, but warnings ride along on
@@ -257,6 +317,17 @@ async def generate_email(
         validation_warnings.append(named_buyer_warning)
     if single_named_buyer_warning:
         validation_warnings.append(single_named_buyer_warning)
+
+    # Broad buyer fallback validator — flag when the intro uses banned phrases
+    # like "sales teams" or "founders" instead of specific named accounts or
+    # trigger-based segments.
+    broad_fallback_hits = detect_broad_buyer_fallback(clean_body)
+    if broad_fallback_hits:
+        validation_warnings.append(
+            "Broad buyer fallback phrases detected in intro — rewrite with "
+            "named accounts or trigger segments: "
+            + ", ".join(f'"{p}"' for p in broad_fallback_hits)
+        )
     seg_warnings = detect_segment_vs_company_mismatch(
         clean_body, named_buyer_accounts=named_buyers,
     )

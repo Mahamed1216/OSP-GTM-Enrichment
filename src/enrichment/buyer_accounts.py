@@ -84,6 +84,27 @@ class BuyerAccountResult(BaseModel):
     buyer_account_rationale: str = ""
     flagged_competitors: list[str] = Field(default_factory=list)
 
+    # v3 fields — five-rung buyer fallback ladder.
+    # `direct_buyer_accounts`: named companies CONFIRMED in research as buyers
+    #   (case studies, customer pages, integration docs). Max 2. Medium+ conf only.
+    # `lookalike_buyer_accounts`: companies NOT confirmed but matching the buyer
+    #   profile (same vertical, motion, scale). Max 2. Used when direct < 2.
+    # `trigger_based_buyer_segments`: "<vertical> companies <doing X>" segments.
+    #   Combine vertical + specific trigger event. Never broad team labels.
+    # `buyer_fallback_mode`: computed deterministically after classification.
+    direct_buyer_accounts: list[str] = Field(default_factory=list)
+    lookalike_buyer_accounts: list[str] = Field(default_factory=list)
+    trigger_based_buyer_segments: list[str] = Field(default_factory=list)
+    buyer_fallback_mode: Literal[
+        "direct_accounts", "direct_plus_lookalike", "lookalike_accounts",
+        "trigger_segment", "needs_review",
+    ] = "needs_review"
+    buyer_research_status: Literal[
+        "found_direct", "found_lookalike", "trigger_only", "needs_review",
+    ] = "needs_review"
+    buyer_research_confidence: Literal["low", "medium", "high"] = "low"
+    buyer_research_rationale: str = ""
+
 
 _SYSTEM_PROMPT = """\
 You classify a target company's commercial relationships so downstream
@@ -197,6 +218,62 @@ STEP 6 — Explicit B2B motion evidence (CRITICAL for B2C companies).
     like a consumer credit-repair app with only individual billing,
     this list MUST be empty even if banks appear in the research.
 
+STEP 7 — Buyer fallback ladder (CRITICAL for email quality).
+Populate these fields so the email layer can pick the highest-quality case.
+
+  DIRECT BUYER ACCOUNTS (for CASE 1 and CASE 2):
+  `direct_buyer_accounts` — named companies CONFIRMED in research as actual
+  buyers/users (appeared in case studies, customer pages, integration docs).
+  MAX 2. Only populate when buyer_confidence is "medium" or "high".
+  If fewer than 2 strong confirmed names exist, leave EMPTY — a lookalike or
+  trigger segment is better than a weak guess.
+
+  LOOKALIKE BUYER ACCOUNTS (for CASE 2 and CASE 3):
+  `lookalike_buyer_accounts` — 2 named companies NOT confirmed in research
+  but that MATCH the buyer profile: same vertical, same scale, same buy motion.
+  These are "obvious next buyers" you'd bet on even without direct evidence.
+  Rules for valid lookalikes:
+    - Same buyer motion (e.g., both embed infra into enterprise support)
+    - Same vertical or adjacent (e.g., both contact-center platforms)
+    - Similar scale/stage
+    - NOT a competitor of the target company
+  Examples:
+    - If Zendesk is the confirmed buyer: lookalikes = ServiceNow, Freshdesk
+    - If Five9 is the confirmed buyer: lookalikes = NICE, Genesys
+    - If Stripe is the confirmed buyer: lookalikes = Adyen, Braintree
+  MAX 2. Omit if no plausible lookalikes exist — needs_review is better.
+
+  TRIGGER-BASED SEGMENTS (for CASE 4):
+  `trigger_based_buyer_segments` — 1-3 segments combining VERTICAL + TRIGGER.
+  Format: "<vertical> companies <doing specific thing>"
+  GOOD examples (use this style — named vertical + named trigger):
+    * "Series A SaaS companies hiring SDRs"
+    * "fintechs launching partner programs"
+    * "cybersecurity companies expanding enterprise GTM"
+    * "DevTools companies hiring enterprise sales leaders"
+    * "AI companies launching customer support products"
+    * "healthcare SaaS companies expanding implementation teams"
+  BANNED — never use these in trigger segments or anywhere else:
+    * "sales teams" / "founders" / "revenue teams" / "product teams"
+    * "engineering teams" / "HR teams" / "marketing teams" / "business leaders"
+    * "companies that need growth" / "teams that need pipeline"
+    * "teams that need automation" / "teams in the industry"
+    * "buyers in this space"
+  Each segment MUST name a specific vertical AND a specific trigger event.
+  "SaaS companies" alone is not valid. "companies hiring" alone is not valid.
+  Always give both: "<vertical> companies <trigger>".
+
+  FALLBACK MODE (set by the system — you must suggest, system will verify):
+  Set `buyer_fallback_mode` to match the best case the data supports:
+    "direct_accounts"      — 2 confirmed direct buyers, medium+ confidence
+    "direct_plus_lookalike"— 1 confirmed + 1 lookalike, medium+ confidence
+    "lookalike_accounts"   — 2 lookalikes (no direct), medium+ confidence
+    "trigger_segment"      — trigger segments only (no named accounts)
+    "needs_review"         — no usable buyer data found
+
+  Set `buyer_research_rationale` to 1 sentence explaining what evidence was
+  found and why you chose the fallback mode you did.
+
 Critical rules:
   1. NEVER conflate partners with direct buyers. If the product is
      sold to consumers but BANKS or LENDERS appear in research, that's
@@ -212,6 +289,9 @@ Critical rules:
      `buyer_account_confidence`, `buyer_account_rationale` so older code
      paths keep working. For B2C, set those to the partner-channel
      equivalents (segments → segments, confidence = partner_confidence).
+  5. NEVER use broad team labels as buyer segments. "Sales teams" or
+     "founders" sound obvious and AI-written. Always pair a vertical with
+     a trigger event.
 
 Output schema (JSON, no prose):
 {
@@ -228,7 +308,14 @@ Output schema (JSON, no prose):
   "buyer_account_confidence": "low | medium | high",
   "buyer_account_rationale": "<1-2 sentences>",
   "flagged_competitors": ["..."],
-  "explicit_b2b_motion_evidence": ["..."]
+  "explicit_b2b_motion_evidence": ["..."],
+  "direct_buyer_accounts": ["named confirmed buyer 1", "named confirmed buyer 2"],
+  "lookalike_buyer_accounts": ["lookalike 1", "lookalike 2"],
+  "trigger_based_buyer_segments": ["<vertical> companies <doing X>"],
+  "buyer_fallback_mode": "direct_accounts | direct_plus_lookalike | lookalike_accounts | trigger_segment | needs_review",
+  "buyer_research_status": "found_direct | found_lookalike | trigger_only | needs_review",
+  "buyer_research_confidence": "low | medium | high",
+  "buyer_research_rationale": "<1 sentence>"
 }
 
 Worked examples:
@@ -295,6 +382,44 @@ C) Same company but research surfaced a real B2B motion
   "explicit_b2b_motion_evidence": ["employer benefits page lists Aon, Mercer, 10 others", "B2B pricing tier visible on benefits.dovly.com"]
 }
 """
+
+
+def _compute_buyer_fallback_mode(result: BuyerAccountResult) -> None:
+    """Deterministically set buyer_fallback_mode and status from classified fields.
+
+    Overrides whatever the LLM suggested so the mode is always consistent with
+    the actual content of the other fields. Operates in-place on `result`.
+
+    Ladder (highest quality first):
+      1. direct_accounts    — ≥2 direct buyer accounts, medium+ confidence
+      2. direct_plus_lookalike — 1 direct + ≥1 lookalike, medium+ confidence
+      3. lookalike_accounts — ≥2 lookalikes, medium+ confidence
+      4. trigger_segment    — ≥1 trigger segment (no named accounts met threshold)
+      5. needs_review       — nothing usable
+    """
+    direct = [a.strip() for a in (result.direct_buyer_accounts or []) if a and a.strip()]
+    lookalike = [a.strip() for a in (result.lookalike_buyer_accounts or []) if a and a.strip()]
+    trigger = [s.strip() for s in (result.trigger_based_buyer_segments or []) if s and s.strip()]
+    conf = (result.buyer_confidence or "low").strip().lower()
+    eligible = conf in ("medium", "high")
+
+    if len(direct) >= 2 and eligible:
+        result.buyer_fallback_mode = "direct_accounts"
+        result.buyer_research_status = "found_direct"
+    elif len(direct) >= 1 and len(lookalike) >= 1 and eligible:
+        result.buyer_fallback_mode = "direct_plus_lookalike"
+        result.buyer_research_status = "found_direct"
+    elif len(lookalike) >= 2 and eligible:
+        result.buyer_fallback_mode = "lookalike_accounts"
+        result.buyer_research_status = "found_lookalike"
+    elif trigger:
+        result.buyer_fallback_mode = "trigger_segment"
+        result.buyer_research_status = "trigger_only"
+    else:
+        result.buyer_fallback_mode = "needs_review"
+        result.buyer_research_status = "needs_review"
+
+    result.buyer_research_confidence = conf  # type: ignore[assignment]
 
 
 def _client() -> TavilyClient:
@@ -424,6 +549,10 @@ async def discover_buyer_accounts(
             )
         )
 
+    # Override buyer_fallback_mode with a deterministic computation based
+    # on the actual classified fields — don't trust the LLM's self-assessment.
+    _compute_buyer_fallback_mode(result)
+
     log.info(
         "buyer_discovery_complete",
         extra={
@@ -432,6 +561,9 @@ async def discover_buyer_accounts(
             "segments": result.likely_buyer_segments,
             "confidence": result.buyer_account_confidence,
             "flagged_competitors_count": len(result.flagged_competitors),
+            "fallback_mode": result.buyer_fallback_mode,
+            "direct_buyer_accounts": result.direct_buyer_accounts,
+            "lookalike_buyer_accounts": result.lookalike_buyer_accounts,
         },
     )
     return result

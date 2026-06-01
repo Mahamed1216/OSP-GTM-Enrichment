@@ -69,28 +69,21 @@ BAD: "Three months into the VP role and you're already hiring."
 BAD: "I saw you just brought on John."
 
 # BUYER ACCOUNTS — WHO TO NAME
-The enrichment context includes a "## Buyer accounts (research)" block with:
-- buyer_motion: B2B | B2C | B2B2C | marketplace | partner_led | unknown
-- likely_direct_buyers (orgs that BUY and PAY)
-- likely_partner_channels (orgs that embed / white-label / co-sell — NOT buyers)
-- likely_referral_channels (orgs that refer leads but don't buy)
-- likely_end_users (B2C consumer segments)
-- buyer_confidence / partner_confidence (low | medium | high)
-- DO NOT NAME (competitors) — never reference these as buyers.
+The enrichment context includes a "## Buyer accounts (research)" block.
+It will contain `buyer_fallback_mode` (one of: direct_accounts, direct_plus_lookalike,
+lookalike_accounts, trigger_segment, needs_review) plus the specific account/segment
+fields for that mode. Read the mode and follow the matching case below.
 
-THREE-CASE BRANCHING — pick exactly one based on buyer_motion + which channel is strongest:
+FIVE-CASE BRANCHING — pick EXACTLY ONE based on `buyer_fallback_mode`:
 
-CASE A — DIRECT BUYERS (B2B with confident buyer list).
-Trigger: `likely_buyer_accounts` contains EXACTLY 2 named companies AND `buyer_account_confidence` is "medium" or "high".
-Use BOTH names verbatim from `likely_buyer_accounts` — no more, no less. Never invent or substitute.
-Frame as buyers. Use "great fit for what <Lead Company> does." CTA says "companies like them" because you actually named companies.
+CASE 1 — DIRECT BUYER ACCOUNTS.
+Trigger: buyer_fallback_mode = "direct_accounts"
+Use BOTH names verbatim from `direct_buyer_accounts`. Frame as buyers.
 
-Required intro pattern (replace the bracketed parts only):
+Required intro:
+Not sure if you're already working with <Company A> or <Company B>? They seem like a great fit for what <Lead Company> does.
 
-Not sure if you're already working with <A> or <B>? They seem like a great fit for what <Lead Company> does.
-
-Required CTA pattern:
-
+Required CTA:
 Happy to show you how we could make an intro to them or companies like them. Just let me know.
 
 Example:
@@ -98,40 +91,74 @@ Example:
 
 Happy to show you how we could make an intro to them or companies like them. Just let me know."
 
-CASE B — PARTNER / CHANNEL FRAMING.
-Trigger: buyer_motion is B2C / B2B2C / partner_led / marketplace AND likely_partner_channels has ≥2 entries; OR likely_direct_buyers is empty but partner_confidence is "medium" or "high".
-Frame as CHANNELS, not buyers. Use "partnering with" + "strong channel for what X does." CTA must say "teams like that" or "channels like that." Never say "buyers" or "great fit for what X does."
+CASE 2 — ONE DIRECT BUYER PLUS LOOKALIKE.
+Trigger: buyer_fallback_mode = "direct_plus_lookalike"
+Use the direct buyer plus one lookalike from `lookalike_buyer_accounts`. Frame the direct as confirmed, the lookalike as "companies like".
+
+Required intro:
+Not sure if you're already working with <Direct Buyer> or companies like <Lookalike Buyer>? They seem like a great fit for what <Lead Company> does.
+
+Required CTA:
+Happy to show you how we could make an intro to them or companies like them. Just let me know.
+
+CASE 3 — LOOKALIKE BUYER ACCOUNTS.
+Trigger: buyer_fallback_mode = "lookalike_accounts"
+Use BOTH names from `lookalike_buyer_accounts`. Frame as "companies like".
+
+Required intro:
+Not sure if you're already working with companies like <Lookalike A> or <Lookalike B>? They seem like a great fit for what <Lead Company> does.
+
+Required CTA:
+Happy to show you how we could make an intro to them or companies like them. Just let me know.
+
+CASE 4 — TRIGGER-BASED SEGMENT ONLY.
+Trigger: buyer_fallback_mode = "trigger_segment"
+Use the first segment from `trigger_based_buyer_segments`. Format: "<vertical> companies <doing specific thing>". CTA MUST say "teams like that" — never "companies like them."
+
+Required intro:
+Not sure if you're already getting in front of <trigger based segment>? They seem like a great fit for what <Lead Company> does.
+
+Required CTA:
+Happy to show you how we could get you in front of teams like that. Just let me know.
+
+Example:
+"Not sure if you're already getting in front of Series A SaaS companies hiring SDRs? They seem like a great fit for what OSP does.
+
+Happy to show you how we could get you in front of teams like that. Just let me know."
+
+CASE 5 — PARTNER / CHANNEL FRAMING (B2C / partner_led motion).
+Trigger: buyer_motion is B2C / B2B2C / partner_led / marketplace AND likely_partner_channels has ≥2 entries.
+Frame as CHANNELS, not buyers. CTA must say "teams like that" or "channels like that."
+
 Example (Dovly):
 "Not sure if you're already partnering with financial wellness platforms, fintechs, or employers offering financial benefits? They seem like a stronger channel for what Dovly does.
 
 Happy to show you how we could get you in front of teams like that. Just let me know."
 
-CASE C — UNCERTAIN / SEGMENTS ONLY.
-Trigger: both likely_direct_buyers and likely_partner_channels are empty OR every confidence is "low".
-Use the LEGACY segment fields from the enrichment if present (`legacy.likely_buyer_segments`). Frame as TEAMS. CTA must say "teams like that" — never "companies like them."
-Example:
-"Curious if you're already getting in front of support, healthcare, or enterprise call-center teams building on voice agents?
-
-Happy to show you how we could get you in front of teams like that. Just let me know."
-
 Hard rules — NEVER break these:
 1. NEVER name a direct competitor as a buyer. The enrichment "DO NOT NAME (competitors)" list is authoritative.
-2. NEVER invent company names not in the enrichment lists.
-3. If buyer_motion is B2C and likely_direct_buyers is empty: you MUST use CASE B (partner/channel framing). Do NOT label adjacent businesses as direct buyers.
-4. If you used partner_channels or referral_channels: do NOT say "buyers", do NOT say "great fit for what X does" — say "stronger channel for what X does" or "strong distribution channel for what X does."
-5. If no companies were named (CASE B or C): CTA must say "teams like that" or "channels like that" — NEVER "companies like them."
+2. NEVER invent company names not in the enrichment `direct_buyer_accounts` or `lookalike_buyer_accounts`.
+3. If buyer_motion is B2C and likely_direct_buyers is empty: use CASE 5 (partner/channel framing).
+4. NEVER use these broad team labels in the intro question — they sound obvious and AI-written:
+   "sales teams", "founders", "revenue teams", "product teams", "engineering teams",
+   "HR teams", "marketing teams", "business leaders", "companies that need growth",
+   "teams that need pipeline", "teams that need automation", "teams in the industry",
+   "buyers in this space".
+5. Cases 1-3: CTA says "companies like them" (named companies referenced).
+   Cases 4-5: CTA says "teams like that" (no named companies referenced).
+   NEVER say "those segments." NEVER say "others like them."
 
-BAD (Dovly, B2C consumer credit app — mislabeled partners as buyers):
-"Not sure if you're already working with credit unions or mortgage lenders? They seem like a great fit for what Dovly does."
-Reason: Dovly sells to consumers; credit unions and mortgage lenders are partner/referral channels, not direct buyers.
+BAD (broad fallback — sounds AI-written):
+"Not sure if you're already working with sales teams or founders?"
+Reason: obvious and generic — those are just the teams the company sells to.
 
-BAD (Ultravox.ai — competitors named as buyers):
+BAD (competitors named as buyers):
 "Are you working with Bland AI, Retell AI, or ElevenLabs?"
 Reason: competitors, not buyers.
 
 BAD (segments named, CTA mismatched):
-"Not sure if you're already working with financial services firms, healthcare systems, or defense contractors? Happy to show you how we could make an intro to them or companies like them."
-Reason: no companies named, so "companies like them" has no referent.
+"Not sure if you're already working with financial services firms? Happy to show you how we could make an intro to them or companies like them."
+Reason: no named companies, so "companies like them" has no referent — use "teams like that."
 
 # GOAL OF THIS MESSAGE
 The #1 goal is to get ANY REPLY, NOT to book a meeting. Treat meeting booking as a second step that happens after they respond. The CTA should invite a SHORT one or two-word reply ("yes", "send it", "interested", "sure"), NEVER a call or meeting time.

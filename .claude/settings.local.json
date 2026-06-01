@@ -13,7 +13,9 @@
       "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\moham\\\\VS Code\\\\OSP Enrichement Tool\" -Recurse -Filter \"*.py\")",
       "Bash(Select-Object -ExpandProperty FullName)",
       "Bash(Sort-Object)",
-      "Bash(findstr /i data)"
+      "Bash(findstr /i data)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\moham\\\\Documents\\\\OSP-GTM-Enrichment\" -Recurse -Directory -Name)",
+      "Bash(Select-Object -First 20)"
     ]
   }
 }

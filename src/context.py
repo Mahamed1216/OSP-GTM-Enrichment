@@ -92,8 +92,35 @@ def format_lead_context(
         legacy_conf = ba.get("buyer_account_confidence") or "low"
         legacy_rationale = (ba.get("buyer_account_rationale") or "").strip()
 
+        # v3 fallback ladder fields.
+        fallback_mode = ba.get("buyer_fallback_mode") or ""
+        v3_direct = ba.get("direct_buyer_accounts") or []
+        v3_lookalike = ba.get("lookalike_buyer_accounts") or []
+        v3_trigger = ba.get("trigger_based_buyer_segments") or []
+        research_rationale = (ba.get("buyer_research_rationale") or "").strip()
+
         parts.append("\n## Buyer accounts (research)")
         parts.append(f"- buyer_motion: {motion}")
+
+        # Surface v3 fallback ladder when fields are populated (new rows).
+        if fallback_mode:
+            parts.append(f"- buyer_fallback_mode: {fallback_mode}")
+            parts.append(
+                "- direct_buyer_accounts: "
+                + (", ".join(v3_direct) if v3_direct else "(none)")
+            )
+            parts.append(
+                "- lookalike_buyer_accounts: "
+                + (", ".join(v3_lookalike) if v3_lookalike else "(none)")
+            )
+            parts.append(
+                "- trigger_based_buyer_segments: "
+                + (", ".join(v3_trigger) if v3_trigger else "(none)")
+            )
+            if research_rationale:
+                parts.append(f"- buyer_research_rationale: {research_rationale}")
+
+        # Always surface v2 fields for the partner-channel framing case.
         parts.append(
             "- likely_direct_buyers: "
             + (", ".join(direct) if direct else "(none)")
@@ -116,13 +143,12 @@ def format_lead_context(
             parts.append(
                 f"- DO NOT NAME (competitors): {', '.join(flagged)}"
             )
-        # Legacy block only when the v2 fields are empty (so old rows
-        # still drive the v1 email branching).
+        # Legacy block only when both v2 and v3 fields are empty (old rows).
         v2_empty = (
             motion == "unknown" and not direct and not partners
             and not referrals and not end_users
         )
-        if v2_empty and (legacy_accounts or legacy_segments):
+        if v2_empty and not fallback_mode and (legacy_accounts or legacy_segments):
             parts.append(
                 "- legacy.likely_buyer_accounts: "
                 + (", ".join(legacy_accounts) if legacy_accounts else "(none)")

@@ -394,7 +394,15 @@ with tab_enrich:
             )
         else:
             motion = ba.get("buyer_motion") or "unknown"
-            accounts = ba.get("likely_buyer_accounts") or []
+            # v3 fallback ladder fields
+            fallback_mode = ba.get("buyer_fallback_mode") or ""
+            v3_direct = ba.get("direct_buyer_accounts") or []
+            v3_lookalike = ba.get("lookalike_buyer_accounts") or []
+            v3_trigger = ba.get("trigger_based_buyer_segments") or []
+            research_status = ba.get("buyer_research_status") or ""
+            research_conf = ba.get("buyer_research_confidence") or ""
+            research_rationale = ba.get("buyer_research_rationale") or ""
+            # v2 / legacy fields
             direct_buyers = ba.get("likely_direct_buyers") or []
             partner_channels = ba.get("likely_partner_channels") or []
             segments = ba.get("likely_buyer_segments") or []
@@ -407,13 +415,44 @@ with tab_enrich:
             rationale = ba.get("buyer_account_rationale") or ba.get("reasoning") or ""
             flagged = ba.get("flagged_competitors") or []
             b2b_evidence = ba.get("explicit_b2b_motion_evidence") or []
+
+            # needs_review warning (v3 rows only)
+            if fallback_mode == "needs_review" or research_status == "needs_review":
+                st.warning(
+                    "No direct buyer account, lookalike buyer account, or trigger "
+                    "based buyer segment found. Review before generating outreach."
+                )
+
             with st.container(border=True):
+                # Fallback mode row (v3 rows)
+                if fallback_mode:
+                    _MODE_LABELS = {
+                        "direct_accounts": "Direct buyer accounts",
+                        "direct_plus_lookalike": "Direct buyer + lookalike",
+                        "lookalike_accounts": "Lookalike buyer accounts",
+                        "trigger_segment": "Trigger-based segment",
+                        "needs_review": "Needs buyer research",
+                    }
+                    mode_label = _MODE_LABELS.get(fallback_mode, fallback_mode)
+                    mode_color = (
+                        ":red" if fallback_mode == "needs_review"
+                        else ":orange" if fallback_mode == "trigger_segment"
+                        else ":green"
+                    )
+                    st.markdown(
+                        f"**buyer_fallback_mode:** {mode_color}[**{mode_label}**]"
+                    )
+
                 cols = st.columns(2)
                 with cols[0]:
                     st.markdown(f"**Motion:** `{motion}`")
                     st.markdown(f"**Buyer confidence:** {buyer_conf}")
+                    if research_conf:
+                        st.markdown(f"**Research confidence:** {research_conf}")
                 with cols[1]:
                     st.markdown(f"**Partner confidence:** {partner_conf}")
+                    if research_status:
+                        st.markdown(f"**Research status:** `{research_status}`")
                     if b2b_evidence:
                         st.markdown(
                             f"**B2B motion evidence ({len(b2b_evidence)}):** "
@@ -421,11 +460,25 @@ with tab_enrich:
                             + (" …" if len(b2b_evidence) > 3 else "")
                         )
 
-                st.markdown(
-                    "**likely_buyer_accounts:** "
-                    + (", ".join(accounts) if accounts else ":gray[(none — using segment fallback)]")
-                )
-                if direct_buyers and direct_buyers != accounts:
+                # v3 fields (shown when present)
+                if fallback_mode:
+                    st.markdown(
+                        "**direct_buyer_accounts:** "
+                        + (", ".join(v3_direct) if v3_direct else ":gray[(none)]")
+                    )
+                    st.markdown(
+                        "**lookalike_buyer_accounts:** "
+                        + (", ".join(v3_lookalike) if v3_lookalike else ":gray[(none)]")
+                    )
+                    st.markdown(
+                        "**trigger_based_buyer_segments:** "
+                        + (", ".join(v3_trigger) if v3_trigger else ":gray[(none)]")
+                    )
+                    if research_rationale:
+                        st.caption(f"Research rationale: {research_rationale}")
+
+                # v2 fields (always shown)
+                if direct_buyers:
                     st.markdown(
                         "**likely_direct_buyers:** " + ", ".join(direct_buyers)
                     )
@@ -433,10 +486,10 @@ with tab_enrich:
                     st.markdown(
                         "**likely_partner_channels:** " + ", ".join(partner_channels)
                     )
-                st.markdown(
-                    "**likely_buyer_segments:** "
-                    + (", ".join(segments) if segments else ":gray[(none)]")
-                )
+                if segments:
+                    st.markdown(
+                        "**likely_buyer_segments:** " + ", ".join(segments)
+                    )
                 if flagged:
                     st.markdown(
                         ":red[**flagged_competitors (never name as buyers):**] "
@@ -444,22 +497,23 @@ with tab_enrich:
                     )
                 if rationale:
                     st.caption(f"Rationale: {rationale}")
-                if not accounts:
-                    # Explain WHY there are no named accounts so the
-                    # operator can decide whether to retry research or
-                    # accept the segment fallback.
-                    if motion.upper() in ("B2C",) and not b2b_evidence:
-                        st.warning(
-                            "No named buyers because the company appears "
-                            "B2C with no explicit B2B motion evidence — "
-                            "this lead is the ICP-skip case (tier D)."
-                        )
-                    else:
-                        st.warning(
-                            "No 2 high-confidence named buyer accounts "
-                            "surfaced. Email generation will fall back to "
-                            "buyer segments + \"teams like that\" CTA."
-                        )
+
+                # Explain why no named accounts for old rows (no fallback_mode)
+                if not fallback_mode and not v3_direct:
+                    legacy_accounts = ba.get("likely_buyer_accounts") or []
+                    if not legacy_accounts:
+                        if motion.upper() == "B2C" and not b2b_evidence:
+                            st.warning(
+                                "No named buyers because the company appears "
+                                "B2C with no explicit B2B motion evidence — "
+                                "this lead is the ICP-skip case (tier D)."
+                            )
+                        else:
+                            st.warning(
+                                "No 2 high-confidence named buyer accounts "
+                                "surfaced. Email generation will fall back to "
+                                "buyer segments + \"teams like that\" CTA."
+                            )
 
         st.subheader("Source payloads")
         any_payload = False

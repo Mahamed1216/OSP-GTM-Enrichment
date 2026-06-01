@@ -215,6 +215,39 @@ def detect_segment_vs_company_mismatch(
     return warnings
 
 
+# Broad team labels that are banned in the intro question. These sound obvious
+# and AI-written ("Not sure if you're working with sales teams or founders?").
+_BROAD_BUYER_FALLBACK_PHRASES = [
+    "sales teams",
+    "founders",
+    "revenue teams",
+    "product teams",
+    "engineering teams",
+    "hr teams",
+    "marketing teams",
+    "business leaders",
+    "companies that need growth",
+    "teams that need pipeline",
+    "teams that need automation",
+    "teams in the industry",
+    "buyers in this space",
+]
+
+
+def detect_broad_buyer_fallback(body: str) -> list[str]:
+    """Flag broad team-label fallbacks in the intro question.
+
+    Only checks the first ~4 non-empty lines so a legitimate mention of
+    "marketing teams" later in the body doesn't trigger a false positive.
+    Returns a list of matched phrases (empty == clean).
+    """
+    if not body:
+        return []
+    lines = [ln for ln in body.split("\n") if ln.strip()]
+    check_region = " ".join(lines[:4]).lower()
+    return [p for p in _BROAD_BUYER_FALLBACK_PHRASES if p in check_region]
+
+
 _BANNED_DIRECT_PITCH_PHRASES = [
     # Pain / timeline framing — banned from every direct pitch.
     "real tension",
@@ -352,6 +385,7 @@ def canonical_sdr_direct_pitch(first_name: str, role_phrase: str) -> str:
 _STRUCTURE_1_STARTERS = [
     "not sure if you're already working with",
     "not sure if you're already partnering with",
+    "not sure if you're already getting in front of",
     "curious if you're already getting in front of",
     "curious if you're already working with",
     "are you already working with",
@@ -969,6 +1003,205 @@ def detect_partner_channel_mismatch(
             "'channels like that'."
         )
     return warnings
+
+
+def coerce_structure_1_direct_plus_lookalike(
+    body: str,
+    *,
+    lead_company: str,
+    direct_buyer: str,
+    lookalike_buyer: str,
+) -> tuple[str, str | None]:
+    """Case 2: 1 confirmed direct buyer + 1 lookalike account.
+
+    Triggers when the body has a Structure 1 starter and either name is
+    missing from the body. Replaces from the starter to end-of-body with:
+
+        Not sure if you're already working with <Direct> or companies like
+        <Lookalike>? They seem like a great fit for what <Lead Company> does.
+
+        Happy to show you how we could make an intro to them or companies
+        like them. Just let me know.
+    """
+    if not body:
+        return body, None
+    db = (direct_buyer or "").strip()
+    lb = (lookalike_buyer or "").strip()
+    if not db or not lb:
+        return body, None
+
+    lower = body.lower()
+    if not any(s in lower for s in _STRUCTURE_1_STARTERS):
+        return body, None
+    if any(m in lower for m in _STRUCTURE_2_MARKERS):
+        return body, None
+    if db.lower() in lower and lb.lower() in lower:
+        return body, None
+
+    company = (lead_company or "").strip() or "the team"
+    new_intro = (
+        f"Not sure if you're already working with {db} or companies like "
+        f"{lb}? They seem like a great fit for what {company} does."
+    )
+    new_cta = (
+        "Happy to show you how we could make an intro to them or "
+        "companies like them. Just let me know."
+    )
+
+    lines = body.split("\n")
+    greeting_idx = 0
+    for i, line in enumerate(lines):
+        if line.strip():
+            greeting_idx = i
+            break
+    starter_idx: int | None = None
+    for i in range(greeting_idx + 1, len(lines)):
+        if any(s in lines[i].lower() for s in _STRUCTURE_1_STARTERS):
+            starter_idx = i
+            break
+    if starter_idx is None:
+        return body, None
+
+    preamble = lines[:starter_idx]
+    while preamble and not preamble[-1].strip():
+        preamble.pop()
+    new_lines = preamble + ["", new_intro, "", new_cta]
+    return "\n".join(new_lines), (
+        f"Rewrote Structure 1 intro for direct+lookalike ({db} / {lb})."
+    )
+
+
+def coerce_structure_1_lookalike_accounts(
+    body: str,
+    *,
+    lead_company: str,
+    lookalike_accounts: list[str],
+) -> tuple[str, str | None]:
+    """Case 3: 2 lookalike accounts (no confirmed direct buyer).
+
+    Triggers when the body has a Structure 1 starter and either lookalike
+    name is missing. Replaces from the starter to end-of-body with:
+
+        Not sure if you're already working with companies like <A> or <B>?
+        They seem like a great fit for what <Lead Company> does.
+
+        Happy to show you how we could make an intro to them or companies
+        like them. Just let me know.
+    """
+    if not body or len(lookalike_accounts) < 2:
+        return body, None
+    a = (lookalike_accounts[0] or "").strip()
+    b = (lookalike_accounts[1] or "").strip()
+    if not a or not b:
+        return body, None
+
+    lower = body.lower()
+    if not any(s in lower for s in _STRUCTURE_1_STARTERS):
+        return body, None
+    if any(m in lower for m in _STRUCTURE_2_MARKERS):
+        return body, None
+    if a.lower() in lower and b.lower() in lower:
+        return body, None
+
+    company = (lead_company or "").strip() or "the team"
+    new_intro = (
+        f"Not sure if you're already working with companies like {a} or {b}? "
+        f"They seem like a great fit for what {company} does."
+    )
+    new_cta = (
+        "Happy to show you how we could make an intro to them or "
+        "companies like them. Just let me know."
+    )
+
+    lines = body.split("\n")
+    greeting_idx = 0
+    for i, line in enumerate(lines):
+        if line.strip():
+            greeting_idx = i
+            break
+    starter_idx: int | None = None
+    for i in range(greeting_idx + 1, len(lines)):
+        if any(s in lines[i].lower() for s in _STRUCTURE_1_STARTERS):
+            starter_idx = i
+            break
+    if starter_idx is None:
+        return body, None
+
+    preamble = lines[:starter_idx]
+    while preamble and not preamble[-1].strip():
+        preamble.pop()
+    new_lines = preamble + ["", new_intro, "", new_cta]
+    return "\n".join(new_lines), (
+        f"Rewrote Structure 1 intro for lookalike accounts ({a}, {b})."
+    )
+
+
+def coerce_structure_1_trigger_segment(
+    body: str,
+    *,
+    lead_company: str,
+    trigger_segment: str,
+) -> tuple[str, str | None]:
+    """Case 4: trigger-based segment only (no named accounts available).
+
+    Triggers when the body has a Structure 1 starter and the trigger segment
+    is not yet in the body. Replaces from the starter to end-of-body with:
+
+        Not sure if you're already getting in front of <trigger segment>?
+        They seem like a great fit for what <Lead Company> does.
+
+        Happy to show you how we could get you in front of teams like that.
+        Just let me know.
+
+    Note: CTA uses "teams like that" (not "companies like them") because no
+    named companies are referenced.
+    """
+    if not body:
+        return body, None
+    seg = (trigger_segment or "").strip()
+    if not seg:
+        return body, None
+
+    lower = body.lower()
+    if not any(s in lower for s in _STRUCTURE_1_STARTERS):
+        return body, None
+    if any(m in lower for m in _STRUCTURE_2_MARKERS):
+        return body, None
+    # Already correct: body uses "getting in front of" + segment text.
+    if "getting in front of" in lower and seg.lower() in lower:
+        return body, None
+
+    company = (lead_company or "").strip() or "the team"
+    new_intro = (
+        f"Not sure if you're already getting in front of {seg}? "
+        f"They seem like a great fit for what {company} does."
+    )
+    new_cta = (
+        "Happy to show you how we could get you in front of teams like "
+        "that. Just let me know."
+    )
+
+    lines = body.split("\n")
+    greeting_idx = 0
+    for i, line in enumerate(lines):
+        if line.strip():
+            greeting_idx = i
+            break
+    starter_idx: int | None = None
+    for i in range(greeting_idx + 1, len(lines)):
+        if any(s in lines[i].lower() for s in _STRUCTURE_1_STARTERS):
+            starter_idx = i
+            break
+    if starter_idx is None:
+        return body, None
+
+    preamble = lines[:starter_idx]
+    while preamble and not preamble[-1].strip():
+        preamble.pop()
+    new_lines = preamble + ["", new_intro, "", new_cta]
+    return "\n".join(new_lines), (
+        f"Rewrote Structure 1 intro to trigger segment ({seg!r})."
+    )
 
 
 def sanitize_generated_text(text: str, sender_first_name: str) -> str:
