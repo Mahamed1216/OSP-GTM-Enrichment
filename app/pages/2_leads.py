@@ -71,6 +71,13 @@ if df.empty:
     st.info("No leads yet. Use the Run Pipeline page to ingest a CSV.")
     st.stop()
 
+# ---------- Search ----------
+search_query = st.text_input(
+    "Search leads",
+    placeholder="Search by name or email",
+    key="leads_search",
+)
+
 # ---------- Filters ----------
 # Wrapper is a presentational marker — Streamlit places its native widgets
 # in their own DOM tree, so this div mostly serves as visual scaffolding and
@@ -118,6 +125,13 @@ if not_sent_only:
     filtered = filtered[~filtered["Sent"].astype(bool)]
 if enriched_only:
     filtered = filtered[filtered["Enriched"]]
+if search_query and search_query.strip():
+    _q = search_query.strip().lower()
+    _mask = (
+        filtered["Name"].str.lower().str.contains(_q, na=False)
+        | filtered["Email"].str.lower().str.contains(_q, na=False)
+    )
+    filtered = filtered[_mask]
 
 # Markdown-rendered Tier + Status columns for display; keep the original Tier
 # (single-letter) for filtering above. Streamlit's :color-background[] shorthand
@@ -129,10 +143,16 @@ display_df["Tier"] = display_df["Tier"].apply(tier_badge)
 display_df["Status"] = filtered.apply(_row_status, axis=1)
 
 if filtered.empty:
-    st.info("No leads match the current filters.")
+    if search_query and search_query.strip():
+        st.info("No leads found for this search.")
+    else:
+        st.info("No leads match the current filters.")
     st.stop()
 
-st.caption(f"{len(filtered)} of {len(df)} leads")
+if search_query and search_query.strip():
+    st.caption(f"Showing {len(filtered)} matching leads")
+else:
+    st.caption(f"{len(filtered)} of {len(df)} leads")
 
 # ---------- Bulk select range (operates on current filtered/sorted view) ----------
 nc1, nc2, nc3, _ = st.columns([1, 1, 1, 3], vertical_alignment="bottom")
@@ -177,6 +197,7 @@ selection = st.dataframe(
         "Enriched": st.column_config.CheckboxColumn("Enriched"),
         "Sent": None,       # hidden — Status column subsumes
         "Replied": None,    # hidden — Status column subsumes
+        "Email": None,      # hidden — used for search only
         # Tier + Status: no explicit type → Streamlit renders the
         # :color-background[] markdown shorthand as colored pills.
     },

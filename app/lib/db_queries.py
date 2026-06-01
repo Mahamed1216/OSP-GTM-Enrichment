@@ -232,6 +232,7 @@ def list_leads() -> pd.DataFrame:
             Lead.id.label("id"),
             Lead.first_name,
             Lead.last_name,
+            Lead.email.label("email"),
             Lead.company,
             Lead.title,
             Score.tier,
@@ -258,6 +259,7 @@ def list_leads() -> pd.DataFrame:
             Lead.id,
             Lead.first_name,
             Lead.last_name,
+            Lead.email,
             Lead.company,
             Lead.title,
             Score.tier,
@@ -276,6 +278,7 @@ def list_leads() -> pd.DataFrame:
             {
                 "id": row.id,
                 "Name": f"{row.first_name} {row.last_name}".strip(),
+                "Email": row.email or "",
                 "Company": row.company or "",
                 "Title": row.title or "",
                 "Tier": row.tier or "",
@@ -287,7 +290,7 @@ def list_leads() -> pd.DataFrame:
         )
     return pd.DataFrame.from_records(
         records,
-        columns=["id", "Name", "Company", "Title", "Tier", "Score", "Enriched", "Sent", "Replied"],
+        columns=["id", "Name", "Email", "Company", "Title", "Tier", "Score", "Enriched", "Sent", "Replied"],
     )
 
 
