@@ -21,6 +21,22 @@ NEGATIVE_FRAMING_HEADER = (
 )
 WINNER_FRAMING_HEADER = "## High-performing examples (study these)"
 
+# The only evidence that makes an email a valid winner example. Any entry
+# in the Winners Library that cannot be traced to one of these reasons
+# should be deactivated, not deleted.
+VALID_WINNER_REASONS: frozenset[str] = frozenset({
+    "seed",                  # manually seeded by operator
+    "manual_positive_rating",# SDR thumbs-up in the UI
+    "positive_reply",        # email received a confirmed positive reply
+    "opportunity",           # lead moved to opportunity status in Instantly
+    "booked_meeting",        # meeting booked as a result of this email
+    "conversion",            # full conversion recorded
+})
+
+# Reason assigned to engagement_reply entries that cannot be confirmed
+# as positive — kept on the entry for audit but treated as invalid.
+WINNER_REASON_UNCONFIRMED = "engagement_reply_unconfirmed"
+
 
 def load_top_winners(k: int = 3) -> list[dict]:
     if not WINNERS_PATH.exists():
@@ -69,6 +85,31 @@ def _load_json_array(path: Path) -> list[dict]:
     return items if isinstance(items, list) else []
 
 
+def _derive_winner_reason(entry: dict) -> str | None:
+    """Derive the winner_reason for an entry without touching the file.
+
+    Priority:
+      1. Explicit `winner_reason` field (set by new code or cleanup).
+      2. `source == "seed"` or `manually_flagged == True` → "seed".
+      3. `source == "manual_rating"` → "manual_positive_rating".
+      4. `source == "engagement_reply"` without an explicit valid reason → None
+         (unconfirmed; caller decides whether to keep or deactivate).
+
+    Returns None when no valid reason can be determined — callers must NOT
+    use this entry as a few-shot example.
+    """
+    reason = entry.get("winner_reason")
+    if reason and reason in VALID_WINNER_REASONS:
+        return reason
+    source = entry.get("source") or ""
+    if source == "seed" or bool(entry.get("manually_flagged", False)):
+        return "seed"
+    if source == "manual_rating":
+        return "manual_positive_rating"
+    # engagement_reply: no valid reason derivable without DB confirmation.
+    return None
+
+
 def _entry_score(e: dict) -> float:
     """Sort key for winners: prefer `score`, fall back to legacy `reply_rate`."""
     if "score" in e and e["score"] is not None:
@@ -91,9 +132,16 @@ def _entry_content_type(e: dict) -> str | None:
 
 
 def list_all_winners() -> list[dict]:
-    """Full winners array, no filtering — for the Engagement page's library
-    table where the SDR needs to see active + inactive entries side by side."""
-    return _load_json_array(WINNERS_PATH)
+    """Full winners array with derived winner_reason added — for the library
+    table where the operator needs to see active + inactive entries side by side.
+
+    Does NOT mutate the file — winner_reason is derived inline for display only.
+    """
+    items = _load_json_array(WINNERS_PATH)
+    for item in items:
+        if "winner_reason" not in item:
+            item["winner_reason"] = _derive_winner_reason(item)
+    return items
 
 
 def list_all_negatives() -> list[dict]:
@@ -104,14 +152,23 @@ def list_all_negatives() -> list[dict]:
 def load_top_winners_for(content_type: str, k: int = 3) -> list[dict]:
     """Filter `winning_examples.json` by content_type, sort, return top-k.
 
-    Skips entries with ``is_active: false``. Pre-migration entries (no
-    ``is_active`` key) are treated as active so behaviour pre-Phase-7c
-    is unchanged.
+    Only includes entries that are:
+      - active (is_active != False)
+      - have a valid winner_reason (seed, manual_positive_rating, positive_reply,
+        opportunity, booked_meeting, conversion)
+
+    engagement_reply entries without an explicit valid winner_reason are skipped —
+    a reply alone does not confirm positive intent. After running
+    `cleanup_invalid_winners()` the library only carries confirmed entries.
+
+    Pre-migration entries with no winner_reason field but with source="seed"
+    or manually_flagged=True still pass (backward compatible).
     """
     items = [
         e for e in _load_json_array(WINNERS_PATH)
         if _entry_content_type(e) == content_type
         and e.get("is_active", True)
+        and _derive_winner_reason(e) in VALID_WINNER_REASONS
     ]
     items.sort(
         key=lambda e: (e.get("manually_flagged", False), _entry_score(e)),

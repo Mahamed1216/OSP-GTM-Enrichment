@@ -51,7 +51,7 @@ from src.feedback.engagement import (
     sync_campaign_analytics,
     sync_engagement,
 )
-from src.feedback.learning import process_ratings, promote_winners
+from src.feedback.learning import cleanup_invalid_winners, process_ratings, promote_winners
 from src.feedback.self_improvement import (
     DEFAULT_BOUNCE_RATE_MAX,
     DEFAULT_OPEN_RATE_TARGET,
@@ -179,27 +179,63 @@ def _entry_subject(entry: dict) -> str | None:
     return entry.get("subject")
 
 
-def _library_dataframe(entries: list[dict], type_filter: str) -> pd.DataFrame:
+_REASON_FILTER_OPTIONS = [
+    "All",
+    "Seed",
+    "Manual approval",
+    "Positive reply",
+    "Opportunity",
+    "Archived",
+]
+
+# Maps UI filter label → winner_reason values that match.
+_REASON_FILTER_MAP: dict[str, set[str]] = {
+    "Seed": {"seed"},
+    "Manual approval": {"manual_positive_rating"},
+    "Positive reply": {"positive_reply"},
+    "Opportunity": {"opportunity", "booked_meeting", "conversion"},
+    "Archived": set(),   # handled separately — show is_active=False
+}
+
+
+def _library_dataframe(
+    entries: list[dict],
+    type_filter: str,
+    reason_filter: str = "All",
+) -> pd.DataFrame:
     rows = []
     for e in entries:
         ct = e.get("content_type") or "email"
         if type_filter != "All" and ct != type_filter:
             continue
+
+        # Apply reason filter.
+        is_active = bool(e.get("is_active", True))
+        reason = e.get("winner_reason") or "—"
+        if reason_filter == "Archived":
+            if is_active:
+                continue
+        elif reason_filter != "All":
+            allowed = _REASON_FILTER_MAP.get(reason_filter, set())
+            if reason not in allowed:
+                continue
+
         body = _entry_body(e)
         snippet = body[:80].replace("\n", " ").strip()
         if len(body) > 80:
             snippet += "…"
         rows.append({
             "id": e.get("id"),
-            "Active": "✓" if e.get("is_active", True) else "—",
+            "Active": "✓" if is_active else "—",
+            "Reason": reason,
             "Type": _KIND_LABELS.get(ct, ct),
             "Source": e.get("source") or "—",
-            "Score": e.get("score"),
             "Added": (e.get("added_at") or "")[:10],
             "Snippet": snippet,
         })
     return pd.DataFrame.from_records(
-        rows, columns=["id", "Active", "Type", "Source", "Score", "Added", "Snippet"]
+        rows,
+        columns=["id", "Active", "Reason", "Type", "Source", "Added", "Snippet"],
     )
 
 
@@ -959,15 +995,27 @@ def _render_library(
     key_prefix: str,
     set_active: Callable[[str, bool], bool],
     item_noun: str,
+    show_reason_filter: bool = False,
 ) -> None:
     st.subheader(title)
-    filter_value = st.selectbox(
-        "Content type",
-        options=_TYPE_FILTER_OPTIONS,
-        index=0,
-        key=f"{key_prefix}_type_filter",
-    )
-    df = _library_dataframe(entries, filter_value)
+    filter_cols = st.columns([2, 2, 4]) if show_reason_filter else st.columns([2, 6])
+    with filter_cols[0]:
+        filter_value = st.selectbox(
+            "Content type",
+            options=_TYPE_FILTER_OPTIONS,
+            index=0,
+            key=f"{key_prefix}_type_filter",
+        )
+    reason_filter = "All"
+    if show_reason_filter:
+        with filter_cols[1]:
+            reason_filter = st.selectbox(
+                "Winner reason",
+                options=_REASON_FILTER_OPTIONS,
+                index=0,
+                key=f"{key_prefix}_reason_filter",
+            )
+    df = _library_dataframe(entries, filter_value, reason_filter)
     if df.empty:
         st.info(empty_msg)
         return
@@ -1074,6 +1122,40 @@ def _render_library(
                     st.rerun()
 
 
+# ---------- Winners library ----------
+st.warning(
+    "**Winners Library policy:** Only positive replies, opportunities, conversions, "
+    "manual approvals, and seed examples should be active winners. "
+    "Emails promoted only because of opens, send count, or generic engagement "
+    "do not belong here and will degrade future prompt quality if kept active."
+)
+
+_wc1, _wc2 = st.columns([3, 2])
+with _wc2:
+    if st.button(
+        "Cleanup invalid winners",
+        key="cleanup_winners_btn",
+        help=(
+            "Deactivates engagement_reply entries that cannot be confirmed as a "
+            "positive reply via the Engagement table. Seed and manual approval "
+            "entries are always kept. Entries are NOT deleted — you can restore "
+            "any entry individually."
+        ),
+    ):
+        try:
+            cleanup_result = cleanup_invalid_winners()
+        except Exception as exc:
+            st.error(f"Cleanup failed: {exc}")
+        else:
+            st.cache_data.clear()
+            st.success(
+                f"Cleanup complete — "
+                f"{cleanup_result['kept_active']} kept active, "
+                f"{cleanup_result['deactivated']} deactivated, "
+                f"{cleanup_result['reason_set']} reasons set."
+            )
+            st.rerun()
+
 _render_library(
     "Winners library",
     _winners_cached(),
@@ -1081,6 +1163,7 @@ _render_library(
     key_prefix="eng_winners",
     set_active=set_winner_active,
     item_noun="winner",
+    show_reason_filter=True,
 )
 
 st.divider()

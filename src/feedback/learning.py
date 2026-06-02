@@ -15,7 +15,13 @@ from datetime import datetime, timezone
 
 from sqlalchemy import select
 
-from src.content.winners import NEGATIVES_PATH, WINNERS_PATH
+from src.content.winners import (
+    NEGATIVES_PATH,
+    VALID_WINNER_REASONS,
+    WINNER_REASON_UNCONFIRMED,
+    WINNERS_PATH,
+    _derive_winner_reason,
+)
 from src.db import session_scope
 from src.models import ContentRating, Engagement, GeneratedContent, Lead, Score
 
@@ -67,6 +73,9 @@ def _make_winner(content: GeneratedContent, lead: Lead, score: Score | None, rep
         "id": f"auto_{content.id}",
         "content_type": content.kind,
         "source": "engagement_reply",
+        # winner_reason = "positive_reply" is set here for new promotions.
+        # Existing entries without this field get it assigned by cleanup_invalid_winners().
+        "winner_reason": "positive_reply",
         "score": float(reply_rate),
         "added_at": now_iso,
         "promoted_at": now_iso,
@@ -143,6 +152,7 @@ def _make_rating_winner(content: GeneratedContent, lead: Lead, score: Score | No
         "rating_id": rating_id,
         "content_type": content.kind,
         "source": "manual_rating",
+        "winner_reason": "manual_positive_rating",
         "score": 1.0,  # SDR thumbs-up is treated as max signal
         "added_at": _now_iso(),
         "lead_context": {
@@ -251,4 +261,148 @@ def process_ratings() -> dict:
         "negatives_total": len(negatives),
     }
     log.info("ratings_processed", extra=summary)
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Winners cleanup — deactivate unconfirmed engagement_reply entries.
+# ---------------------------------------------------------------------------
+
+# Integer lead statuses in Instantly that signal positive engagement.
+_POSITIVE_STATUS_INTS: frozenset[int] = frozenset({2, 3, 4, 5, 6})
+# reply_sentiment string values that confirm a positive reply.
+_POSITIVE_SENTIMENTS: frozenset[str] = frozenset({
+    "positive", "interested", "opportunity", "booked", "meeting_booked",
+})
+
+
+def _has_positive_engagement_signal(content_id: int) -> bool:
+    """Return True if the Engagement row for this content confirms a positive reply.
+
+    Checks in order:
+      1. Engagement.reply_sentiment is a known positive value.
+      2. Instantly per-lead status in Engagement.raw is ≥ 2 (interested / booked / etc.).
+    Returns False when no Engagement row exists or neither signal is present.
+    """
+    try:
+        with session_scope() as session:
+            eng = session.execute(
+                select(Engagement).where(Engagement.content_id == content_id)
+            ).scalar_one_or_none()
+            if eng is None:
+                return False
+            sentiment = (eng.reply_sentiment or "").lower().strip()
+            if sentiment in _POSITIVE_SENTIMENTS:
+                return True
+            raw = eng.raw or {}
+            status = raw.get("status")
+            if isinstance(status, int) and status in _POSITIVE_STATUS_INTS:
+                return True
+        return False
+    except Exception as exc:
+        log.warning(
+            "positive_signal_check_failed",
+            extra={"content_id": content_id, "error": f"{type(exc).__name__}: {exc}"},
+        )
+        return False
+
+
+def cleanup_invalid_winners() -> dict:
+    """Deactivate Winners Library entries that cannot be confirmed as positive.
+
+    Rules (applied in order, non-destructive — entries are never deleted):
+      - source="seed" or manually_flagged=True → keep active, ensure winner_reason="seed"
+      - source="manual_rating" → keep active, ensure winner_reason="manual_positive_rating"
+      - source="engagement_reply" with explicit valid winner_reason → keep active
+      - source="engagement_reply" without explicit valid reason → check Engagement row:
+          positive signal confirmed → keep active, winner_reason="positive_reply"
+          no positive signal → set is_active=False, winner_reason=WINNER_REASON_UNCONFIRMED
+      - any other source with no valid winner_reason → deactivate
+
+    Returns a summary dict: {kept, deactivated, already_inactive, reason_set}.
+    """
+    library = _load_library()
+    kept = 0
+    deactivated = 0
+    already_inactive = 0
+    reason_set = 0
+
+    for entry in library:
+        source = entry.get("source") or ""
+        manually_flagged = bool(entry.get("manually_flagged", False))
+        currently_active = bool(entry.get("is_active", True))
+
+        # --- Seed entries: always keep ---
+        if source == "seed" or manually_flagged:
+            if entry.get("winner_reason") != "seed":
+                entry["winner_reason"] = "seed"
+                reason_set += 1
+            if not currently_active:
+                entry["is_active"] = True
+            kept += 1
+            continue
+
+        # --- Manual rating entries: always keep ---
+        if source == "manual_rating":
+            if entry.get("winner_reason") != "manual_positive_rating":
+                entry["winner_reason"] = "manual_positive_rating"
+                reason_set += 1
+            kept += 1
+            continue
+
+        # --- Engagement reply entries: confirm positive signal ---
+        if source == "engagement_reply":
+            existing_reason = entry.get("winner_reason")
+            # Already has an explicit valid reason (set by new code or a previous cleanup).
+            if existing_reason in VALID_WINNER_REASONS:
+                kept += 1
+                continue
+
+            # Try to extract content_id from the entry id (format: "auto_{content_id}").
+            entry_id = entry.get("id", "")
+            has_positive = False
+            if entry_id.startswith("auto_"):
+                try:
+                    content_id = int(entry_id[5:])
+                    has_positive = _has_positive_engagement_signal(content_id)
+                except (ValueError, TypeError):
+                    pass
+
+            if has_positive:
+                entry["winner_reason"] = "positive_reply"
+                entry["is_active"] = True
+                reason_set += 1
+                kept += 1
+            else:
+                entry["winner_reason"] = WINNER_REASON_UNCONFIRMED
+                if currently_active:
+                    entry["is_active"] = False
+                    deactivated += 1
+                    reason_set += 1
+                else:
+                    already_inactive += 1
+            continue
+
+        # --- Unknown source: deactivate if no valid reason ---
+        existing_reason = entry.get("winner_reason")
+        if existing_reason in VALID_WINNER_REASONS:
+            kept += 1
+        else:
+            entry["winner_reason"] = WINNER_REASON_UNCONFIRMED
+            if currently_active:
+                entry["is_active"] = False
+                deactivated += 1
+            else:
+                already_inactive += 1
+
+    _save_library(library)
+
+    summary = {
+        "kept_active": kept,
+        "deactivated": deactivated,
+        "already_inactive": already_inactive,
+        "reason_set": reason_set,
+        "library_size": len(library),
+    }
+    log.info("winners_cleanup_complete", extra=summary)
     return summary
