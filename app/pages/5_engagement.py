@@ -62,8 +62,10 @@ from src.feedback.self_improvement import (
     LOOP_WAIT,
     MIN_SAMPLE_FOR_RECOMMENDATION,
     REPLY_DIAGNOSE_HOURS,
+    REPLY_POSITIVE_SIGNAL_GATE_HOURS,
     SAMPLE_LOW_CONF_MAX,
     approve_recommendation,
+    archive_recommendation,
     diagnose,
     kpi_view,
     latest_send_info,
@@ -843,17 +845,22 @@ with st.expander("Recommendation history & rollback"):
                         f"({drift * 100:.0f}% drift)"
                     )
 
+            _rec_status = rec["status"]
             status_icon = {
                 "approved": "✓",
                 "rejected": "✗",
                 "draft": "·",
                 "ready_for_approval": "⏳",
-            }.get(rec["status"], "?")
+                "archived": "🗄",
+            }.get(_rec_status, "?")
 
-            if is_stale and rec["status"] in ("ready_for_approval", "draft"):
+            _is_pending = _rec_status in ("ready_for_approval", "draft")
+            if _rec_status == "archived":
+                status_label = "Archived"
+            elif is_stale and _is_pending:
                 status_label = "Stale recommendation"
             else:
-                status_label = rec["status"].replace("_", " ").capitalize()
+                status_label = _rec_status.replace("_", " ").capitalize()
 
             header = (
                 f"{status_icon} {status_label} · "
@@ -867,7 +874,6 @@ with st.expander("Recommendation history & rollback"):
                 st.markdown(header)
 
                 # Snapshot provenance row
-                _rec_snap_ts = (rec.get("metric_snapshot") or {}).get("_snap_ts") if rec.get("metric_snapshot") else None
                 _based_on = f"sample {rec_sent:,}"
                 if _current_snap_ts:
                     _based_on += f"  ·  created {_format_timestamp(rec['created_at'])}"
@@ -878,23 +884,36 @@ with st.expander("Recommendation history & rollback"):
                         _curr_info += f", {_current_opps} opportunity/ies"
                     st.caption(f"Current snapshot: {_curr_info}  ·  synced {_format_timestamp(_current_snap_ts)}")
 
-                if is_stale:
-                    st.warning(
-                        f"This recommendation was based on older campaign data "
-                        f"({stale_reason}). Recalculate before approving."
+                if is_stale and _rec_status != "archived":
+                    st.error(
+                        f"**Stale:** This recommendation was based on older campaign data "
+                        f"({stale_reason}). Do not approve — recalculate or archive it."
                     )
 
                 st.caption(rec["diagnosis"])
+
+                # Addendum preview — label clearly when the rec is stale or archived.
                 if rec.get("proposed_addendum"):
-                    with st.expander("Addendum that was proposed"):
+                    _addendum_label = (
+                        "Historical recommendation — not active (stale, do not approve)"
+                        if (is_stale or _rec_status == "archived") and _is_pending or _rec_status == "archived"
+                        else "Addendum that was proposed"
+                    )
+                    with st.expander(_addendum_label):
+                        if is_stale and _is_pending:
+                            st.warning(
+                                "This addendum was drafted from an older snapshot. "
+                                "It should not be approved as-is. Archive and recalculate."
+                            )
                         st.code(rec["proposed_addendum"], language="markdown")
+
                 if rec["approved_by"]:
                     st.caption(
                         f"By {rec['approved_by']} at "
                         f"{_format_timestamp(rec['approved_at'])}"
                     )
                 if (
-                    rec["status"] == "approved"
+                    _rec_status == "approved"
                     and rec["previous_prompt_snapshot"]
                     and rec["channel"]
                 ):
@@ -912,11 +931,42 @@ with st.expander("Recommendation history & rollback"):
                             st.success("Rolled back to previous prompt overlay.")
                             st.rerun()
 
-                # Approval disabled for stale pending recommendations.
-                if is_stale and rec["status"] in ("ready_for_approval", "draft"):
+                # For stale pending recommendations: archive + recalculate buttons.
+                if is_stale and _is_pending:
                     st.caption(
-                        ":orange[Approval disabled — recalculate from latest data first.]"
+                        ":orange[Approval disabled — this recommendation was based on older data.]"
                     )
+                    _arch_col, _recalc_col = st.columns(2)
+                    with _arch_col:
+                        if st.button(
+                            "Archive this recommendation",
+                            key=f"sil_archive_{rec['id']}",
+                            type="secondary",
+                            help="Dismisses this stale recommendation without changing the prompt.",
+                        ):
+                            try:
+                                archive_recommendation(rec["id"])
+                            except Exception as exc:
+                                st.error(f"Archive failed: {exc}")
+                            else:
+                                st.cache_data.clear()
+                                st.info("Recommendation archived.")
+                                st.rerun()
+                    with _recalc_col:
+                        if st.button(
+                            "Recalculate from latest data",
+                            key=f"sil_recalc_hist_{rec['id']}",
+                            type="secondary",
+                            help=(
+                                "Clears cached recommendations and re-diagnoses "
+                                "from the current analytics snapshot."
+                            ),
+                        ):
+                            for k in list(st.session_state.keys()):
+                                if k.startswith("sil_pending_rec_"):
+                                    del st.session_state[k]
+                            st.cache_data.clear()
+                            st.rerun()
 
 # ---------- Prompt experiment tracker ----------
 with st.expander("Prompt experiment tracker — performance by prompt version"):

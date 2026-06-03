@@ -71,6 +71,11 @@ SAMPLE_WAIT_MAX = 50          # below this → "wait" (no recommendation)
 SAMPLE_LOW_CONF_MAX = 200     # below this but ≥ wait → "draft" (low conf)
 REPLY_WAIT_HOURS = 24         # below this, no reply-rate diagnosis at all
 REPLY_DIAGNOSE_HOURS = 48     # below this, diagnose-only on reply-rate
+# When positive signals (opportunities / positive replies) exist, hold off on
+# any body-copy addendum until this many hours have elapsed since the latest
+# send AND positive_signals drops to zero. Below this threshold the loop
+# returns LOOP_WAIT so the operator is not nudged toward a rewrite prematurely.
+REPLY_POSITIVE_SIGNAL_GATE_HOURS = 72
 
 # Loop status vocabulary — see module docstring.
 LOOP_WAIT = "wait"
@@ -215,15 +220,31 @@ def _open_rate_addendum(current_rate: float, target_rate: float) -> str:
 
 
 def _reply_rate_addendum(current_rate: float, target_rate: float) -> str:
+    """Narrow, style-consistent addendum for low reply rate.
+
+    Constraints:
+    - Must not conflict with existing prompt rules (no meeting CTAs on Structure 1,
+      no forced numeric value prop for intro play, no generic "one-word reply" rule).
+    - Only fires when positive_signals == 0, sample is large, timing is mature.
+    - Focuses on BUYER SPECIFICITY — the most common root cause of weak reply
+      rates on already-healthy-open-rate campaigns.
+    """
     return (
         "# REPLY-RATE FIX — added by self-improvement loop\n"
         f"# Triggered by: reply rate {current_rate * 100:.2f}% "
-        f"(target {target_rate * 100:.0f}%) with a HEALTHY open rate.\n"
-        "# Scope: body length, CTA, hedging. Subject lines unchanged.\n"
-        "- Body 50–80 words. Cut every sentence without a named entity.\n"
-        "- CTA must invite a one-word reply. No call/meeting CTAs.\n"
-        "- Lead with a concrete value comparison or a number.\n"
-        "- Remove hedging (\"might be a fit\", \"if you're open\", \"no worries if not\").\n"
+        f"(target {target_rate * 100:.0f}%) with a HEALTHY open rate and ZERO positive signals.\n"
+        "# Scope: buyer specificity in the intro. Do NOT change body word count, value prop\n"
+        "# structure, CTA phrasing, or subject lines.\n"
+        "# This fires only when no positive replies or opportunities exist at this sample size.\n"
+        "- Require a named buyer account (direct or lookalike) or a trigger-based buyer segment\n"
+        "  in every Structure 1 intro before generating. Do not fall back to generic team labels.\n"
+        "- Buyer segment MUST name a specific vertical AND a trigger event.\n"
+        "  Good: 'Series A SaaS companies hiring SDRs'\n"
+        "  Bad: 'sales teams' / 'founders' / 'revenue teams'\n"
+        "- If no named buyer account or trigger segment can be found, mark the email\n"
+        "  as NEEDS REVIEW rather than generating with a broad fallback.\n"
+        "- For Structure 1 intro play: keep 'Just let me know.' CTA unchanged.\n"
+        "- Do not add numeric value comparisons unless an SDR/BDR hiring signal is present.\n"
     )
 
 
@@ -562,6 +583,50 @@ def diagnose(
                 hours_since_latest_send=hours_since_send,
                 latest_send_source=send_source,
             )
+        # Gate: positive signal present before 72h → WAIT.
+        # If at least one opportunity or positive reply has been recorded and
+        # the campaign is still maturing (< REPLY_POSITIVE_SIGNAL_GATE_HOURS),
+        # hold off entirely. Changing body copy when a positive signal already
+        # exists risks breaking what is working before we have enough evidence
+        # that the current rate is the real steady state.
+        if positive_signals > 0 and (
+            hours_since_send is None
+            or hours_since_send < REPLY_POSITIVE_SIGNAL_GATE_HOURS
+        ):
+            _hours_clause = (
+                f" ({hours_since_send:.1f}h since latest send)"
+                if hours_since_send is not None
+                else ""
+            )
+            return Diagnosis(
+                loop_status=LOOP_WAIT,
+                bottleneck="reply_rate",
+                channel="email",
+                confidence=confidence,
+                diagnosis=(
+                    f"Open rate is healthy ({open_rate * 100:.1f}%) and "
+                    f"{positive_signals} positive signal(s) / opportunity(ies) "
+                    f"recorded{_hours_clause}. "
+                    "Positive signal exists and latest sends are still fresh. "
+                    f"Recalculate after {REPLY_POSITIVE_SIGNAL_GATE_HOURS}h from the latest send."
+                ),
+                current_metric_label="Reply rate",
+                current_metric_value=reply_rate,
+                target_metric_value=reply_rate_target,
+                recommended_change=(
+                    f"Wait at least {REPLY_POSITIVE_SIGNAL_GATE_HOURS}h after the latest send "
+                    "AND confirm positive signals have not arrived before drafting a body-copy change. "
+                    "Do not rewrite copy while positive engagement exists — it could break what is already working."
+                ),
+                expected_impact="—",
+                risk_level="low",
+                proposed_addendum=None,
+                previous_prompt_snapshot=None,
+                sample_size=sample_size,
+                hours_since_latest_send=hours_since_send,
+                latest_send_source=send_source,
+            )
+
         if hours_since_send is not None and hours_since_send < REPLY_DIAGNOSE_HOURS:
             return Diagnosis(
                 loop_status=LOOP_DIAGNOSE,
@@ -592,6 +657,7 @@ def diagnose(
                 hours_since_latest_send=hours_since_send,
                 latest_send_source=send_source,
             )
+
         if insufficient:
             return Diagnosis(
                 loop_status=LOOP_WAIT,
@@ -618,6 +684,43 @@ def diagnose(
                 hours_since_latest_send=hours_since_send,
                 latest_send_source=send_source,
             )
+
+        # Gate: positive signal still present in mature window → DIAGNOSE only.
+        # Even with a large, mature sample, if at least one positive signal
+        # exists the copy is working for some recipients. Diagnose-only; never
+        # propose a body rewrite while positive engagement is on the board.
+        if positive_signals > 0:
+            return Diagnosis(
+                loop_status=LOOP_DIAGNOSE,
+                bottleneck="reply_rate",
+                channel="email",
+                confidence=confidence,
+                diagnosis=(
+                    f"Open rate is healthy ({open_rate * 100:.1f}%) and "
+                    f"{positive_signals} positive signal(s) detected on {sample_size} sent. "
+                    "Positive engagement exists — no body copy change recommended. "
+                    "Monitor reply rate as the campaign matures before proposing edits."
+                ),
+                current_metric_label="Reply rate",
+                current_metric_value=reply_rate,
+                target_metric_value=reply_rate_target,
+                recommended_change=(
+                    "Do not change body copy while positive replies or opportunities exist. "
+                    "The current copy appears to be resonating for at least some recipients. "
+                    "Re-evaluate when the positive signal rate drops or more sends accumulate."
+                ),
+                expected_impact="—",
+                risk_level="low",
+                proposed_addendum=None,
+                previous_prompt_snapshot=None,
+                sample_size=sample_size,
+                hours_since_latest_send=hours_since_send,
+                latest_send_source=send_source,
+            )
+
+        # Only reach this branch when:
+        #   positive_signals == 0 AND hours >= 48 AND sample >= 50
+        # All gates passed — propose the narrow buyer-specificity addendum.
         current = get_effective_prompt("email", DEFAULT_EMAIL_PROMPT_BODY)
         return Diagnosis(
             loop_status=_loop_status_for_prompt_change(confidence),
@@ -627,18 +730,18 @@ def diagnose(
             diagnosis=(
                 f"Open rate is healthy ({open_rate * 100:.1f}%) but reply "
                 f"rate is {reply_rate * 100:.2f}% on {sample_size} sent "
-                f"(target {reply_rate_target * 100:.0f}%). Body copy / CTA "
-                "is the bottleneck — subject lines are working."
+                f"(target {reply_rate_target * 100:.0f}%). No positive signals detected. "
+                "Buyer specificity in the intro is the most likely bottleneck."
             ),
             current_metric_label="Reply rate",
             current_metric_value=reply_rate,
             target_metric_value=reply_rate_target,
             recommended_change=(
-                "Append a BODY/CTA addendum to the email prompt: tighten "
-                "length to 50–80 words, force one-word CTA, drop hedging. "
+                "Append a BUYER SPECIFICITY addendum to the email prompt: require "
+                "a named buyer account or trigger-based segment before generating. "
                 "Affects FUTURE generated emails only."
             ),
-            expected_impact="Reply rate +1 to +2 percentage points on subsequent sends.",
+            expected_impact="Reply rate improvement by reducing generic intros that do not name specific buyers.",
             risk_level="medium",
             proposed_addendum=_reply_rate_addendum(reply_rate, reply_rate_target),
             previous_prompt_snapshot=current,
@@ -826,6 +929,23 @@ def rollback_recommendation(rec_id: int) -> dict[str, Any]:
     save_overlay(channel, previous)
     log.info("self_improvement_rolled_back", extra={"rec_id": rec_id, "channel": channel})
     return {"id": rec_id, "channel": channel}
+
+
+def archive_recommendation(rec_id: int) -> None:
+    """Archive a stale or superseded recommendation without rolling back any prompt.
+
+    Sets status = "archived" so the history UI can collapse it. Unlike
+    `reject_recommendation`, this does NOT set `approved_by` and does NOT
+    touch the prompt overlay — it is a pure UI-hygiene operation to dismiss
+    recommendations that were created from outdated snapshot data.
+    """
+    with session_scope() as session:
+        rec = session.get(PromptRecommendation, rec_id)
+        if rec is None:
+            raise ValueError(f"Recommendation {rec_id} not found")
+        rec.status = "archived"
+        rec.rejected_at = datetime.utcnow()
+    log.info("recommendation_archived", extra={"rec_id": rec_id})
 
 
 # ---------------------------------------------------------------------------

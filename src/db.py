@@ -59,6 +59,21 @@ _RUNTIME_COLUMN_ADDS: list[tuple[str, str, str]] = [
     # FK to the snapshot a PromptRecommendation was based on, for staleness
     # detection when a newer sync arrives before the operator acts.
     ("prompt_recommendations", "analytics_snapshot_id", "INTEGER"),
+    # Phase 2: workspace_id added to every workspace-scoped table.
+    # Nullable so existing rows survive migration; backfilled to the default
+    # OSP workspace by backfill_default_workspace_ids() called from init_db().
+    # No FK constraint here — the runtime migration style does not enforce FKs
+    # in ALTER TABLE statements; ORM models carry the semantic relationship.
+    ("leads", "workspace_id", "INTEGER"),
+    ("enrichments", "workspace_id", "INTEGER"),
+    ("scores", "workspace_id", "INTEGER"),
+    ("generated_contents", "workspace_id", "INTEGER"),
+    ("engagements", "workspace_id", "INTEGER"),
+    ("content_ratings", "workspace_id", "INTEGER"),
+    ("winning_examples", "workspace_id", "INTEGER"),
+    ("instantly_analytics_snapshots", "workspace_id", "INTEGER"),
+    ("prompt_recommendations", "workspace_id", "INTEGER"),
+    ("prompt_configs", "workspace_id", "INTEGER"),
 ]
 
 # Postgres-only column widenings. SQLite ignores VARCHAR length caps so
@@ -121,6 +136,10 @@ def init_db() -> None:
     from src import models  # noqa: F401  registers tables on Base.metadata
     Base.metadata.create_all(engine)
     _apply_runtime_migrations()
+    # Lazy imports avoid circular dependency: src.workspace imports src.db.
+    from src.workspace import backfill_default_workspace_ids, seed_default_workspace
+    seed_default_workspace()
+    backfill_default_workspace_ids()
 
 
 @contextmanager

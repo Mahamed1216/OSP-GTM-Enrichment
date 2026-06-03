@@ -21,6 +21,11 @@ if str(_PROJECT_ROOT) not in sys.path:
 import streamlit as st
 
 from app.styles import inject_styles
+from src.workspace import (
+    get_campaign_id_source,
+    get_default_workspace,
+    get_workspace_table_stats,
+)
 from src.icp_config import (
     CONFIG_PATH,
     BuyerPersona,
@@ -62,6 +67,64 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.write(_last_saved_caption(CONFIG_PATH))
+
+# ---------- Workspace foundation (read-only, Phase 2) ----------
+with st.expander("Workspace foundation (read-only)", expanded=False):
+    try:
+        _ws = get_default_workspace()
+    except Exception as _ws_exc:
+        _ws = None
+        st.warning(f"Could not load workspace: {_ws_exc}")
+
+    if _ws:
+        _campaign_id_source = get_campaign_id_source()
+        _campaign_id_display = _ws.get("instantly_campaign_id") or "—"
+        st.caption(
+            "Phase 2 — workspace_id columns added to all workspace-scoped tables. "
+            "Workspace switching is not yet available."
+        )
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Name", _ws.get("name") or "—")
+        c2.metric("Slug", _ws.get("slug") or "—")
+        c3.metric("Default", "Yes" if _ws.get("is_default") else "No")
+        c4.metric("Workspace ID", str(_ws.get("id") or "—"))
+        st.markdown(
+            f"**Instantly campaign ID:** `{_campaign_id_display}`  "
+            f"·  **Source:** {_campaign_id_source}"
+        )
+
+        # Per-table workspace_id coverage diagnostic.
+        st.markdown("**workspace_id coverage by table**")
+        try:
+            _stats = get_workspace_table_stats()
+            _table_rows = []
+            for _tname, _tdata in (_stats.get("tables") or {}).items():
+                if not isinstance(_tdata, dict) or _tdata.get("status") != "ok":
+                    _table_rows.append({
+                        "Table": _tname,
+                        "Total rows": "—",
+                        "Assigned to OSP": "—",
+                        "Missing workspace_id": "—",
+                        "Status": _tdata.get("status", "—") if isinstance(_tdata, dict) else str(_tdata),
+                    })
+                else:
+                    _table_rows.append({
+                        "Table": _tname,
+                        "Total rows": _tdata["total_rows"],
+                        "Assigned to OSP": _tdata["assigned_to_default"],
+                        "Missing workspace_id": _tdata["missing_workspace_id"],
+                        "Status": "ok",
+                    })
+            if _table_rows:
+                import pandas as pd
+                st.dataframe(pd.DataFrame(_table_rows), hide_index=True, use_container_width=True)
+        except Exception as _stats_exc:
+            st.caption(f":gray[Table stats unavailable: {_stats_exc}]")
+    else:
+        st.info(
+            "Default workspace not found. It will be created automatically "
+            "the next time the app starts (init_db runs on startup)."
+        )
 
 cfg = load_icp_config()
 

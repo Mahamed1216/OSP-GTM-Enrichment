@@ -11,6 +11,66 @@ def now_utc() -> datetime:
     return datetime.utcnow()
 
 
+def _default_workspace_id() -> int | None:
+    """SQLAlchemy insert-time default for workspace_id columns.
+
+    Uses raw SQL via the shared engine to avoid ORM circular imports —
+    src.workspace imports src.models, so models cannot import workspace.
+
+    Safe in all phases:
+      - Returns None when the workspaces table does not exist (fresh DB
+        before create_all, or during test setUp without seeding).
+      - Returns None when no default workspace is seeded yet.
+      - Returns the default OSP workspace id once Phase 1 seeding runs.
+    Exceptions are silently swallowed so no insert ever fails because of
+    a missing workspace row.
+    """
+    try:
+        from sqlalchemy import text as _text
+        from src.db import engine as _engine
+        with _engine.connect() as conn:
+            row = conn.execute(
+                _text(
+                    "SELECT id FROM workspaces "
+                    "WHERE is_default = :flag LIMIT 1"
+                ),
+                {"flag": True},
+            ).first()
+        return int(row[0]) if row else None
+    except Exception:
+        return None
+
+
+class Workspace(Base):
+    """A named operating context for the app (e.g. one per client or campaign).
+
+    Phase 1: foundational table only. No foreign keys from other tables yet —
+    existing data continues to work unchanged. Phase 2 will add workspace_id
+    columns to the lead/prompt/analytics tables and wire up the UI selectors.
+
+    The default OSP workspace is seeded automatically by `init_db()` so the
+    app is never left without a workspace after the first startup.
+    """
+
+    __tablename__ = "workspaces"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    slug: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Instantly integration — nullable so workspaces without a campaign can
+    # still exist. The campaign-ID resolver falls back to the env var when
+    # this is NULL (see src.workspace.get_campaign_id_for_workspace).
+    instantly_campaign_id: Mapped[Optional[str]] = mapped_column(String(128))
+    instantly_api_key: Mapped[Optional[str]] = mapped_column(String(256))
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=now_utc, onupdate=now_utc, nullable=False
+    )
+
+
 class Lead(Base):
     __tablename__ = "leads"
 
@@ -31,6 +91,9 @@ class Lead(Base):
     email_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    # Phase 2: workspace scoping. Nullable so existing rows survive migration;
+    # backfilled to the default OSP workspace id by init_db().
+    workspace_id: Mapped[Optional[int]] = mapped_column(Integer, default=_default_workspace_id)
 
     enrichment: Mapped[Optional["Enrichment"]] = relationship(
         back_populates="lead", uselist=False, cascade="all, delete-orphan"
@@ -62,6 +125,7 @@ class Enrichment(Base):
     # {source_name: {"success": bool, "error": str|None, "duration_ms": int}}
     source_status: Mapped[dict] = mapped_column(JSON, default=dict)
     enriched_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    workspace_id: Mapped[Optional[int]] = mapped_column(Integer, default=_default_workspace_id)
 
     lead: Mapped[Lead] = relationship(back_populates="enrichment")
 
@@ -77,6 +141,7 @@ class Score(Base):
     signals_used: Mapped[list] = mapped_column(JSON, default=list)
     model: Mapped[str] = mapped_column(String(64))
     scored_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    workspace_id: Mapped[Optional[int]] = mapped_column(Integer, default=_default_workspace_id)
 
     lead: Mapped[Lead] = relationship(back_populates="score")
 
@@ -127,6 +192,8 @@ class GeneratedContent(Base):
         ForeignKey("generated_contents.id"), nullable=True
     )
 
+    workspace_id: Mapped[Optional[int]] = mapped_column(Integer, default=_default_workspace_id)
+
     lead: Mapped[Lead] = relationship(back_populates="contents")
     ratings: Mapped[list["ContentRating"]] = relationship(
         back_populates="generated_content", cascade="all, delete-orphan"
@@ -147,6 +214,7 @@ class Engagement(Base):
     bounced: Mapped[bool] = mapped_column(Boolean, default=False)
     raw: Mapped[Optional[dict]] = mapped_column(JSON)
     synced_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    workspace_id: Mapped[Optional[int]] = mapped_column(Integer, default=_default_workspace_id)
 
 
 class ContentRating(Base):
@@ -160,6 +228,7 @@ class ContentRating(Base):
     feedback_text: Mapped[Optional[str]] = mapped_column(Text)
     rated_by: Mapped[str] = mapped_column(String(64), nullable=False)
     rated_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, nullable=False)
+    workspace_id: Mapped[Optional[int]] = mapped_column(Integer, default=_default_workspace_id)
 
     generated_content: Mapped["GeneratedContent"] = relationship(back_populates="ratings")
 
@@ -174,6 +243,7 @@ class WinningExample(Base):
     reply_rate: Mapped[float] = mapped_column(Float, default=0.0)
     manually_flagged: Mapped[bool] = mapped_column(Boolean, default=False)
     promoted_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    workspace_id: Mapped[Optional[int]] = mapped_column(Integer, default=_default_workspace_id)
 
 
 class InstantlyAnalyticsSnapshot(Base):
@@ -214,6 +284,7 @@ class InstantlyAnalyticsSnapshot(Base):
     raw_opportunity_source: Mapped[Optional[str]] = mapped_column(String(128))
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
     synced_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
+    workspace_id: Mapped[Optional[int]] = mapped_column(Integer, default=_default_workspace_id)
 
 
 class PromptRecommendation(Base):
@@ -276,6 +347,7 @@ class PromptRecommendation(Base):
     rejected_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     drafted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
+    workspace_id: Mapped[Optional[int]] = mapped_column(Integer, default=_default_workspace_id)
 
 
 class PromptConfig(Base):
@@ -304,3 +376,4 @@ class PromptConfig(Base):
     prompt_fingerprint: Mapped[Optional[str]] = mapped_column(String(64))
     updated_by: Mapped[Optional[str]] = mapped_column(String(64))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    workspace_id: Mapped[Optional[int]] = mapped_column(Integer, default=_default_workspace_id)
