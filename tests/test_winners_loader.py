@@ -39,9 +39,12 @@ def _write(path: Path, data) -> None:
 def test_load_top_winners_for_filters_by_content_type(temp_libraries):
     win_path, _ = temp_libraries
     _write(win_path, [
-        {"content_type": "email", "score": 0.4, "subject": "e1", "body": "b"},
-        {"content_type": "call_script", "score": 0.9, "body": "{}"},
-        {"content_type": "email", "score": 0.6, "subject": "e2", "body": "b"},
+        {"content_type": "email", "score": 0.4, "subject": "e1", "body": "b",
+         "winner_reason": "seed"},
+        {"content_type": "call_script", "score": 0.9, "body": "{}",
+         "winner_reason": "seed"},
+        {"content_type": "email", "score": 0.6, "subject": "e2", "body": "b",
+         "winner_reason": "seed"},
     ])
     em = load_top_winners_for("email", k=10)
     cs = load_top_winners_for("call_script", k=10)
@@ -52,7 +55,8 @@ def test_load_top_winners_for_filters_by_content_type(temp_libraries):
 def test_load_top_winners_for_treats_legacy_entries_as_email(temp_libraries):
     win_path, _ = temp_libraries
     _write(win_path, [
-        {"subject": "legacy", "body": "b", "reply_rate": 0.42},  # no content_type
+        {"subject": "legacy", "body": "b", "reply_rate": 0.42,  # no content_type
+         "manually_flagged": True},
     ])
     out = load_top_winners_for("email", k=10)
     assert len(out) == 1
@@ -62,7 +66,8 @@ def test_load_top_winners_for_treats_legacy_entries_as_email(temp_libraries):
 def test_load_top_winners_for_sorts_manually_flagged_first_then_score(temp_libraries):
     win_path, _ = temp_libraries
     _write(win_path, [
-        {"content_type": "email", "score": 0.9, "manually_flagged": False, "subject": "auto"},
+        {"content_type": "email", "score": 0.9, "manually_flagged": False, "subject": "auto",
+         "winner_reason": "positive_reply"},
         {"content_type": "email", "score": 0.3, "manually_flagged": True, "subject": "seed"},
     ])
     out = load_top_winners_for("email", k=10)
@@ -166,9 +171,9 @@ def test_load_top_winners_for_skips_inactive_entries(temp_libraries):
     win_path, _ = temp_libraries
     _write(win_path, [
         {"id": "a", "content_type": "email", "score": 0.9, "subject": "s", "body": "active",
-         "is_active": True},
+         "is_active": True, "winner_reason": "seed"},
         {"id": "b", "content_type": "email", "score": 0.8, "subject": "s", "body": "demoted",
-         "is_active": False},
+         "is_active": False, "winner_reason": "seed"},
     ])
     out = load_top_winners_for("email", k=5)
     ids = [e["id"] for e in out]
@@ -180,7 +185,8 @@ def test_load_top_winners_for_treats_missing_is_active_as_active(temp_libraries)
     """Pre-migration entries (no is_active key) must still load."""
     win_path, _ = temp_libraries
     _write(win_path, [
-        {"id": "legacy", "content_type": "email", "score": 0.5, "subject": "s", "body": "b"},
+        {"id": "legacy", "content_type": "email", "score": 0.5, "subject": "s", "body": "b",
+         "winner_reason": "seed"},
     ])
     out = load_top_winners_for("email", k=5)
     assert [e["id"] for e in out] == ["legacy"]

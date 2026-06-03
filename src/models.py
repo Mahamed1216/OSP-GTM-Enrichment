@@ -24,11 +24,17 @@ def _default_workspace_id() -> int | None:
       - Returns the default OSP workspace id once Phase 1 seeding runs.
     Exceptions are silently swallowed so no insert ever fails because of
     a missing workspace row.
+
+    Uses AUTOCOMMIT isolation so the connection never starts its own transaction
+    and closing it never issues a rollback. Without this, the StaticPool (used
+    in tests) shares one physical connection, and the default close-time rollback
+    corrupts the outer session's pending INSERTs.
     """
     try:
         from sqlalchemy import text as _text
         from src.db import engine as _engine
-        with _engine.connect() as conn:
+        conn = _engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+        with conn:
             row = conn.execute(
                 _text(
                     "SELECT id FROM workspaces "

@@ -47,10 +47,10 @@ class TestSeedDefaultWorkspace:
         seed_default_workspace()
         with session_scope() as session:
             ws = session.execute(select(Workspace)).scalar_one()
-        assert ws.name == "OSP"
-        assert ws.slug == "osp"
-        assert ws.is_default is True
-        assert ws.is_active is True
+            assert ws.name == "OSP"
+            assert ws.slug == "osp"
+            assert ws.is_default is True
+            assert ws.is_active is True
 
     def test_idempotent_no_duplicates(self):
         seed_default_workspace()
@@ -66,7 +66,7 @@ class TestSeedDefaultWorkspace:
             seed_default_workspace()
         with session_scope() as session:
             ws = session.execute(select(Workspace)).scalar_one()
-        assert ws.instantly_campaign_id == "test-campaign-abc"
+            assert ws.instantly_campaign_id == "test-campaign-abc"
 
     def test_campaign_id_null_when_env_blank(self):
         with patch("src.workspace.settings") as mock_settings:
@@ -74,7 +74,7 @@ class TestSeedDefaultWorkspace:
             seed_default_workspace()
         with session_scope() as session:
             ws = session.execute(select(Workspace)).scalar_one()
-        assert ws.instantly_campaign_id is None
+            assert ws.instantly_campaign_id is None
 
 
 class TestGetDefaultWorkspace:

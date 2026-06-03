@@ -21,7 +21,18 @@
       "Read(//c/Users/moham/AppData/Roaming/**)",
       "Read(//c/Users/moham/AppData/Local/Programs/Python/**)",
       "Bash(~/AppData/Local/Programs/Python/Python310/python.exe *)",
-      "Bash(/c/Users/moham/AppData/Local/Microsoft/WindowsApps/python.exe *)"
+      "Bash(/c/Users/moham/AppData/Local/Microsoft/WindowsApps/python.exe *)",
+      "Bash(py -m pytest tests/test_workspace.py tests/test_workspace_phase2.py -x -q)",
+      "Bash(py -m pytest tests/test_workspace.py -v)",
+      "Bash(py -m pytest tests/test_workspace_phase2.py -v)",
+      "Bash(py -m pytest tests/test_lead_deletion.py tests/test_winners_loader.py tests/test_eligibility.py -v)",
+      "Bash(py -m pytest tests/test_lead_deletion.py::test_delete_lead_removes_all_dependent_rows tests/test_winners_loader.py::test_load_top_winners_for_filters_by_content_type tests/test_eligibility.py::test_filter_eligible_categorizes_every_skip_path -v)",
+      "Bash(py -m pytest tests/test_lead_deletion.py::test_delete_lead_removes_all_dependent_rows -v)",
+      "Bash(py -m pytest tests/test_winners_loader.py -v)",
+      "Bash(py -c \"import sqlalchemy; print\\(sqlalchemy.__version__\\)\")",
+      "Bash(py -c \"from sqlalchemy import create_engine; from sqlalchemy.pool import StaticPool; e = create_engine\\('sqlite://', connect_args={'check_same_thread': False}, poolclass=StaticPool, future=True\\); conn = e.connect\\(\\).execution_options\\(no_autobegin=True\\); print\\('no_autobegin works'\\); conn.close\\(\\)\")",
+      "Bash(py -m pytest tests/ -q --ignore=tests/test_llm_live.py --ignore=tests/test_ingest_writer.py)",
+      "Bash(py -m pytest tests/test_workspace.py tests/test_workspace_phase2.py tests/test_lead_deletion.py tests/test_winners_loader.py tests/test_eligibility.py -v)"
     ]
   }
 }
