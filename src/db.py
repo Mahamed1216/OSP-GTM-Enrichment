@@ -97,6 +97,43 @@ _RUNTIME_COLUMN_WIDENS_PG: list[tuple[str, str, str]] = [
 ]
 
 
+def _migrate_prompt_configs_composite_unique() -> None:
+    """Phase 4: change prompt_configs unique index from (channel) to (channel, workspace_id).
+
+    Idempotent — checks if composite index already exists before making changes.
+    Only runs on PostgreSQL; SQLite tests use fresh schema each run.
+    """
+    if engine.dialect.name != "postgresql":
+        return
+    try:
+        with engine.connect() as conn:
+            exists = conn.execute(text(
+                "SELECT 1 FROM pg_indexes "
+                "WHERE tablename = 'prompt_configs' "
+                "AND indexname = 'uq_prompt_configs_channel_workspace'"
+            )).scalar()
+        if exists:
+            return
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE prompt_configs "
+                "DROP CONSTRAINT IF EXISTS prompt_configs_channel_key"
+            ))
+        with engine.begin() as conn:
+            conn.execute(text("DROP INDEX IF EXISTS ix_prompt_configs_channel"))
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_prompt_configs_channel_workspace "
+                "ON prompt_configs (channel, workspace_id)"
+            ))
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "prompt_configs_composite_unique_migration_failed",
+            extra={"error": f"{type(exc).__name__}: {exc}"},
+        )
+
+
 def _apply_runtime_migrations() -> None:
     """Idempotently bring existing tables in line with the current model.
 
@@ -130,6 +167,9 @@ def _apply_runtime_migrations() -> None:
             ddl = f"ALTER TABLE {table_name} ADD COLUMN {col_name} {ddl_type}"
         with engine.begin() as conn:
             conn.execute(text(ddl))
+
+    # Pass 1b — Phase 4: change prompt_configs unique index to composite.
+    _migrate_prompt_configs_composite_unique()
 
     # Pass 2 — widen string columns on Postgres.
     if engine.dialect.name == "postgresql":

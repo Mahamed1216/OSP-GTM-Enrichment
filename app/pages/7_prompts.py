@@ -21,7 +21,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import streamlit as st
 
-from app.lib.workspace_state import render_workspace_banner
+from app.lib.workspace_state import get_current_workspace_id, render_workspace_banner
 from app.styles import inject_styles
 from src.prompts.call_script import DEFAULT_CALL_SCRIPT_PROMPT_BODY
 from src.prompts.email import DEFAULT_EMAIL_PROMPT_BODY
@@ -41,6 +41,8 @@ from src.prompts.loader import (
 )
 
 inject_styles()
+
+_ws_id = get_current_workspace_id()
 
 CHANNELS = [
     ("email", "Email", DEFAULT_EMAIL_PROMPT_BODY),
@@ -83,7 +85,7 @@ def recombine_sections(sections: list[tuple[str, str]]) -> str:
 
 
 def _last_saved_caption() -> str:
-    ts = get_last_saved_timestamp()
+    ts = get_last_saved_timestamp(workspace_id=_ws_id)
     if ts is None:
         return ":gray[No overlay saved yet — showing defaults.]"
     # `ts` is a string from the loader (legacy contract); the loader
@@ -100,7 +102,7 @@ def _last_saved_caption() -> str:
 
 def _render_channel(channel: str, label: str, default_body: str) -> None:
     with st.expander(label, expanded=False):
-        current, source = get_effective_prompt_with_source(channel, default_body)
+        current, source = get_effective_prompt_with_source(channel, default_body, workspace_id=_ws_id)
         st.caption(f"Loaded from: {_SOURCE_LABELS.get(source, source)}")
         text_key = f"prompt_text_{channel}"
         edited = st.text_area(
@@ -119,7 +121,7 @@ def _render_channel(channel: str, label: str, default_body: str) -> None:
 
         if save_clicked:
             try:
-                save_overlay(channel, edited)
+                save_overlay(channel, edited, workspace_id=_ws_id)
             except (OSError, ValueError) as exc:
                 st.error(f"Failed to save {label} prompt: {exc}")
             else:
@@ -143,9 +145,9 @@ def _render_email_channel_sectioned(channel: str, label: str, default_body: str)
     other channels use.
     """
     with st.expander(label, expanded=False):
-        current, source = get_effective_prompt_with_source(channel, default_body)
+        current, source = get_effective_prompt_with_source(channel, default_body, workspace_id=_ws_id)
         st.caption(f"Loaded from: {_SOURCE_LABELS.get(source, source)}")
-        meta = get_overlay_metadata(channel) if source == "database" else None
+        meta = get_overlay_metadata(channel, workspace_id=_ws_id) if source == "database" else None
         if meta:
             from app.lib.formatters import format_et
             meta_bits = []
@@ -175,7 +177,7 @@ def _render_email_channel_sectioned(channel: str, label: str, default_body: str)
                 type="secondary",
             ):
                 try:
-                    stats = clean_saved_overlay(channel)
+                    stats = clean_saved_overlay(channel, workspace_id=_ws_id)
                 except Exception as exc:
                     st.error(f"Cleanup failed: {exc}")
                 else:
@@ -220,7 +222,7 @@ def _render_email_channel_sectioned(channel: str, label: str, default_body: str)
                 )
             else:
                 try:
-                    save_overlay(channel, new_prompt)
+                    save_overlay(channel, new_prompt, workspace_id=_ws_id)
                 except (OSError, ValueError) as exc:
                     st.error(f"Failed to save {label} prompt: {exc}")
                 else:

@@ -73,7 +73,7 @@ except Exception as exc:
     st.stop()
 
 if df.empty:
-    st.info("No leads yet. Use the Run Pipeline page to ingest a CSV.")
+    st.info("No leads yet in this workspace. Use the Run Pipeline page to ingest a CSV.")
     st.stop()
 
 # ---------- Search ----------

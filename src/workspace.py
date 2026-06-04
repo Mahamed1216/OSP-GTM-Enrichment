@@ -1,8 +1,11 @@
-"""Workspace helpers — Phase 1 + Phase 2.
+"""Workspace helpers — Phase 1 + Phase 2 + Phase 4.
 
 Phase 1: workspace lookup, campaign-ID resolver, default OSP seeding.
 Phase 2: workspace_id backfill, per-table coverage stats, insert-time
          helpers for safe workspace assignment on new rows.
+Phase 3: workspace switching (session-state wrappers in app/lib/workspace_state.py).
+Phase 4: workspace creation UI helper — create_workspace() with validation,
+         prompt copying, seed-winner copying.
 
 Phase 2 design rules:
   - All workspace_id columns are nullable; no inserts are broken.
@@ -14,6 +17,7 @@ Phase 2 design rules:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from sqlalchemy import select
@@ -439,3 +443,293 @@ def get_workspace_table_stats() -> dict[str, Any]:
         "default_workspace_id": default_id,
         "tables": table_stats,
     }
+
+
+# ---------------------------------------------------------------------------
+# Instantly API key resolver (Phase 4)
+# ---------------------------------------------------------------------------
+
+def get_api_key_for_workspace(workspace_id: int | None = None) -> str | None:
+    """Resolve the Instantly API key for a workspace.
+
+    Lookup priority:
+      1. workspace.instantly_api_key (if non-empty for the given workspace)
+      2. settings.instantly_api_key  (env-var fallback)
+      3. None
+
+    When workspace_id is None, uses the default workspace.
+    """
+    workspace: dict[str, Any] | None = None
+    if workspace_id is not None:
+        workspace = get_workspace_by_id(workspace_id)
+    else:
+        workspace = get_default_workspace()
+
+    if workspace:
+        ws_key = (workspace.get("instantly_api_key") or "").strip()
+        if ws_key:
+            return ws_key
+
+    env_key = (settings.instantly_api_key or "").strip()
+    return env_key or None
+
+
+def get_api_key_source(workspace_id: int | None = None) -> str:
+    """Return a human-readable label for where the API key comes from."""
+    workspace: dict[str, Any] | None = None
+    if workspace_id is not None:
+        workspace = get_workspace_by_id(workspace_id)
+    else:
+        workspace = get_default_workspace()
+
+    if workspace:
+        ws_key = (workspace.get("instantly_api_key") or "").strip()
+        if ws_key:
+            return "workspace"
+
+    env_key = (settings.instantly_api_key or "").strip()
+    if env_key:
+        return "env (INSTANTLY_API_KEY)"
+    return "not configured"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: workspace creation
+# ---------------------------------------------------------------------------
+
+_SLUG_RE = re.compile(r"^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$")
+
+
+def _validate_slug(slug: str) -> None:
+    """Raise ValueError if slug is not lowercase-safe."""
+    if not slug:
+        raise ValueError("Workspace slug is required.")
+    if not _SLUG_RE.match(slug):
+        raise ValueError(
+            "Slug must be lowercase letters, digits, hyphens, or underscores. "
+            "It must start and end with a letter or digit."
+        )
+
+
+def _copy_prompt_configs(from_workspace_id: int, to_workspace_id: int) -> int:
+    """Copy all prompt_configs rows from one workspace to another.
+
+    Returns the number of rows copied. Skips channels that already have a
+    row in the target workspace (idempotent).
+    """
+    from datetime import datetime as _dt
+    from src.models import PromptConfig
+
+    with session_scope() as session:
+        source_rows = session.execute(
+            select(PromptConfig).where(PromptConfig.workspace_id == from_workspace_id)
+        ).scalars().all()
+
+        existing_channels = {
+            row.channel
+            for row in session.execute(
+                select(PromptConfig).where(PromptConfig.workspace_id == to_workspace_id)
+            ).scalars().all()
+        }
+
+        count = 0
+        for row in source_rows:
+            if row.channel in existing_channels:
+                continue
+            import hashlib
+            fingerprint = hashlib.sha256((row.content or "").encode()).hexdigest()[:16]
+            session.add(PromptConfig(
+                channel=row.channel,
+                content=row.content,
+                prompt_version=row.prompt_version,
+                prompt_fingerprint=fingerprint,
+                updated_by=row.updated_by,
+                is_active=row.is_active,
+                workspace_id=to_workspace_id,
+                updated_at=_dt.utcnow(),
+            ))
+            count += 1
+
+    return count
+
+
+def _seed_default_prompts_for_workspace(workspace_id: int) -> None:
+    """Seed code-default prompts for a new workspace so the Prompts page
+    always has content to display even before the user customises anything.
+    """
+    from src.models import PromptConfig
+    try:
+        from src.prompts.email import DEFAULT_EMAIL_PROMPT_BODY
+        from src.prompts.linkedin_msg import DEFAULT_LINKEDIN_MSG_PROMPT_BODY
+        from src.prompts.call_script import DEFAULT_CALL_SCRIPT_PROMPT_BODY
+    except Exception:
+        return
+
+    defaults = {
+        "email": DEFAULT_EMAIL_PROMPT_BODY,
+        "linkedin_msg": DEFAULT_LINKEDIN_MSG_PROMPT_BODY,
+        "call_script": DEFAULT_CALL_SCRIPT_PROMPT_BODY,
+    }
+
+    import hashlib
+    with session_scope() as session:
+        existing_channels = {
+            row.channel
+            for row in session.execute(
+                select(PromptConfig).where(PromptConfig.workspace_id == workspace_id)
+            ).scalars().all()
+        }
+        for channel, content in defaults.items():
+            if channel in existing_channels:
+                continue
+            session.add(PromptConfig(
+                channel=channel,
+                content=content,
+                prompt_fingerprint=hashlib.sha256(content.encode()).hexdigest()[:16],
+                is_active=True,
+                workspace_id=workspace_id,
+            ))
+
+
+def _copy_seed_winners(from_workspace_id: int, to_workspace_id: int) -> int:
+    """Copy seed winners from the source workspace to the new workspace.
+
+    Reads from the JSON winners file (data/winning_examples.json), filters
+    for entries where winner_reason == "seed" or source == "seed" or
+    manually_flagged is True, then inserts them as WinningExample DB rows
+    for the target workspace.
+
+    Returns the number of rows inserted.
+    """
+    from src.models import WinningExample
+    from src.content.winners import _load_json_array, _derive_winner_reason, WINNERS_PATH
+
+    items = _load_json_array(WINNERS_PATH)
+    seed_items = [
+        e for e in items
+        if _derive_winner_reason(e) == "seed"
+    ]
+
+    if not seed_items:
+        return 0
+
+    count = 0
+    with session_scope() as session:
+        for entry in seed_items:
+            content = entry.get("content") or {}
+            subject = (
+                content.get("subject") if isinstance(content, dict) else None
+            ) or entry.get("subject") or ""
+            body = (
+                content.get("body") if isinstance(content, dict) else None
+            ) or entry.get("body") or ""
+            session.add(WinningExample(
+                lead_context=entry.get("lead_context") or {},
+                subject=subject,
+                body=body,
+                reply_rate=float(entry.get("reply_rate") or 0.0),
+                manually_flagged=bool(entry.get("manually_flagged", False)),
+                workspace_id=to_workspace_id,
+            ))
+            count += 1
+
+    return count
+
+
+def create_workspace(
+    name: str,
+    slug: str,
+    instantly_campaign_id: str,
+    *,
+    instantly_api_key: str | None = None,
+    notes: str | None = None,
+    copy_prompts_from_workspace_id: int | None = None,
+    copy_seed_winners_from_workspace_id: int | None = None,
+) -> dict[str, Any]:
+    """Create a new workspace and return its full dict.
+
+    Validates all inputs, then creates the workspace row, optionally copies
+    prompt_configs and/or seed winners from another workspace.
+
+    Raises ValueError on validation failure (duplicate slug/name, bad slug
+    format, missing required fields).
+    """
+    name = (name or "").strip()
+    slug = (slug or "").strip()
+    instantly_campaign_id = (instantly_campaign_id or "").strip()
+
+    if not name:
+        raise ValueError("Workspace name is required.")
+    if not slug:
+        raise ValueError("Workspace slug is required.")
+    _validate_slug(slug)
+    if not instantly_campaign_id:
+        raise ValueError("Instantly campaign ID is required.")
+
+    with session_scope() as session:
+        dup_slug = session.execute(
+            select(Workspace).where(Workspace.slug == slug)
+        ).scalar_one_or_none()
+        if dup_slug is not None:
+            raise ValueError(f"A workspace with slug '{slug}' already exists.")
+
+        dup_name = session.execute(
+            select(Workspace).where(Workspace.name == name)
+        ).scalar_one_or_none()
+        if dup_name is not None:
+            raise ValueError(f"A workspace named '{name}' already exists.")
+
+        new_ws = Workspace(
+            name=name,
+            slug=slug,
+            is_default=False,
+            is_active=True,
+            instantly_campaign_id=instantly_campaign_id or None,
+            instantly_api_key=(instantly_api_key or "").strip() or None,
+            notes=(notes or "").strip() or None,
+        )
+        session.add(new_ws)
+        session.flush()
+        new_ws_id = new_ws.id
+        new_ws_dict = _row_to_dict(new_ws)
+
+    log.info(
+        "workspace_created",
+        extra={
+            "name": name,
+            "slug": slug,
+            "id": new_ws_id,
+            "copy_prompts": copy_prompts_from_workspace_id is not None,
+            "copy_winners": copy_seed_winners_from_workspace_id is not None,
+        },
+    )
+
+    if copy_prompts_from_workspace_id is not None:
+        try:
+            copied = _copy_prompt_configs(copy_prompts_from_workspace_id, new_ws_id)
+            log.info("workspace_prompts_copied", extra={"rows": copied, "to_workspace": new_ws_id})
+        except Exception as exc:
+            log.warning(
+                "workspace_prompt_copy_failed",
+                extra={"error": f"{type(exc).__name__}: {exc}"},
+            )
+    else:
+        try:
+            _seed_default_prompts_for_workspace(new_ws_id)
+        except Exception as exc:
+            log.warning(
+                "workspace_default_prompt_seed_failed",
+                extra={"error": f"{type(exc).__name__}: {exc}"},
+            )
+
+    if copy_seed_winners_from_workspace_id is not None:
+        try:
+            copied = _copy_seed_winners(copy_seed_winners_from_workspace_id, new_ws_id)
+            log.info("workspace_seed_winners_copied", extra={"rows": copied, "to_workspace": new_ws_id})
+        except Exception as exc:
+            log.warning(
+                "workspace_seed_winner_copy_failed",
+                extra={"error": f"{type(exc).__name__}: {exc}"},
+            )
+
+    return new_ws_dict

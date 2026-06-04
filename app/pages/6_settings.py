@@ -20,9 +20,11 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import streamlit as st
 
-from app.lib.workspace_state import get_current_workspace, get_current_workspace_id, render_workspace_banner
+from app.lib.workspace_state import get_current_workspace, get_current_workspace_id, render_workspace_banner, set_current_workspace
 from app.styles import inject_styles
 from src.workspace import (
+    create_workspace,
+    get_api_key_source,
     get_campaign_id_source,
     get_default_workspace,
     get_workspace_table_stats,
@@ -83,6 +85,13 @@ if _selected_ws:
     _sel_src = get_campaign_id_source(_selected_ws_id)
     sc3.metric("Campaign ID", _sel_campaign_id)
     sc4.metric("Campaign source", _sel_src)
+    # Second row: additional workspace details
+    sd1, sd2, sd3, sd4 = st.columns(4)
+    sd1.metric("Slug", _selected_ws.get("slug") or "—")
+    _api_key_src = get_api_key_source(_selected_ws_id)
+    sd2.metric("API key source", _api_key_src)
+    sd3.metric("Active", "Yes" if _selected_ws.get("is_active") else "No")
+    sd4.metric("Default", "Yes" if _selected_ws.get("is_default") else "No")
 
 with st.expander("Workspace foundation (read-only)", expanded=False):
     try:
@@ -140,6 +149,118 @@ with st.expander("Workspace foundation (read-only)", expanded=False):
             "Default workspace not found. The migration runs automatically on "
             "startup — refresh the page if this persists after a few seconds."
         )
+
+# ---------- Workspace management (Phase 4) ----------
+with st.expander("Workspace management", expanded=False):
+    st.markdown("**Create a new workspace**")
+    st.caption(
+        "Each workspace is fully isolated: separate leads, prompts, engagement "
+        "data, and Instantly campaign. OSP data is never affected."
+    )
+
+    with st.form("create_workspace_form", clear_on_submit=True):
+        _new_name = st.text_input(
+            "Workspace name *",
+            placeholder="Client A",
+            key="ws_new_name",
+            help="Required. Human-readable name shown in the workspace selector.",
+        )
+        _new_slug = st.text_input(
+            "Workspace slug *",
+            placeholder="client-a",
+            key="ws_new_slug",
+            help="Required. Lowercase letters, digits, hyphens, underscores. Must be unique.",
+        )
+        _new_campaign_id = st.text_input(
+            "Instantly campaign ID *",
+            placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+            key="ws_new_campaign_id",
+            help="Required. Used for engagement sync for this workspace.",
+        )
+        _new_api_key = st.text_input(
+            "Instantly API key (optional)",
+            placeholder="Leave blank to use the environment default",
+            key="ws_new_api_key",
+            type="password",
+            help="Optional. If blank, falls back to the INSTANTLY_API_KEY env var.",
+        )
+        _new_notes = st.text_area(
+            "Notes (optional)",
+            key="ws_new_notes",
+            height=70,
+            placeholder="Client name, account owner, campaign details…",
+        )
+        _copy_prompts = st.checkbox(
+            "Copy prompts from current workspace",
+            value=True,
+            key="ws_copy_prompts",
+            help=(
+                "Copies email, LinkedIn DM, and call-script prompts from the currently "
+                "selected workspace. Edits to the new workspace's prompts will NOT affect "
+                "the source workspace."
+            ),
+        )
+        _copy_winners = st.checkbox(
+            "Copy seed winners from current workspace",
+            value=False,
+            key="ws_copy_winners",
+            help=(
+                "Copies seed examples (winner_reason=seed) from the winners library. "
+                "Engagement winners, manual ratings, and positive-reply winners are NOT copied."
+            ),
+        )
+        _create_btn = st.form_submit_button("Create workspace", type="primary")
+
+    if _create_btn:
+        _src_ws_id = _selected_ws_id  # the currently selected workspace
+        _copy_prompts_from = _src_ws_id if _copy_prompts else None
+        _copy_winners_from = _src_ws_id if _copy_winners else None
+        try:
+            _new_ws = create_workspace(
+                name=_new_name,
+                slug=_new_slug,
+                instantly_campaign_id=_new_campaign_id,
+                instantly_api_key=_new_api_key or None,
+                notes=_new_notes or None,
+                copy_prompts_from_workspace_id=_copy_prompts_from,
+                copy_seed_winners_from_workspace_id=_copy_winners_from,
+            )
+            st.success(
+                f"Workspace **{_new_ws['name']}** created (ID {_new_ws['id']}). "
+                "Switching to it now…"
+            )
+            set_current_workspace(_new_ws["id"])
+            st.cache_data.clear()
+            st.rerun()
+        except ValueError as _ve:
+            st.error(str(_ve))
+        except Exception as _exc:
+            st.error(f"Workspace creation failed: {_exc}")
+
+    # Show existing workspaces in a compact table
+    st.divider()
+    st.markdown("**Existing workspaces**")
+    try:
+        import pandas as _pd
+        from src.workspace import get_active_workspaces as _gaw
+        _all_ws = _gaw()
+        if _all_ws:
+            _ws_rows = [
+                {
+                    "Name": ws.get("name") or "—",
+                    "Slug": ws.get("slug") or "—",
+                    "ID": ws.get("id"),
+                    "Default": "Yes" if ws.get("is_default") else "No",
+                    "Campaign ID": ws.get("instantly_campaign_id") or "—",
+                    "Created": str(ws.get("created_at") or "—")[:10],
+                }
+                for ws in _all_ws
+            ]
+            st.dataframe(_pd.DataFrame(_ws_rows), hide_index=True, use_container_width=True)
+        else:
+            st.caption(":gray[No workspaces found.]")
+    except Exception as _exc:
+        st.caption(f":gray[Could not load workspace list: {_exc}]")
 
 cfg = load_icp_config()
 

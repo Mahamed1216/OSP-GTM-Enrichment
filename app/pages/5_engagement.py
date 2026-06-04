@@ -120,8 +120,8 @@ def _reply_rate_cached(days: int, workspace_id: int | None = None) -> pd.DataFra
 
 
 @st.cache_data(ttl=15)
-def _winners_cached() -> list[dict]:
-    return list_all_winners()
+def _winners_cached(workspace_id: int | None = None) -> list[dict]:
+    return list_all_winners(workspace_id=workspace_id)
 
 
 @st.cache_data(ttl=15)
@@ -286,13 +286,31 @@ render_workspace_banner()
 
 # ---------- Sync controls ----------
 _snapshot = _instantly_snapshot_cached(workspace_id=_ws_id)
+
+# Phase 4: show workspace campaign context for safety
+_current_ws = None
+try:
+    from app.lib.workspace_state import get_current_workspace as _get_cw
+    from src.workspace import get_campaign_id_for_workspace as _get_cid, get_api_key_source as _get_aksrc
+    _current_ws = _get_cw()
+    if _current_ws:
+        _ws_campaign_id = _get_cid(_ws_id) or "—"
+        _ws_api_src = _get_aksrc(_ws_id)
+        st.info(
+            f"Current workspace: **{_current_ws.get('name')}**  "
+            f"·  Campaign ID: `{_ws_campaign_id}`  "
+            f"·  API key source: {_ws_api_src}"
+        )
+except Exception:
+    pass
+
 if _snapshot is not None:
     st.caption(
         f"Last synced from Instantly: {_format_timestamp(_snapshot.get('synced_at'))} "
         f"(weekdays 9 AM ET via GitHub Actions)."
     )
 else:
-    st.caption("Not yet synced from Instantly — hit the button below or wait for the 9 AM ET job.")
+    st.caption("No engagement data synced yet for this workspace — hit the button below or wait for the 9 AM ET job.")
 
 sync_col, promote_col = st.columns(2)
 with sync_col:
@@ -324,7 +342,7 @@ if sync_clicked:
     local_before = _local_sent_cached(workspace_id=_ws_id)
     try:
         with st.spinner("Syncing from Instantly…"):
-            analytics_result = run_async(sync_campaign_analytics())
+            analytics_result = run_async(sync_campaign_analytics(workspace_id=_ws_id))
             per_lead = run_async(sync_engagement())
     except CampaignAnalyticsMismatch as exc:
         sync_error = str(exc)
@@ -1227,8 +1245,8 @@ with _wc2:
 
 _render_library(
     "Winners library",
-    _winners_cached(),
-    empty_msg="No winners yet. Hit \"Promote winners now\" once engagement replies or thumbs-up ratings exist.",
+    _winners_cached(workspace_id=_ws_id),
+    empty_msg="No winners yet for this workspace. Hit \"Promote winners now\" once engagement replies or thumbs-up ratings exist.",
     key_prefix="eng_winners",
     set_active=set_winner_active,
     item_noun="winner",

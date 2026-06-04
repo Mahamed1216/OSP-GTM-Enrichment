@@ -131,17 +131,56 @@ def _entry_content_type(e: dict) -> str | None:
     return None
 
 
-def list_all_winners() -> list[dict]:
+def list_all_winners(workspace_id: int | None = None) -> list[dict]:
     """Full winners array with derived winner_reason added — for the library
     table where the operator needs to see active + inactive entries side by side.
 
+    Phase 4: when workspace_id is given and is not the default OSP workspace,
+    loads from the WinningExample DB table for that workspace instead of the
+    JSON file. This gives new workspaces an empty winners library by default.
+
     Does NOT mutate the file — winner_reason is derived inline for display only.
     """
+    if workspace_id is not None:
+        try:
+            from src.workspace import get_default_workspace_id
+            default_id = get_default_workspace_id()
+            if default_id is None or workspace_id != default_id:
+                return _list_db_winners(workspace_id)
+        except Exception:
+            pass
     items = _load_json_array(WINNERS_PATH)
     for item in items:
         if "winner_reason" not in item:
             item["winner_reason"] = _derive_winner_reason(item)
     return items
+
+
+def _list_db_winners(workspace_id: int) -> list[dict]:
+    """Load winners from WinningExample DB rows for a specific workspace."""
+    try:
+        from sqlalchemy import select
+        from src.db import session_scope
+        from src.models import WinningExample
+        with session_scope() as session:
+            rows = session.execute(
+                select(WinningExample).where(WinningExample.workspace_id == workspace_id)
+            ).scalars().all()
+            result = []
+            for row in rows:
+                result.append({
+                    "lead_context": row.lead_context or {},
+                    "subject": row.subject,
+                    "body": row.body,
+                    "reply_rate": row.reply_rate,
+                    "manually_flagged": row.manually_flagged,
+                    "winner_reason": "seed",
+                    "is_active": True,
+                })
+            return result
+    except Exception as exc:
+        log.warning("db_winners_load_failed", extra={"error": str(exc)})
+        return []
 
 
 def list_all_negatives() -> list[dict]:

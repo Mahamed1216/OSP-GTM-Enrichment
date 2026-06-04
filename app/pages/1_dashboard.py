@@ -89,6 +89,13 @@ except Exception as exc:
         "sent": 0, "replied": 0,
     }
 
+if kpis.get("leads_total", 0) == 0:
+    st.info(
+        "No leads yet in this workspace. "
+        "Go to **Run Pipeline** to import a CSV and start the enrichment pipeline."
+    )
+    st.stop()
+
 verified_emails = kpis["enriched"]  # enrichment success implies verified email
 try:
     ready_n = _ready_to_send_cached(workspace_id=_ws_id)

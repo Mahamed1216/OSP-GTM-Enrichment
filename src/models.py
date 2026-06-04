@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.db import Base
@@ -361,18 +361,27 @@ class PromptConfig(Base):
 
     Persisted in the DB (not data/prompts_config.json) so Streamlit Cloud
     deploys don't wipe overrides — local disk is ephemeral there. One row
-    per channel; saves upsert by channel.
+    per (channel, workspace_id) pair so each workspace has independent prompts.
 
     Audit columns (`prompt_version`, `prompt_fingerprint`, `updated_by`,
     `is_active`) are populated by `save_overlay` so the editor can show
     "Last saved by X at Y" and the experiment tracker can correlate
     GeneratedContent.prompt_fingerprint with the overlay that produced it.
+
+    Phase 4: unique constraint changed from (channel) to (channel, workspace_id)
+    so each workspace can have its own prompt for each channel.
     """
     __tablename__ = "prompt_configs"
+    __table_args__ = (
+        UniqueConstraint(
+            "channel", "workspace_id",
+            name="uq_prompt_configs_channel_workspace",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     channel: Mapped[str] = mapped_column(
-        String(32), unique=True, nullable=False, index=True
+        String(32), nullable=False, index=True
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(

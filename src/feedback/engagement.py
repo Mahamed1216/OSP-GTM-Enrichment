@@ -52,9 +52,10 @@ _POSITIVE_STATUS_STRS: frozenset[str] = frozenset({
 })
 
 
-def _auth_headers() -> dict[str, str]:
+def _auth_headers(api_key: str | None = None) -> dict[str, str]:
+    key = api_key or settings.instantly_api_key or ""
     return {
-        "Authorization": f"Bearer {settings.instantly_api_key}",
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
 
@@ -181,7 +182,7 @@ class CampaignAnalyticsMismatch(RuntimeError):
 
 
 @retry_api
-async def _fetch_campaigns_analytics_raw(campaign_id: str) -> Any:
+async def _fetch_campaigns_analytics_raw(campaign_id: str, api_key: str | None = None) -> Any:
     """Hit GET /api/v2/campaigns/analytics with the campaign filter.
 
     Instantly's docs name this param `id` (UUID or comma-separated list).
@@ -192,7 +193,7 @@ async def _fetch_campaigns_analytics_raw(campaign_id: str) -> Any:
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         resp = await client.get(
             f"{_API_BASE}/campaigns/analytics",
-            headers=_auth_headers(),
+            headers=_auth_headers(api_key),
             params={"id": campaign_id, "campaign_id": campaign_id},
         )
         resp.raise_for_status()
@@ -437,31 +438,36 @@ def _parse_analytics(raw: dict) -> dict:
     }
 
 
-async def sync_campaign_analytics() -> dict:
+async def sync_campaign_analytics(workspace_id: int | None = None) -> dict:
     """Pull analytics for the configured campaign only and persist a snapshot.
 
     Returns a dict combining the parsed metrics, the raw matched record,
     and a small debug bundle the UI can render to prove the snapshot is
     NOT an account-wide aggregate:
 
-      requested_campaign_id   — value of INSTANTLY_CAMPAIGN_ID
+      requested_campaign_id   — value of INSTANTLY_CAMPAIGN_ID (or workspace override)
       returned_campaign_ids   — every id Instantly handed back this call
       selected_campaign_id    — the id we matched and persisted
       selected_campaign_name  — campaign_name from the matched record
 
+    Phase 4: workspace_id is used to resolve campaign_id and api_key.
+    When workspace_id=None, falls back to env vars (backward compat).
+
     Raises CampaignAnalyticsMismatch (subclass of RuntimeError) if none
-    of the returned records matches the env var; the caller (script /
-    UI) should surface it as a hard failure so account-wide totals never
-    silently land in the KPI cards.
+    of the returned records matches the configured campaign id; the caller
+    (script / UI) should surface it as a hard failure so account-wide
+    totals never silently land in the KPI cards.
     """
-    campaign_id = settings.instantly_campaign_id
-    if not settings.instantly_api_key or not campaign_id:
+    from src.workspace import get_campaign_id_for_workspace, get_api_key_for_workspace
+    campaign_id = get_campaign_id_for_workspace(workspace_id) or settings.instantly_campaign_id
+    api_key = get_api_key_for_workspace(workspace_id) or settings.instantly_api_key
+    if not api_key or not campaign_id:
         raise RuntimeError(
-            "INSTANTLY_API_KEY or INSTANTLY_CAMPAIGN_ID not set — "
+            "Instantly API key or campaign ID not configured for this workspace — "
             "cannot sync campaign analytics"
         )
 
-    raw_full = await _fetch_campaigns_analytics_raw(campaign_id)
+    raw_full = await _fetch_campaigns_analytics_raw(campaign_id, api_key)
     if isinstance(raw_full, list):
         all_records = [r for r in raw_full if isinstance(r, dict)]
     elif isinstance(raw_full, dict):
@@ -563,14 +569,17 @@ async def sync_campaign_analytics() -> dict:
 
     snapshot_id: int
     synced_at = datetime.utcnow()
+    from src.workspace import get_default_workspace_id as _get_default_ws_id
+    _snapshot_workspace_id = workspace_id if workspace_id is not None else _get_default_ws_id()
     with session_scope() as session:
-        # Store the env-var campaign id (not the API-returned one) so the
+        # Store the configured campaign id (not the API-returned one) so the
         # snapshot is keyed by what the operator configured. The matched
         # record itself goes into `raw` for full audit.
         snapshot = InstantlyAnalyticsSnapshot(
             campaign_id=campaign_id,
             raw=matched or {},
             synced_at=synced_at,
+            workspace_id=_snapshot_workspace_id,
             **{k: v for k, v in parsed.items() if k in {
                 "leads_count", "contacted_count", "emails_sent_count",
                 "open_count", "unique_open_count", "reply_count",
