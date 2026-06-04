@@ -38,7 +38,9 @@ from src.icp_config import (
     IntentSignals,
     default_icp_config,
     load_icp_config,
+    load_workspace_icp_config,
     save_icp_config,
+    save_workspace_icp_config,
 )
 
 inject_styles()
@@ -55,11 +57,23 @@ def _joined(items: list[str]) -> str:
     return "\n".join(items or [])
 
 
-def _last_saved_caption(path: Path) -> str:
+def _last_saved_caption(path: Path, workspace_id: int | None = None) -> str:
+    # Check if the workspace has DB-stored settings (takes precedence over file).
+    if workspace_id is not None:
+        try:
+            from src.db import session_scope
+            from src.models import Workspace
+            with session_scope() as _s:
+                _ws = _s.get(Workspace, workspace_id)
+                if _ws is not None and _ws.icp_config is not None:
+                    ts_str = str(_ws.updated_at)[:19] if _ws.updated_at else "—"
+                    return f":gray[Last saved: {ts_str}]"
+        except Exception:
+            pass
     if not path.exists():
-        return ":gray[Config file not yet created — showing defaults.]"
+        return ":gray[Settings not yet saved for this workspace — showing defaults.]"
     ts = datetime.fromtimestamp(path.stat().st_mtime)
-    return f":gray[Last saved: {ts.strftime('%Y-%m-%d %H:%M:%S')}]"
+    return f":gray[Last saved: {ts.strftime('%Y-%m-%d %H:%M:%S')} (file)]"
 
 
 st.markdown(
@@ -69,7 +83,7 @@ st.markdown(
     '</div>',
     unsafe_allow_html=True,
 )
-st.write(_last_saved_caption(CONFIG_PATH))
+st.write(_last_saved_caption(CONFIG_PATH, workspace_id=get_current_workspace_id()))
 
 render_workspace_banner()
 
@@ -190,6 +204,15 @@ with st.expander("Workspace management", expanded=False):
             height=70,
             placeholder="Client name, account owner, campaign details…",
         )
+        _copy_settings = st.checkbox(
+            "Copy settings from current workspace",
+            value=False,
+            key="ws_copy_settings",
+            help=(
+                "Copies company, ICP, persona, and signal settings from the currently "
+                "selected workspace. If unchecked, the new workspace starts with blank settings."
+            ),
+        )
         _copy_prompts = st.checkbox(
             "Copy prompts from current workspace",
             value=True,
@@ -213,6 +236,7 @@ with st.expander("Workspace management", expanded=False):
 
     if _create_btn:
         _src_ws_id = _selected_ws_id  # the currently selected workspace
+        _copy_settings_from = _src_ws_id if _copy_settings else None
         _copy_prompts_from = _src_ws_id if _copy_prompts else None
         _copy_winners_from = _src_ws_id if _copy_winners else None
         try:
@@ -222,6 +246,7 @@ with st.expander("Workspace management", expanded=False):
                 instantly_campaign_id=_new_campaign_id,
                 instantly_api_key=_new_api_key or None,
                 notes=_new_notes or None,
+                copy_settings_from_workspace_id=_copy_settings_from,
                 copy_prompts_from_workspace_id=_copy_prompts_from,
                 copy_seed_winners_from_workspace_id=_copy_winners_from,
             )
@@ -262,7 +287,13 @@ with st.expander("Workspace management", expanded=False):
     except Exception as _exc:
         st.caption(f":gray[Could not load workspace list: {_exc}]")
 
-cfg = load_icp_config()
+cfg = load_workspace_icp_config(workspace_id=_selected_ws_id)
+
+_ws_caption = f"**{_selected_ws['name']}** · ID {_selected_ws['id']}" if _selected_ws else "selected workspace"
+st.info(
+    f"These settings apply only to the current workspace: {_ws_caption}. "
+    "Switching workspaces loads that workspace's own saved settings."
+)
 
 # ---------- Company ----------
 with st.expander("Company", expanded=True):
@@ -414,12 +445,13 @@ with st.expander("Demo / testing", expanded=False):
 # ---------- Save handlers ----------
 def _persist(updated: ICPConfig, label: str) -> None:
     try:
-        save_icp_config(updated)
-    except OSError as exc:
+        save_workspace_icp_config(updated, workspace_id=_selected_ws_id)
+    except Exception as exc:
         st.error(f"Failed to save {label}: {exc}")
         return
     st.cache_data.clear()
-    st.success(f"{label} saved.")
+    _ws_label = _selected_ws.get("name") if _selected_ws else "workspace"
+    st.success(f"Saved for workspace **{_ws_label}** — {label} saved.")
 
 
 if save_company:
@@ -503,8 +535,8 @@ with st.container(border=True):
             key="icp_reset_confirm",
         ):
             try:
-                save_icp_config(default_icp_config())
-            except OSError as exc:
+                save_workspace_icp_config(default_icp_config(), workspace_id=_selected_ws_id)
+            except Exception as exc:
                 st.error(f"Reset failed: {exc}")
                 st.session_state.pop(pending_key, None)
                 st.session_state.pop(pending_at_key, None)

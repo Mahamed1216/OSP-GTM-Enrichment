@@ -70,6 +70,8 @@ _RUNTIME_COLUMN_ADDS: list[tuple[str, str, str]] = [
     # FK to the snapshot a PromptRecommendation was based on, for staleness
     # detection when a newer sync arrives before the operator acts.
     ("prompt_recommendations", "analytics_snapshot_id", "INTEGER"),
+    # Phase 4 hotfix: workspace-scoped ICP/company settings on the workspace row.
+    ("workspaces", "icp_config", "JSON"),
     # Phase 2: workspace_id added to every workspace-scoped table.
     # Nullable so existing rows survive migration; backfilled to the default
     # OSP workspace by backfill_default_workspace_ids() called from init_db().
@@ -210,9 +212,14 @@ def init_db() -> None:
         Base.metadata.create_all(engine)
         _apply_runtime_migrations()
         # Lazy imports avoid circular dependency: src.workspace imports src.db.
-        from src.workspace import backfill_default_workspace_ids, seed_default_workspace
+        from src.workspace import (
+            backfill_default_workspace_ids,
+            backfill_osp_icp_config,
+            seed_default_workspace,
+        )
         seed_default_workspace()
         backfill_default_workspace_ids()
+        backfill_osp_icp_config()
     except Exception:
         _db_initialized = False  # Allow the next caller to retry.
         raise

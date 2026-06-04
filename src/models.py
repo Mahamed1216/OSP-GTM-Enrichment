@@ -71,6 +71,12 @@ class Workspace(Base):
     instantly_campaign_id: Mapped[Optional[str]] = mapped_column(String(128))
     instantly_api_key: Mapped[Optional[str]] = mapped_column(String(256))
     notes: Mapped[Optional[str]] = mapped_column(Text)
+    # Phase 4 hotfix: workspace-scoped ICP/company settings stored as JSON.
+    # NULL means "not yet saved — fall back to file or code defaults".
+    # Populated on first save from the Settings page, or at startup by
+    # backfill_osp_icp_config() which seeds the OSP workspace from the
+    # existing data/icp_config.json file so OSP settings are never lost.
+    icp_config: Mapped[Optional[dict]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=now_utc, onupdate=now_utc, nullable=False

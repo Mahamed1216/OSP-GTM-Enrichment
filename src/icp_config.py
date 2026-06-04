@@ -1,9 +1,14 @@
 """ICP configuration — user-editable JSON config that feeds scoring,
 content generation, and Tavily news queries.
 
-Singleton file at ``data/icp_config.json``. Loaded once per pipeline run
-and threaded through downstream consumers so a mid-run save never
-splits a single lead's outputs across two configs.
+Phase 4 hotfix: ICP config is now stored per workspace in the `workspaces.icp_config`
+JSON column. The Settings page reads/writes from the DB via `load_workspace_icp_config`
+and `save_workspace_icp_config`. Content generators and scoring still use the file-based
+`load_icp_config()` so they are unchanged.
+
+Singleton file at ``data/icp_config.json``. Still used as:
+  1. Seed source for the OSP workspace on first startup (backfill_osp_icp_config).
+  2. Fallback for content generators / scoring until they are workspace-aware (Phase 5).
 
 Atomic write on save (tmp + os.replace) so a concurrent reader never
 sees a half-written file. Falls back to ``default_icp_config()`` when
@@ -205,3 +210,70 @@ def render_icp_block(cfg: ICPConfig) -> str:
         "Disqualifiers (mark these leads as poor fit — DO NOT target):\n"
         f"{_bullets(cfg.signals.disqualifiers)}\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 hotfix: workspace-scoped load / save
+# ---------------------------------------------------------------------------
+
+def load_workspace_icp_config(workspace_id=None):
+    try:
+        from src.db import session_scope
+        from src.models import Workspace
+        _ws_id = workspace_id
+        if _ws_id is None:
+            from src.workspace import get_default_workspace_id
+            _ws_id = get_default_workspace_id()
+        if _ws_id is not None:
+            with session_scope() as session:
+                ws = session.get(Workspace, _ws_id)
+                if ws is not None and ws.icp_config:
+                    try:
+                        return ICPConfig.model_validate(ws.icp_config)
+                    except Exception as exc:
+                        log.warning("workspace_icp_config_invalid", extra={"workspace_id": _ws_id, "error": str(exc)})
+        try:
+            from src.workspace import get_default_workspace_id as _gd
+            default_id = _gd()
+        except Exception:
+            default_id = None
+        if _ws_id is not None and _ws_id == default_id:
+            return load_icp_config()
+    except Exception as exc:
+        log.warning("load_workspace_icp_config_failed", extra={"workspace_id": workspace_id, "error": f"{type(exc).__name__}: {exc}"})
+    return default_icp_config()
+
+
+def save_workspace_icp_config(cfg, workspace_id=None):
+    from src.db import session_scope
+    from src.models import Workspace
+    _ws_id = workspace_id
+    if _ws_id is None:
+        from src.workspace import get_default_workspace_id
+        _ws_id = get_default_workspace_id()
+    if _ws_id is None:
+        raise RuntimeError("No workspace to save settings to.")
+    with session_scope() as session:
+        ws = session.get(Workspace, _ws_id)
+        if ws is None:
+            raise ValueError(f"Workspace {_ws_id} not found.")
+        ws.icp_config = cfg.model_dump()
+    # Write-through for the default workspace so file-based pipeline stays in sync.
+    # Skipped in SQLite (test) environments to avoid polluting test artifacts.
+    try:
+        from src.db import engine as _engine
+        from src.workspace import get_default_workspace_id as _gd
+        if _ws_id == _gd() and _engine.dialect.name != "sqlite":
+            save_icp_config(cfg)
+    except Exception as exc:
+        log.warning("icp_config_file_write_through_failed", extra={"workspace_id": _ws_id, "error": f"{type(exc).__name__}: {exc}"})
+
+
+def copy_workspace_icp_config(from_workspace_id, to_workspace_id):
+    try:
+        cfg = load_workspace_icp_config(from_workspace_id)
+        save_workspace_icp_config(cfg, to_workspace_id)
+        return True
+    except Exception as exc:
+        log.warning("copy_workspace_icp_config_failed", extra={"from": from_workspace_id, "to": to_workspace_id, "error": str(exc)})
+        return False

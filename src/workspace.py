@@ -143,6 +143,36 @@ def seed_default_workspace() -> None:
     )
 
 
+def backfill_osp_icp_config() -> bool:
+    """Seed the default workspace's icp_config column from data/icp_config.json.
+
+    Idempotent — only runs when workspace.icp_config IS NULL. Ensures existing
+    OSP settings survive the Phase 4 hotfix deploy without manual re-entry.
+    Returns True if backfill happened, False if skipped (already set or no file).
+    """
+    try:
+        default_id = get_default_workspace_id()
+        if default_id is None:
+            return False
+        with session_scope() as session:
+            ws = session.get(Workspace, default_id)
+            if ws is None or ws.icp_config is not None:
+                return False  # already populated or workspace not found
+            import src.icp_config as _icp_mod
+            if not _icp_mod.CONFIG_PATH.exists():
+                return False
+            cfg = _icp_mod.load_icp_config(_icp_mod.CONFIG_PATH)
+            ws.icp_config = cfg.model_dump()
+        log.info("backfill_osp_icp_config_done", extra={"workspace_id": default_id})
+        return True
+    except Exception as exc:
+        log.warning(
+            "backfill_osp_icp_config_failed",
+            extra={"error": f"{type(exc).__name__}: {exc}"},
+        )
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Lookups — all return plain dicts so callers never touch detached ORM objects.
 # ---------------------------------------------------------------------------
@@ -645,6 +675,7 @@ def create_workspace(
     notes: str | None = None,
     copy_prompts_from_workspace_id: int | None = None,
     copy_seed_winners_from_workspace_id: int | None = None,
+    copy_settings_from_workspace_id: int | None = None,
 ) -> dict[str, Any]:
     """Create a new workspace and return its full dict.
 
@@ -701,8 +732,20 @@ def create_workspace(
             "id": new_ws_id,
             "copy_prompts": copy_prompts_from_workspace_id is not None,
             "copy_winners": copy_seed_winners_from_workspace_id is not None,
+            "copy_settings": copy_settings_from_workspace_id is not None,
         },
     )
+
+    if copy_settings_from_workspace_id is not None:
+        try:
+            from src.icp_config import copy_workspace_icp_config
+            copy_workspace_icp_config(copy_settings_from_workspace_id, new_ws_id)
+            log.info("workspace_settings_copied", extra={"to_workspace": new_ws_id})
+        except Exception as exc:
+            log.warning(
+                "workspace_settings_copy_failed",
+                extra={"error": f"{type(exc).__name__}: {exc}"},
+            )
 
     if copy_prompts_from_workspace_id is not None:
         try:
