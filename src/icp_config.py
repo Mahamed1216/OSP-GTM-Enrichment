@@ -26,7 +26,12 @@ from pydantic import BaseModel, Field, ValidationError
 
 log = logging.getLogger(__name__)
 
-CONFIG_PATH = Path("data/icp_config.json")
+# Resolved relative to the repo root (parent of the src/ directory).
+# Using an absolute path avoids working-directory sensitivity on Streamlit Cloud.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+CONFIG_PATH = _REPO_ROOT / "data" / "icp_config.json"
+# Legacy relative form kept as backup for callers that override path= explicitly.
+_CONFIG_PATH_RELATIVE = Path("data/icp_config.json")
 
 
 class CompanyProfile(BaseModel):
@@ -277,3 +282,29 @@ def copy_workspace_icp_config(from_workspace_id, to_workspace_id):
     except Exception as exc:
         log.warning("copy_workspace_icp_config_failed", extra={"from": from_workspace_id, "to": to_workspace_id, "error": str(exc)})
         return False
+
+
+def is_default_icp_config(cfg_dict: dict) -> bool:
+    """Return True if cfg_dict matches the hardcoded default_icp_config() exactly.
+
+    Used by backfill logic to detect configs that were accidentally seeded
+    with defaults and should be overwritten with real data from the file.
+    """
+    try:
+        stored = ICPConfig.model_validate(cfg_dict)
+        return stored == default_icp_config()
+    except Exception:
+        return False
+
+
+def _resolve_config_path() -> Path:
+    """Return the best available path to icp_config.json.
+
+    Tries the absolute module-relative path first; falls back to the
+    relative path for any caller that sets CONFIG_PATH to a custom value.
+    """
+    if CONFIG_PATH.exists():
+        return CONFIG_PATH
+    if _CONFIG_PATH_RELATIVE.exists():
+        return _CONFIG_PATH_RELATIVE
+    return CONFIG_PATH  # return canonical even if absent so callers can check .exists()

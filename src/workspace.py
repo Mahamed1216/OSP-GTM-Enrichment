@@ -143,27 +143,70 @@ def seed_default_workspace() -> None:
     )
 
 
-def backfill_osp_icp_config() -> bool:
+def backfill_osp_icp_config(force: bool = False) -> bool:
     """Seed the default workspace's icp_config column from data/icp_config.json.
 
-    Idempotent — only runs when workspace.icp_config IS NULL. Ensures existing
-    OSP settings survive the Phase 4 hotfix deploy without manual re-entry.
-    Returns True if backfill happened, False if skipped (already set or no file).
+    Rules (in order):
+      1. If the file does not exist: return False (nothing to restore).
+      2. If workspace.icp_config IS NULL: always backfill.
+      3. If workspace.icp_config equals the hardcoded code defaults: backfill
+         (those defaults were written accidentally; real OSP data lives in the file).
+      4. If workspace.icp_config is non-NULL and non-default: skip unless force=True.
+
+    When force=True: always overwrite, regardless of current DB value.
+
+    Returns True if backfill happened, False if skipped.
+    Logs both the old and new company.name so the change is auditable.
     """
     try:
+        import src.icp_config as _icp_mod
+        config_path = _icp_mod._resolve_config_path()
+        if not config_path.exists():
+            log.warning("backfill_osp_icp_config_skipped", extra={"reason": "file_not_found", "path": str(config_path)})
+            return False
+
+        file_cfg = _icp_mod.load_icp_config(config_path)
+        file_dict = file_cfg.model_dump()
+
         default_id = get_default_workspace_id()
         if default_id is None:
             return False
+
         with session_scope() as session:
             ws = session.get(Workspace, default_id)
-            if ws is None or ws.icp_config is not None:
-                return False  # already populated or workspace not found
-            import src.icp_config as _icp_mod
-            if not _icp_mod.CONFIG_PATH.exists():
+            if ws is None:
                 return False
-            cfg = _icp_mod.load_icp_config(_icp_mod.CONFIG_PATH)
-            ws.icp_config = cfg.model_dump()
-        log.info("backfill_osp_icp_config_done", extra={"workspace_id": default_id})
+
+            old_name = None
+            should_backfill = force
+
+            if ws.icp_config is None:
+                should_backfill = True
+            elif _icp_mod.is_default_icp_config(ws.icp_config):
+                # Stored value is just code defaults — real data lives in the file.
+                should_backfill = True
+                old_name = ws.icp_config.get("company", {}).get("name", "—")
+            else:
+                old_name = ws.icp_config.get("company", {}).get("name", "—")
+
+            if not should_backfill:
+                log.info(
+                    "backfill_osp_icp_config_skipped",
+                    extra={"reason": "already_set", "company_name": old_name},
+                )
+                return False
+
+            ws.icp_config = file_dict
+
+        log.info(
+            "backfill_osp_icp_config_done",
+            extra={
+                "workspace_id": default_id,
+                "old_company_name": old_name,
+                "new_company_name": file_cfg.company.name,
+                "forced": force,
+            },
+        )
         return True
     except Exception as exc:
         log.warning(
@@ -171,6 +214,48 @@ def backfill_osp_icp_config() -> bool:
             extra={"error": f"{type(exc).__name__}: {exc}"},
         )
         return False
+
+
+def restore_osp_from_legacy_config() -> dict[str, Any]:
+    """Read data/icp_config.json and return a restore payload for the Settings page.
+
+    Returns:
+      {
+        "file_path": str,
+        "file_exists": bool,
+        "file_company_name": str,
+        "current_db_company_name": str | None,
+        "config": dict | None,   # the raw ICPConfig dict from the file
+      }
+
+    Call backfill_osp_icp_config(force=True) to actually apply.
+    """
+    import src.icp_config as _icp_mod
+    config_path = _icp_mod._resolve_config_path()
+    result: dict[str, Any] = {
+        "file_path": str(config_path),
+        "file_exists": config_path.exists(),
+        "file_company_name": None,
+        "current_db_company_name": None,
+        "config": None,
+    }
+
+    if config_path.exists():
+        try:
+            cfg = _icp_mod.load_icp_config(config_path)
+            result["file_company_name"] = cfg.company.name
+            result["config"] = cfg.model_dump()
+        except Exception as exc:
+            result["file_company_name"] = f"error: {exc}"
+
+    default_id = get_default_workspace_id()
+    if default_id is not None:
+        with session_scope() as session:
+            ws = session.get(Workspace, default_id)
+            if ws is not None and ws.icp_config:
+                result["current_db_company_name"] = ws.icp_config.get("company", {}).get("name")
+
+    return result
 
 
 # ---------------------------------------------------------------------------

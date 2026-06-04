@@ -23,11 +23,14 @@ import streamlit as st
 from app.lib.workspace_state import get_current_workspace, get_current_workspace_id, render_workspace_banner, set_current_workspace
 from app.styles import inject_styles
 from src.workspace import (
+    backfill_osp_icp_config,
     create_workspace,
     get_api_key_source,
     get_campaign_id_source,
     get_default_workspace,
+    get_default_workspace_id,
     get_workspace_table_stats,
+    restore_osp_from_legacy_config,
 )
 from src.icp_config import (
     CONFIG_PATH,
@@ -546,3 +549,95 @@ with st.container(border=True):
                 st.cache_data.clear()
                 st.success("ICP config reset to defaults.")
                 st.rerun()
+
+# ---------- Restore from legacy config (OSP workspace only) ----------
+_default_ws_id = get_default_workspace_id()
+if _selected_ws_id is not None and _selected_ws_id == _default_ws_id:
+    st.divider()
+    with st.container(border=True):
+        st.markdown("**Restore OSP settings from legacy config file**")
+        st.caption(
+            "If OSP settings were lost or replaced during migration, this reads the "
+            "committed `data/icp_config.json` file and writes it back to the OSP workspace. "
+            "Only affects the OSP workspace. Preview is shown before applying."
+        )
+
+        _restore_preview_key = "restore_legacy_preview_open"
+        _restore_confirm_key = "restore_legacy_confirm_pending"
+        _restore_confirm_at_key = "restore_legacy_confirm_at"
+        _RESTORE_TTL = 15.0
+
+        if not st.session_state.get(_restore_preview_key, False):
+            if st.button("Preview legacy config", key="restore_legacy_preview_btn", type="secondary"):
+                st.session_state[_restore_preview_key] = True
+                st.rerun()
+        else:
+            try:
+                _restore_info = restore_osp_from_legacy_config()
+            except Exception as _exc:
+                st.error(f"Could not read legacy config: {_exc}")
+                _restore_info = None
+
+            if _restore_info:
+                if not _restore_info["file_exists"]:
+                    st.warning(
+                        f"Legacy config file not found at: `{_restore_info['file_path']}`  \n"
+                        "Nothing to restore."
+                    )
+                    st.session_state.pop(_restore_preview_key, None)
+                else:
+                    _file_name = _restore_info.get("file_company_name") or "—"
+                    _db_name = _restore_info.get("current_db_company_name") or "(not set)"
+                    st.markdown(
+                        f"**File company name:** `{_file_name}`  \n"
+                        f"**Current DB company name:** `{_db_name}`"
+                    )
+                    if _restore_info.get("config"):
+                        with st.expander("Preview full legacy config", expanded=False):
+                            import json as _json_mod
+                            st.code(_json_mod.dumps(_restore_info["config"], indent=2), language="json")
+
+                    _restore_pending = st.session_state.get(_restore_confirm_key, False)
+                    _restore_at = float(st.session_state.get(_restore_confirm_at_key, 0.0))
+                    if _restore_pending and (time.monotonic() - _restore_at) > _RESTORE_TTL:
+                        _restore_pending = False
+                        st.session_state[_restore_confirm_key] = False
+                        st.caption(":gray[Restore confirmation expired.]")
+
+                    rc1, rc2 = st.columns(2)
+                    with rc1:
+                        if not _restore_pending:
+                            if st.button(
+                                "Restore OSP settings from file",
+                                key="restore_legacy_apply_btn",
+                                type="primary",
+                            ):
+                                st.session_state[_restore_confirm_key] = True
+                                st.session_state[_restore_confirm_at_key] = time.monotonic()
+                                st.rerun()
+                        else:
+                            if st.button(
+                                "Confirm restore — this overwrites current OSP settings",
+                                key="restore_legacy_confirm_btn",
+                                type="primary",
+                            ):
+                                try:
+                                    backfill_osp_icp_config(force=True)
+                                except Exception as _exc:
+                                    st.error(f"Restore failed: {_exc}")
+                                else:
+                                    st.session_state.pop(_restore_preview_key, None)
+                                    st.session_state.pop(_restore_confirm_key, None)
+                                    st.session_state.pop(_restore_confirm_at_key, None)
+                                    st.cache_data.clear()
+                                    st.success(
+                                        f"OSP settings restored from file. "
+                                        f"Company name: **{_file_name}**"
+                                    )
+                                    st.rerun()
+                    with rc2:
+                        if st.button("Cancel", key="restore_legacy_cancel_btn", type="secondary"):
+                            st.session_state.pop(_restore_preview_key, None)
+                            st.session_state.pop(_restore_confirm_key, None)
+                            st.session_state.pop(_restore_confirm_at_key, None)
+                            st.rerun()

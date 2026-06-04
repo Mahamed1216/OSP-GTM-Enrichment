@@ -36,7 +36,8 @@
       "Bash(py -m pytest tests/test_workspace_phase3.py::TestLeadSelectorWorkspaceFilter -v)",
       "Bash(py -m pytest tests/test_workspace_phase4.py -q --tb=short)",
       "Bash(py -m pytest tests/ -q --ignore=tests/test_llm_live.py --ignore=tests/test_ingest_writer.py --tb=short)",
-      "Bash(py *)"
+      "Bash(py *)",
+      "Bash(git checkout *)"
     ]
   }
 }

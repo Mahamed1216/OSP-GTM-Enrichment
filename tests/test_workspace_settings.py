@@ -30,6 +30,7 @@ from src.workspace import (
     backfill_osp_icp_config,
     create_workspace,
     get_default_workspace_id,
+    restore_osp_from_legacy_config,
     seed_default_workspace,
 )
 
@@ -213,40 +214,158 @@ class TestPromptsUnaffectedBySettings:
 
 
 # ---------------------------------------------------------------------------
+# Helpers for file-based tests
+# ---------------------------------------------------------------------------
+
+def _write_fake_cfg(path, name: str) -> None:
+    """Write a fake ICP config with a distinctive company name to a file."""
+    cfg = default_icp_config()
+    cfg.company.name = name
+    cfg.company.one_liner = f"One-liner for {name}"
+    cfg.company.value_props = [f"Value prop from {name}"]
+    path.write_text(cfg.model_dump_json(indent=2), encoding="utf-8")
+
+
+def _patch_config_path(monkeypatch, path):
+    """Patch both CONFIG_PATH and _CONFIG_PATH_RELATIVE in src.icp_config."""
+    import src.icp_config as _m
+    monkeypatch.setattr(_m, "CONFIG_PATH", path)
+    monkeypatch.setattr(_m, "_CONFIG_PATH_RELATIVE", path)
+
+
+# ---------------------------------------------------------------------------
 # 9. Backfill from file preserves OSP settings
 # ---------------------------------------------------------------------------
 
 class TestBackfillOspIcpConfig:
-    def test_backfill_reads_from_file_when_db_column_null(self, tmp_path):
-        import json
+    def test_backfill_reads_from_file_when_db_column_null(self, tmp_path, monkeypatch):
         osp_id = _seed_osp()
-
-        fake_cfg = default_icp_config()
-        fake_cfg.company.name = "Backfill OSP Name"
         config_file = tmp_path / "icp_config.json"
-        config_file.write_text(fake_cfg.model_dump_json(indent=2), encoding="utf-8")
+        _write_fake_cfg(config_file, "Backfill OSP Name")
+        _patch_config_path(monkeypatch, config_file)
 
-        # Patch CONFIG_PATH to point to our tmp file.
-        import src.icp_config as _icp_mod
-        original = _icp_mod.CONFIG_PATH
-        _icp_mod.CONFIG_PATH = config_file
-        try:
-            result = backfill_osp_icp_config()
-            assert result is True
-            loaded = load_workspace_icp_config(workspace_id=osp_id)
-            assert loaded.company.name == "Backfill OSP Name"
-        finally:
-            _icp_mod.CONFIG_PATH = original
-
-    def test_backfill_is_no_op_when_already_set(self):
-        osp_id = _seed_osp()
-        save_workspace_icp_config(_make_osp_cfg("Already Set"), workspace_id=osp_id)
         result = backfill_osp_icp_config()
-        assert result is False  # skipped because column is already populated
+        assert result is True
 
-        # Value should remain unchanged
         loaded = load_workspace_icp_config(workspace_id=osp_id)
-        assert loaded.company.name == "Already Set"
+        assert loaded.company.name == "Backfill OSP Name"
+
+    def test_backfill_skips_when_real_data_already_set(self, monkeypatch):
+        osp_id = _seed_osp()
+        save_workspace_icp_config(_make_osp_cfg("Real OSP Data"), workspace_id=osp_id)
+        result = backfill_osp_icp_config()
+        assert result is False
+
+        loaded = load_workspace_icp_config(workspace_id=osp_id)
+        assert loaded.company.name == "Real OSP Data"
+
+    def test_backfill_overwrites_defaults_with_file_data(self, tmp_path, monkeypatch):
+        """If DB has only code defaults, treat as not-yet-set and backfill from file."""
+        osp_id = _seed_osp()
+        # Store code defaults in DB (simulates accidental seeding with defaults).
+        from src.models import Workspace
+        with session_scope() as session:
+            ws = session.get(Workspace, osp_id)
+            ws.icp_config = default_icp_config().model_dump()
+
+        config_file = tmp_path / "icp_config.json"
+        _write_fake_cfg(config_file, "Real OSP From File")
+        _patch_config_path(monkeypatch, config_file)
+
+        result = backfill_osp_icp_config()
+        assert result is True
+
+        loaded = load_workspace_icp_config(workspace_id=osp_id)
+        assert loaded.company.name == "Real OSP From File"
+
+    def test_backfill_force_overwrites_real_data(self, tmp_path, monkeypatch):
+        """force=True always overwrites even when non-default data is present."""
+        osp_id = _seed_osp()
+        save_workspace_icp_config(_make_osp_cfg("Old Real Data"), workspace_id=osp_id)
+
+        config_file = tmp_path / "icp_config.json"
+        _write_fake_cfg(config_file, "Forced New Data")
+        _patch_config_path(monkeypatch, config_file)
+
+        result = backfill_osp_icp_config(force=True)
+        assert result is True
+
+        loaded = load_workspace_icp_config(workspace_id=osp_id)
+        assert loaded.company.name == "Forced New Data"
+
+    def test_backfill_skips_when_file_missing(self, tmp_path, monkeypatch):
+        osp_id = _seed_osp()
+        missing_file = tmp_path / "does_not_exist.json"
+        _patch_config_path(monkeypatch, missing_file)
+
+        result = backfill_osp_icp_config()
+        assert result is False
+
+    def test_backfill_does_not_affect_other_workspaces(self, tmp_path, monkeypatch):
+        osp_id = _seed_osp()
+        other_ws = create_workspace(name="Other WS BF", slug="other-ws-bf", instantly_campaign_id="c-bf")
+        save_workspace_icp_config(_make_client_cfg("Other Corp"), workspace_id=other_ws["id"])
+
+        config_file = tmp_path / "icp_config.json"
+        _write_fake_cfg(config_file, "OSP From File BF")
+        _patch_config_path(monkeypatch, config_file)
+
+        backfill_osp_icp_config()
+        other_loaded = load_workspace_icp_config(workspace_id=other_ws["id"])
+        assert other_loaded.company.name == "Other Corp"
+
+
+# ---------------------------------------------------------------------------
+# Restore from legacy config
+# ---------------------------------------------------------------------------
+
+class TestRestoreOspFromLegacyConfig:
+    def test_restore_reads_file_content(self, tmp_path, monkeypatch):
+        osp_id = _seed_osp()
+        save_workspace_icp_config(_make_osp_cfg("Current DB Data"), workspace_id=osp_id)
+
+        config_file = tmp_path / "icp_config.json"
+        _write_fake_cfg(config_file, "Legacy File Data")
+        _patch_config_path(monkeypatch, config_file)
+
+        info = restore_osp_from_legacy_config()
+        assert info["file_exists"] is True
+        assert info["file_company_name"] == "Legacy File Data"
+        assert info["current_db_company_name"] == "Current DB Data"
+
+    def test_restore_reports_file_missing(self, tmp_path, monkeypatch):
+        _seed_osp()
+        missing = tmp_path / "no_file.json"
+        _patch_config_path(monkeypatch, missing)
+        info = restore_osp_from_legacy_config()
+        assert info["file_exists"] is False
+        assert info["config"] is None
+
+    def test_restore_force_applies_file_data(self, tmp_path, monkeypatch):
+        osp_id = _seed_osp()
+        save_workspace_icp_config(_make_osp_cfg("Old DB"), workspace_id=osp_id)
+
+        config_file = tmp_path / "icp_config.json"
+        _write_fake_cfg(config_file, "Restored From File")
+        _patch_config_path(monkeypatch, config_file)
+
+        backfill_osp_icp_config(force=True)
+        loaded = load_workspace_icp_config(workspace_id=osp_id)
+        assert loaded.company.name == "Restored From File"
+
+    def test_restore_only_affects_osp(self, tmp_path, monkeypatch):
+        osp_id = _seed_osp()
+        other_ws = create_workspace(name="Other RS", slug="other-rs", instantly_campaign_id="c-rs")
+        save_workspace_icp_config(_make_client_cfg("Other Client RS"), workspace_id=other_ws["id"])
+
+        config_file = tmp_path / "icp_config.json"
+        _write_fake_cfg(config_file, "OSP Restored")
+        _patch_config_path(monkeypatch, config_file)
+
+        backfill_osp_icp_config(force=True)
+
+        other_loaded = load_workspace_icp_config(workspace_id=other_ws["id"])
+        assert other_loaded.company.name == "Other Client RS"
 
 
 # ---------------------------------------------------------------------------

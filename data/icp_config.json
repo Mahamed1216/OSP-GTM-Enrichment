@@ -1,84 +1,144 @@
 {
   "company": {
-    "name": "Changed After Copy",
-    "one_liner": "OSP outbound",
+    "name": "Outbound Sales Pro",
+    "one_liner": "Outsourced SDR agency that fills B2B pipeline through multi-channel outbound (email, LinkedIn, cold calls, web visitor ID) — qualified meetings on your calendar at a fraction of the cost of an in-house SDR hire.",
     "value_props": [
-      "OSP value prop 1"
+      "Qualified meetings booked directly onto your calendar — no managing SDRs",
+      "Reply rates 4.5x above industry average via Parakeet email infrastructure",
+      "Multi-channel outreach (email + LinkedIn + cold calls + web visitor ID) yields 3-5x more live conversations than single-channel",
+      "First meetings within 2-4 weeks of ramp; results compound from there",
+      "60-second SLA on real-time intro calls when a prospect lands on your site (35% conversion rate)",
+      "Pipeline at a fraction of the cost of a single $80-120k SDR hire — no headcount risk, no 6-month ramp",
+      "Market validation built in: every campaign surfaces objections, messaging signals, and ICP refinements you can use across GTM"
     ],
     "differentiators": [
-      "OSP differentiator"
+      "Proprietary Parakeet email infrastructure — deliverability protection at scale",
+      "Human callers blended with AI-assisted research and prioritization",
+      "Website visitor de-anonymization plus 60-second human follow-up call",
+      "G2 5.0 rated; 9+ month average client tenure",
+      "1 in 4 clients expand their investment within 6 months",
+      "Hundreds of qualified demos booked weekly across the book"
     ]
   },
   "icp": {
     "target_industries": [
       "B2B SaaS",
-      "Data/AI",
-      "Fintech",
-      "Cloud",
       "DevTools",
-      "Healthtech"
+      "Cybersecurity",
+      "Fintech",
+      "AI / ML",
+      "MarTech",
+      "Managed Services (MSPs)",
+      "IT Services",
+      "B2B Real Estate Tech",
+      "Recruiting Tech",
+      "Sales Tech"
     ],
     "target_company_sizes": [
-      "50-2000 employees"
+      "10-100 employees"
     ],
     "target_geographies": [
-      "<edit me in Settings>"
+      "United States",
+      "Canada"
     ],
     "target_tech_stack_signals": [
-      "<edit me in Settings>"
+      "Salesforce or HubSpot CRM",
+      "Apollo or ZoomInfo",
+      "Outreach or Salesloft",
+      "Calendly or Chili Piper",
+      "LinkedIn Sales Navigator",
+      "Instantly, Smartlead, or Parakeet (tried DIY cold email)"
     ],
     "target_company_stages": [
-      "Series B",
-      "Series C",
-      "Series D",
-      "stable mid-market"
+      "Bootstrapped with revenue",
+      "Pre-seed",
+      "Seed",
+      "Series A"
     ]
   },
   "persona": {
     "target_titles": [
-      "Sales leaders",
-      "RevOps leaders",
-      "Growth leaders",
-      "Marketing leaders",
-      "VPs",
-      "CROs",
-      "Heads",
-      "Directors"
+      "Founder",
+      "Co-founder",
+      "CEO",
+      "Founder & CEO",
+      "Founding CEO",
+      "President",
+      "VP Sales",
+      "Head of Sales",
+      "Chief Revenue Officer"
     ],
     "seniority_levels": [
+      "Founder",
+      "C-Suite",
       "VP",
-      "Director",
       "Head"
     ],
     "departments": [
+      "Executive / Leadership",
       "Sales",
-      "RevOps",
-      "Growth",
-      "Marketing"
+      "Revenue",
+      "Growth"
     ],
     "top_pain_points": [
-      "data fragmentation",
-      "outbound efficiency",
-      "rep ramp",
-      "pipeline visibility",
-      "CRM hygiene"
+      "Pipeline is unpredictable — relying on referrals and inbound that don't scale",
+      "Can't justify an $80-120k SDR hire with 6-month ramp and high attrition risk",
+      "Founder is doing sales themselves and it's not their zone of genius",
+      "Tried DIY cold email and either burned the domain, got no replies, or both",
+      "Existing AEs have no pipeline to work",
+      "Board / investor pressure to grow but no clear plan to get there",
+      "Marketing generates some leads but nobody is qualifying or following up systematically"
     ],
     "common_objections": [
-      "<edit me in Settings>"
+      "We've tried outsourced SDRs before and they sent generic spam",
+      "Nobody will understand our product as well as we do",
+      "I'd rather hire in-house so I own the talent and process",
+      "Cold outbound is dead — nobody opens these emails anymore",
+      "We're too early — still figuring out our ICP",
+      "Too expensive for where we are right now",
+      "Don't want to lock into a long contract",
+      "We just need lead lists, not a full service"
     ]
   },
   "signals": {
     "positive_signals": [
-      "<edit me in Settings>"
+      "Raised seed, Series A, or Series B funding in the last 6 months",
+      "Active SDR, BDR, or AE job posting on LinkedIn or company careers page",
+      "Recently hired VP Sales, Head of Sales, or CRO (last 90 days)",
+      "Hired CMO or marketing lead but no SDR function visible on team",
+      "New product launch or new market expansion in the last 90 days",
+      "Founder posting on LinkedIn about pipeline, GTM, scaling sales, or hiring SDRs",
+      "Headcount growth of 25% or more year over year",
+      "Company size between 10 and 100 employees on LinkedIn",
+      "Rebrand, website refresh, or repositioning in the last 6 months",
+      "Sponsoring or attending industry conferences",
+      "Has Salesforce or HubSpot in tech stack",
+      "Using Apollo, ZoomInfo, or LinkedIn Sales Navigator (sales-conscious but undermanned)"
     ],
     "disqualifiers": [
-      "<edit me in Settings>"
+      "Over 250 employees (will build SDR team in-house)",
+      "Under 10 employees (too early, no budget for outbound)",
+      "B2C, DTC, or e-commerce business model",
+      "Marketplace or consumer app",
+      "Government, public sector, or non-profit",
+      "Series C or later, or publicly traded",
+      "Three or more SDRs already visible on LinkedIn",
+      "Agency selling primarily to other agencies",
+      "No website or website still listed as \"coming soon\"",
+      "Manufacturing or heavy industry with no B2B SaaS angle"
     ]
   },
   "news_search_terms": [
-    "outbound sales",
-    "SDR automation",
-    "revenue operations"
+    "raised funding",
+    "hiring VP Sales",
+    "Series A announcement",
+    "new product launch",
+    "hiring SDR BDR",
+    "go-to-market strategy",
+    "B2B SaaS pipeline",
+    "founder-led sales",
+    "outbound sales benchmarks",
+    "AI SDR"
   ],
   "generate_content_for_all_tiers": false
 }
