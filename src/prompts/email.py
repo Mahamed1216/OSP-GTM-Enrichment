@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 PROMPT_VERSION = "email_v4"
 
 
-def current_email_prompt_fingerprint() -> str:
+def current_email_prompt_fingerprint(workspace_id: int | None = None) -> str:
     """Stable SHA256-prefix of the user-edited email prompt overlay.
 
     Used by bulk-regen resume detection to tell "this row was generated
@@ -24,11 +24,10 @@ def current_email_prompt_fingerprint() -> str:
     ICP merged in, so the fingerprint stays stable across leads and only
     moves when an operator actually edits the email prompt itself.
 
-    16 hex chars = 64 bits of entropy. Collision odds for the prompt-text
-    universe are effectively zero, and the short form keeps DB rows lean
-    and logs readable.
+    Phase 5: workspace_id scopes the prompt overlay lookup so each
+    workspace's fingerprint reflects its own prompt, not OSP's.
     """
-    text = get_effective_prompt("email", DEFAULT_EMAIL_PROMPT_BODY)
+    text = get_effective_prompt("email", DEFAULT_EMAIL_PROMPT_BODY, workspace_id=workspace_id)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 DEFAULT_EMAIL_PROMPT_BODY = """\
@@ -409,14 +408,17 @@ def build_system(
     negatives: list[dict],
     icp: "ICPConfig | None" = None,
     sender_first_name: str | None = None,
+    *,
+    workspace_id: int | None = None,
 ) -> str:
     """Compose (optional) ICP + body + winners + negatives.
 
-    Body comes from get_effective_prompt('email', DEFAULT_EMAIL_PROMPT_BODY),
+    Body comes from get_effective_prompt('email', ..., workspace_id=workspace_id),
     so a Prompts-editor overlay supersedes the default. `sender_first_name`
     is substituted into the body's literal `{sender_first_name}` token.
+    Phase 5: workspace_id scopes the prompt overlay to the current workspace.
     """
-    body = get_effective_prompt("email", DEFAULT_EMAIL_PROMPT_BODY)
+    body = get_effective_prompt("email", DEFAULT_EMAIL_PROMPT_BODY, workspace_id=workspace_id)
     body = body.replace("{sender_first_name}", sender_first_name or "")
     parts: list[str] = []
     if icp is not None:

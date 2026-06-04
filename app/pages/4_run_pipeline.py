@@ -93,6 +93,7 @@ def _run_pipeline_thread(
     run_linkedin_msg: bool,
     force_refresh: bool,
     progress_dict: dict,
+    workspace_id: int | None = None,
 ) -> None:
     """Background-thread driver: walks lead_ids and updates a shared dict.
 
@@ -195,6 +196,7 @@ def _run_pipeline_thread(
                     run_linkedin_msg=run_linkedin_msg,
                     force_refresh=force_refresh,
                     on_update=_collect,
+                    workspace_id=workspace_id,
                 )
             except Exception as exc:
                 progress_dict["errors"].append(
@@ -443,6 +445,32 @@ st.header("2) Run pipeline")
 _ws_id = get_current_workspace_id()
 render_workspace_banner()
 
+# Show workspace + campaign context before any pipeline action.
+try:
+    from src.workspace import get_campaign_id_for_workspace as _get_cid, get_workspace_by_id as _get_ws
+    _pipeline_ws = _get_ws(_ws_id) if _ws_id else None
+    _pipeline_campaign = _get_cid(_ws_id)
+    if _pipeline_ws:
+        _ws_name = _pipeline_ws.get("name", "—")
+        _ws_slug = _pipeline_ws.get("slug", "—")
+        from src.icp_config import load_workspace_icp_config as _load_ws_icp
+        _pipeline_icp = _load_ws_icp(_ws_id)
+        _company_name = _pipeline_icp.company.name if _pipeline_icp else "—"
+        _has_settings = _pipeline_icp is not None and _pipeline_icp.company.one_liner
+        if _has_settings:
+            st.info(
+                f"Using workspace **{_ws_name}** · Company: **{_company_name}** "
+                f"· Campaign: `{_pipeline_campaign or '—'}`"
+            )
+        else:
+            st.warning(
+                f"Workspace **{_ws_name}** has incomplete settings. "
+                "Scoring and content may be low quality. "
+                "Go to Settings to configure company, ICP, and personas."
+            )
+except Exception:
+    pass
+
 try:
     leads_df = list_leads(workspace_id=_ws_id)
 except Exception as exc:
@@ -450,10 +478,10 @@ except Exception as exc:
     leads_df = pd.DataFrame()
 
 total_leads = len(leads_df)
-st.caption(f"{total_leads} lead(s) in the current workspace.")
+st.caption(f"{total_leads} lead(s) in this workspace.")
 
 if total_leads == 0:
-    st.info("No leads to run. Ingest a CSV first.")
+    st.info("No leads yet in this workspace. Ingest a CSV first.")
     st.stop()
 
 if "_staged_ids" in st.session_state:
@@ -815,6 +843,7 @@ if selected_ids and not running:
             bool(force_refresh),
             progress,
         ),
+        kwargs={"workspace_id": _ws_id},
         daemon=True,
     )
     thread.start()
@@ -1028,7 +1057,7 @@ try:
 
     # Optional fingerprint filter applied on top.
     if skip_current_version and paginated_ids:
-        candidate_ids = get_email_regen_unfinished_lead_ids(paginated_ids)
+        candidate_ids = get_email_regen_unfinished_lead_ids(paginated_ids, workspace_id=_ws_id)
     else:
         candidate_ids = list(paginated_ids)
     fingerprint_filtered_out = len(paginated_ids) - len(candidate_ids)
@@ -1215,6 +1244,7 @@ else:
                 run_ids,
                 on_update=bulk_on_update,
                 skip_current_version=skip_current_run,
+                workspace_id=_ws_id,
             )
             bulk_block.update(
                 label=(

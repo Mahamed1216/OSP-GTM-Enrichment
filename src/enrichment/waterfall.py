@@ -22,7 +22,7 @@ from src.enrichment.buyer_accounts import discover_buyer_accounts
 from src.enrichment.company_details import fetch_company_details
 from src.enrichment.linkedin_profile import fetch_linkedin_profile
 from src.enrichment.news import fetch_company_news, fetch_industry_news
-from src.icp_config import load_icp_config
+from src.icp_config import load_workspace_icp_config
 from src.models import Enrichment, Lead, now_utc
 
 log = logging.getLogger(__name__)
@@ -87,7 +87,7 @@ def _model_dump(value: Any) -> Any:
     return value
 
 
-async def enrich_lead(lead_id: int) -> dict:
+async def enrich_lead(lead_id: int, *, workspace_id: int | None = None) -> dict:
     """Run all enrichment sources for one lead. Returns the source_status map.
 
     Persists results to the Enrichment row (upsert).
@@ -105,9 +105,9 @@ async def enrich_lead(lead_id: int) -> dict:
 
     import asyncio
 
-    # Load ICP once per enrichment so both news fetchers see the same snapshot
-    # and a save mid-run can't split which lead's news cited which value prop.
-    icp = load_icp_config()
+    # Load ICP once per enrichment so both news fetchers see the same snapshot.
+    # Phase 5: uses the selected workspace's ICP (news_search_terms, company context).
+    icp = load_workspace_icp_config(workspace_id)
     # Industry news is now "input_present" as long as the user has news_search_terms
     # configured, even if the lead has no industry field — terms drive the query.
     industry_input_present = bool(snapshot["industry"]) or bool(icp.news_search_terms)
@@ -185,6 +185,7 @@ async def enrich_lead(lead_id: int) -> dict:
                 industry_news=payload.get("industry_news"),
                 buyer_accounts=payload.get("buyer_accounts"),
                 source_status=status,
+                workspace_id=workspace_id,
             ))
 
     successes = sum(1 for s in status.values() if s["status"] == "ok")

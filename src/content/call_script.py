@@ -11,7 +11,7 @@ from sqlalchemy import select
 from src.config import settings
 from src.context import format_lead_context
 from src.db import session_scope
-from src.icp_config import load_icp_config
+from src.icp_config import load_workspace_icp_config
 from src.llm import generate_json
 from src.models import Enrichment, GeneratedContent, Lead, Score
 from src.content.winners import load_top_negatives, load_top_winners_for
@@ -37,6 +37,7 @@ async def generate_call_script(
     lead_id: int,
     *,
     regeneration_feedback: str | None = None,
+    workspace_id: int | None = None,
 ) -> CallScript:
     with session_scope() as session:
         lead = session.get(Lead, lead_id)
@@ -53,9 +54,9 @@ async def generate_call_script(
 
     winners = load_top_winners_for("call_script", k=3)
     negatives = load_top_negatives("call_script", k=2)
-    icp = load_icp_config()
+    icp = load_workspace_icp_config(workspace_id)
     sender_first_name = get_secret("SENDER_FIRST_NAME", "Mohammed")
-    system = build_call_system(winners, negatives, icp, sender_first_name=sender_first_name)
+    system = build_call_system(winners, negatives, icp, sender_first_name=sender_first_name, workspace_id=workspace_id)
     if regeneration_feedback:
         system = (
             "Previous version of this content was rated negatively. "
@@ -85,6 +86,7 @@ async def generate_call_script(
             signals_cited=[],
             prompt_version=PROMPT_VERSION,
             model=settings.content_model,
+            workspace_id=workspace_id,
         ))
 
     log.info("call_script_generated", extra={

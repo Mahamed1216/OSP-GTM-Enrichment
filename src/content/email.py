@@ -11,7 +11,7 @@ from src.config import settings
 from src.context import format_lead_context
 from src.content.winners import load_top_negatives, load_top_winners_for
 from src.db import session_scope
-from src.icp_config import load_icp_config
+from src.icp_config import load_workspace_icp_config
 from src.llm import generate_json
 from src.models import Enrichment, GeneratedContent, Lead, Score
 from src.prompts.email import (
@@ -49,6 +49,7 @@ async def generate_email(
     lead_id: int,
     *,
     regeneration_feedback: str | None = None,
+    workspace_id: int | None = None,
 ) -> EmailResult:
     with session_scope() as session:
         lead = session.get(Lead, lead_id)
@@ -142,9 +143,10 @@ async def generate_email(
                 body=skip_body,
                 signals_cited=skip_signals,
                 prompt_version=PROMPT_VERSION,
-                prompt_fingerprint=current_email_prompt_fingerprint(),
+                prompt_fingerprint=current_email_prompt_fingerprint(workspace_id),
                 model="rule:icp_skip",
                 skip_reason="tier_below_threshold",
+                workspace_id=workspace_id,
             ))
         log.info(
             "email_icp_skip",
@@ -175,9 +177,10 @@ async def generate_email(
                 body=nr_body,
                 signals_cited=nr_signals,
                 prompt_version=PROMPT_VERSION,
-                prompt_fingerprint=current_email_prompt_fingerprint(),
+                prompt_fingerprint=current_email_prompt_fingerprint(workspace_id),
                 model="rule:needs_buyer_research",
                 skip_reason="needs_buyer_research",
+                workspace_id=workspace_id,
             ))
         log.info(
             "email_needs_buyer_research",
@@ -191,9 +194,9 @@ async def generate_email(
 
     winners = load_top_winners_for("email", k=3)
     negatives = load_top_negatives("email", k=2)
-    icp = load_icp_config()
+    icp = load_workspace_icp_config(workspace_id)
     sender_first_name = get_secret("SENDER_FIRST_NAME", "Mohammed")
-    system = build_email_system(winners, negatives, icp, sender_first_name=sender_first_name)
+    system = build_email_system(winners, negatives, icp, sender_first_name=sender_first_name, workspace_id=workspace_id)
     if regeneration_feedback:
         system = (
             "Previous version of this content was rated negatively. "
@@ -389,8 +392,9 @@ async def generate_email(
             body=clean_body,
             signals_cited=signals_with_warnings,
             prompt_version=PROMPT_VERSION,
-            prompt_fingerprint=current_email_prompt_fingerprint(),
+            prompt_fingerprint=current_email_prompt_fingerprint(workspace_id),
             model=settings.content_model,
+            workspace_id=workspace_id,
         ))
 
     if validation_warnings:

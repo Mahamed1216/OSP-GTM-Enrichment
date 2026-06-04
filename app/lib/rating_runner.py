@@ -58,24 +58,24 @@ def regenerate_direct_sync(content_id: int, feedback: str) -> int:
     return run_async(regenerate_direct(content_id, feedback))
 
 
-def rerun_enrichment_sync(lead_id: int) -> dict[str, Any]:
+def rerun_enrichment_sync(lead_id: int, *, workspace_id: int | None = None) -> dict[str, Any]:
     """Re-run enrichment for a single lead. Returns the source_status dict.
 
     Wraps `src.enrichment.waterfall.enrich_lead`. Per-source errors are
     captured inside the waterfall and reported via the returned dict;
     only catastrophic failures (lead not found, DB unavailable) raise.
     """
-    return run_async(enrich_lead(lead_id))
+    return run_async(enrich_lead(lead_id, workspace_id=workspace_id))
 
 
-def rerun_scoring_sync(lead_id: int) -> dict[str, Any]:
+def rerun_scoring_sync(lead_id: int, *, workspace_id: int | None = None) -> dict[str, Any]:
     """Re-run scoring for a single lead. Returns a small summary dict
     ({score, tier}) so the UI can render the change without re-querying.
 
     `score_lead` upserts the Score row so re-running on an already-scored
     lead replaces the old score deterministically.
     """
-    result = run_async(score_lead(lead_id))
+    result = run_async(score_lead(lead_id, workspace_id=workspace_id))
     return {
         "score": int(result.score),
         "tier": result.tier,
@@ -84,7 +84,7 @@ def rerun_scoring_sync(lead_id: int) -> dict[str, Any]:
     }
 
 
-def regenerate_email_sync(lead_id: int) -> int:
+def regenerate_email_sync(lead_id: int, *, workspace_id: int | None = None) -> int:
     """Re-generate email for a single lead (no feedback). Returns the new
     GeneratedContent id.
 
@@ -109,7 +109,7 @@ def regenerate_email_sync(lead_id: int) -> int:
         ).scalars().first()
         old_head_id = head.id if head else None
 
-    run_async(generate_email(lead_id))
+    run_async(generate_email(lead_id, workspace_id=workspace_id))
 
     # Identify the row we just wrote (newest non-superseded email for
     # this lead that isn't the old head) and wire supersede.
@@ -135,7 +135,7 @@ def regenerate_email_sync(lead_id: int) -> int:
     return new_id
 
 
-def full_refresh_sync(lead_id: int) -> dict[str, Any]:
+def full_refresh_sync(lead_id: int, *, workspace_id: int | None = None) -> dict[str, Any]:
     """Enrichment → scoring → email regeneration for one lead.
 
     Stops the chain at the first failure and reports which step failed
@@ -145,19 +145,19 @@ def full_refresh_sync(lead_id: int) -> dict[str, Any]:
     """
     out: dict[str, Any] = {"enrichment": None, "scoring": None, "email_id": None}
     try:
-        out["enrichment"] = rerun_enrichment_sync(lead_id)
+        out["enrichment"] = rerun_enrichment_sync(lead_id, workspace_id=workspace_id)
     except Exception as exc:
         out["failed_step"] = "enrichment"
         out["error"] = f"{type(exc).__name__}: {exc}"
         return out
     try:
-        out["scoring"] = rerun_scoring_sync(lead_id)
+        out["scoring"] = rerun_scoring_sync(lead_id, workspace_id=workspace_id)
     except Exception as exc:
         out["failed_step"] = "scoring"
         out["error"] = f"{type(exc).__name__}: {exc}"
         return out
     try:
-        out["email_id"] = regenerate_email_sync(lead_id)
+        out["email_id"] = regenerate_email_sync(lead_id, workspace_id=workspace_id)
     except Exception as exc:
         out["failed_step"] = "email"
         out["error"] = f"{type(exc).__name__}: {exc}"

@@ -229,7 +229,7 @@ _REGEN_KEY = f"ld_action_regen_{_action_lead_id}"
 _FULL_KEY = f"ld_action_full_{_action_lead_id}"
 
 
-def _run_with_spinner(label: str, fn, *args):
+def _run_with_spinner(label: str, fn, *args, **kwargs):
     """Run a sync helper with a spinner + standardized error capture.
 
     Returns (ok, result_or_error). On failure, the exact exception text
@@ -237,7 +237,7 @@ def _run_with_spinner(label: str, fn, *args):
     """
     try:
         with st.spinner(label):
-            return True, fn(*args)
+            return True, fn(*args, **kwargs)
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
 
@@ -246,6 +246,7 @@ with _action_cols[0]:
     if st.button("Rerun enrichment", key=_REENRICH_KEY, type="secondary"):
         ok, result = _run_with_spinner(
             "Rerunning enrichment…", rerun_enrichment_sync, _action_lead_id,
+            workspace_id=_ws_id,
         )
         if not ok:
             st.error(f"Enrichment failed: {result}")
@@ -267,6 +268,7 @@ with _action_cols[1]:
     if st.button("Rerun scoring", key=_RESCORE_KEY, type="secondary"):
         ok, result = _run_with_spinner(
             "Rerunning scoring…", rerun_scoring_sync, _action_lead_id,
+            workspace_id=_ws_id,
         )
         if not ok:
             st.error(f"Scoring failed: {result}")
@@ -280,6 +282,7 @@ with _action_cols[2]:
     if st.button("Regenerate email", key=_REGEN_KEY, type="secondary"):
         ok, result = _run_with_spinner(
             "Regenerating email…", regenerate_email_sync, _action_lead_id,
+            workspace_id=_ws_id,
         )
         if not ok:
             st.error(f"Email regeneration failed: {result}")
@@ -296,6 +299,7 @@ with _action_cols[3]:
         ok, result = _run_with_spinner(
             "Full refresh: enrichment → scoring → email…",
             full_refresh_sync, _action_lead_id,
+            workspace_id=_ws_id,
         )
         if not ok:
             # _run_with_spinner already collapsed the exception.

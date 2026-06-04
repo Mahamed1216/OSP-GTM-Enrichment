@@ -114,9 +114,11 @@ def build_system(
     negatives: list[dict],
     icp: "ICPConfig | None" = None,
     sender_first_name: str | None = None,
+    *,
+    workspace_id: int | None = None,
 ) -> str:
     """Compose (optional) ICP + body + winners + negatives."""
-    body = get_effective_prompt("call_script", DEFAULT_CALL_SCRIPT_PROMPT_BODY)
+    body = get_effective_prompt("call_script", DEFAULT_CALL_SCRIPT_PROMPT_BODY, workspace_id=workspace_id)
     body = body.replace("{sender_first_name}", sender_first_name or "")
     parts: list[str] = []
     if icp is not None:

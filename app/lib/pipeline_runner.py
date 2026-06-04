@@ -63,11 +63,12 @@ async def _phase_enrich(
     on_update: Callable[[PhaseUpdate], None] | None,
     *,
     force_refresh: bool = False,
+    workspace_id: int | None = None,
 ) -> None:
     total = len(lead_ids)
     for idx, lid in enumerate(lead_ids, start=1):
         try:
-            payload = await enrich_lead(lid)
+            payload = await enrich_lead(lid, workspace_id=workspace_id)
             extra = {"refreshed": True} if force_refresh else {}
             merged: dict[str, Any] = {**(payload or {}), **extra} if isinstance(payload, dict) else extra
             _emit(on_update, PhaseUpdate("enrichment", lid, idx, total, True, None, merged or payload))
@@ -80,6 +81,7 @@ async def _phase_score(
     on_update: Callable[[PhaseUpdate], None] | None,
     *,
     force_refresh: bool = False,
+    workspace_id: int | None = None,
 ) -> None:
     total = len(lead_ids)
     # Force mode bypasses the "already scored" guard so the Score row's
@@ -97,7 +99,7 @@ async def _phase_score(
             )
             continue
         try:
-            result = await score_lead(lid)
+            result = await score_lead(lid, workspace_id=workspace_id)
             _emit(
                 on_update,
                 PhaseUpdate(
@@ -157,6 +159,7 @@ async def _phase_content(
     run_call_script: bool = True,
     run_linkedin_msg: bool = True,
     force_refresh: bool = False,
+    workspace_id: int | None = None,
 ) -> None:
     """Per lead, generate the enabled content kinds in parallel.
 
@@ -219,7 +222,7 @@ async def _phase_content(
             )
             continue
 
-        tasks = [_KIND_GENERATOR[k](lid) for k in kinds_to_run]
+        tasks = [_KIND_GENERATOR[k](lid, workspace_id=workspace_id) for k in kinds_to_run]
         try:
             results = await asyncio.gather(*tasks, return_exceptions=True)
         except Exception as exc:
@@ -299,6 +302,7 @@ async def _phase_bulk_regen(
     on_update: Callable[[PhaseUpdate], None] | None,
     *,
     skip_current_version: bool = True,
+    workspace_id: int | None = None,
 ) -> None:
     """Regenerate the active **email** GeneratedContent row for each lead.
 
@@ -320,7 +324,7 @@ async def _phase_bulk_regen(
     (one session per lead), so a crash mid-batch keeps prior work."""
     # Snapshot the current fingerprint once for the whole batch so a
     # mid-batch prompt edit doesn't shift the skip threshold under us.
-    current_fingerprint = current_email_prompt_fingerprint()
+    current_fingerprint = current_email_prompt_fingerprint(workspace_id)
 
     total = len(lead_ids)
     for idx, lid in enumerate(lead_ids, start=1):
@@ -377,7 +381,7 @@ async def _phase_bulk_regen(
         # timeout/crash on this lead does not affect already-saved work.
         try:
             await asyncio.wait_for(
-                generate_email(lid),
+                generate_email(lid, workspace_id=workspace_id),
                 timeout=_BULK_REGEN_PER_LEAD_TIMEOUT_SEC,
             )
         except asyncio.TimeoutError:
@@ -437,6 +441,7 @@ def bulk_regenerate_content(
     *,
     on_update: Callable[[PhaseUpdate], None] | None = None,
     skip_current_version: bool = True,
+    workspace_id: int | None = None,
 ) -> None:
     """Regenerate **email** content for the given leads. Call scripts and
     LinkedIn DMs are left untouched. Old email rows are preserved with
@@ -449,12 +454,14 @@ def bulk_regenerate_content(
         return
     run_async(
         _phase_bulk_regen(
-            lead_ids, on_update, skip_current_version=skip_current_version
+            lead_ids, on_update,
+            skip_current_version=skip_current_version,
+            workspace_id=workspace_id,
         )
     )
 
 
-def get_email_regen_unfinished_lead_ids(lead_ids: list[int]) -> list[int]:
+def get_email_regen_unfinished_lead_ids(lead_ids: list[int], *, workspace_id: int | None = None) -> list[int]:
     """Subset of `lead_ids` whose latest active email was NOT generated
     under the current prompt fingerprint. Used by the Run Pipeline page
     to count "unfinished" leads when resume mode is on.
@@ -468,7 +475,7 @@ def get_email_regen_unfinished_lead_ids(lead_ids: list[int]) -> list[int]:
     """
     if not lead_ids:
         return []
-    current_fp = current_email_prompt_fingerprint()
+    current_fp = current_email_prompt_fingerprint(workspace_id)
     with session_scope() as s:
         rows = s.execute(
             select(
@@ -539,6 +546,7 @@ def process_single_lead(
     run_linkedin_msg: bool = True,
     force_refresh: bool = False,
     on_update: Callable[[PhaseUpdate], None] | None = None,
+    workspace_id: int | None = None,
 ) -> None:
     """Run enrich → score → content → deliver for a single lead, in order.
 
@@ -553,10 +561,10 @@ def process_single_lead(
     — caller can rely on it returning even if a phase failed for this lead.
     """
     if run_enrichment:
-        run_async(_phase_enrich([lead_id], on_update, force_refresh=force_refresh))
+        run_async(_phase_enrich([lead_id], on_update, force_refresh=force_refresh, workspace_id=workspace_id))
 
     if run_scoring:
-        run_async(_phase_score([lead_id], on_update, force_refresh=force_refresh))
+        run_async(_phase_score([lead_id], on_update, force_refresh=force_refresh, workspace_id=workspace_id))
 
     if run_email or run_call_script or run_linkedin_msg:
         eligible = _send_eligible_lead_ids([lead_id])
@@ -568,6 +576,7 @@ def process_single_lead(
                 run_call_script=run_call_script,
                 run_linkedin_msg=run_linkedin_msg,
                 force_refresh=force_refresh,
+                workspace_id=workspace_id,
             ))
             if run_email:
                 have_email = _has_email_content_lead_ids(eligible)
@@ -586,6 +595,7 @@ def run_phased_pipeline(
     run_call_script: bool = True,
     run_linkedin_msg: bool = True,
     force_refresh: bool = False,
+    workspace_id: int | None = None,
 ) -> dict[str, Any]:
     """Run the full pipeline per-lead and return a summary dict.
 
@@ -615,6 +625,7 @@ def run_phased_pipeline(
             run_linkedin_msg=run_linkedin_msg,
             force_refresh=force_refresh,
             on_update=on_update,
+            workspace_id=workspace_id,
         )
 
     return _summary(lead_ids)

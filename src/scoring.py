@@ -9,7 +9,7 @@ from sqlalchemy import select
 from src.config import settings
 from src.context import format_lead_context
 from src.db import session_scope
-from src.icp_config import load_icp_config
+from src.icp_config import load_workspace_icp_config
 from src.llm import generate_json
 from src.models import Enrichment, Lead, Score, now_utc
 from src.prompts.scoring import build_system as build_scoring_system
@@ -90,7 +90,7 @@ def _persist_skip_score(lead_id: int) -> ScoreResult:
     return result
 
 
-async def score_lead(lead_id: int) -> ScoreResult:
+async def score_lead(lead_id: int, *, workspace_id: int | None = None) -> ScoreResult:
     with session_scope() as session:
         lead = session.get(Lead, lead_id)
         if not lead:
@@ -113,7 +113,7 @@ async def score_lead(lead_id: int) -> ScoreResult:
     if should_skip:
         return _persist_skip_score(lead_id)
 
-    icp = load_icp_config()
+    icp = load_workspace_icp_config(workspace_id)
     system = build_scoring_system(icp)
 
     start = time.monotonic()
@@ -156,6 +156,7 @@ async def score_lead(lead_id: int) -> ScoreResult:
                 rationale=result.rationale,
                 signals_used=result.signals_used,
                 model=settings.scoring_model,
+                workspace_id=workspace_id,
             ))
 
     log.info("scoring_complete", extra={
