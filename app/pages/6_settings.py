@@ -122,8 +122,8 @@ with st.expander("Workspace foundation (read-only)", expanded=False):
             st.caption(f":gray[Table stats unavailable: {_stats_exc}]")
     else:
         st.info(
-            "Default workspace not found. It will be created automatically "
-            "the next time the app starts (init_db runs on startup)."
+            "Default workspace not found. The migration runs automatically on "
+            "startup — refresh the page if this persists after a few seconds."
         )
 
 cfg = load_icp_config()

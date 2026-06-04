@@ -257,6 +257,20 @@ def _format_timestamp(ts: datetime | None) -> str:
     return format_et(ts)
 
 
+# Ensure workspace schema (tables + workspace_id columns) is in place before
+# any DB query on this page.  init_db() is normally called by main.py, but
+# on Streamlit Cloud the session state used by the old guard can survive a
+# server restart, causing init_db() to be skipped for reconnecting sessions.
+# This call is a fast no-op if init_db() already ran for this process.
+from src.workspace import ensure_workspace_schema as _ensure_ws
+
+if not _ensure_ws():
+    st.warning(
+        "⚠️ Workspace migration is initializing. "
+        "Refresh the page in a few seconds to continue."
+    )
+    st.stop()
+
 st.markdown(
     '<div style="margin-bottom: 3rem;">'
     '<h1 class="hero-headline" style="font-size: 72px;">Engagement.</h1>'

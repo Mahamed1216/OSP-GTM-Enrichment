@@ -61,13 +61,22 @@ with st.sidebar:
     else:
         st.caption(":orange[Dev mode — auth disabled]")
 
+# setup_logging is guarded by session state (calling it twice in a session
+# is harmless, but we skip the overhead when already done for this session).
 if not st.session_state.get("_app_initialized"):
-    from src.db import init_db
     from src.logging_setup import setup_logging
-
     setup_logging()
-    init_db()
     st.session_state["_app_initialized"] = True
+
+# init_db() is guarded by a *process-level* flag inside the function, so
+# calling it here on every Streamlit script execution is a fast no-op after
+# the first successful run.  This is intentional: st.session_state can
+# survive a Streamlit Cloud server restart (the browser reconnects and
+# rehydrates session state), which would cause the old session-only guard to
+# skip init_db() on a fresh process — leaving the workspaces table and
+# workspace_id columns uncreated in production Postgres.
+from src.db import init_db
+init_db()
 
 _PAGES_DIR = Path(__file__).parent / "pages"
 

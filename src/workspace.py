@@ -47,6 +47,56 @@ WORKSPACE_SCOPED_TABLES: tuple[str, ...] = (
 
 
 # ---------------------------------------------------------------------------
+# Schema bootstrap
+# ---------------------------------------------------------------------------
+
+def ensure_workspace_schema() -> bool:
+    """Ensure the workspaces table and workspace_id columns exist (DDL only).
+
+    Fast path  — if init_db() has already completed for this process, this
+    returns True in a single bool check.
+
+    Medium path — if init_db() hasn't run yet but the workspaces table is
+    already present (e.g. the process restarted but the DB was not dropped),
+    returns True without re-running any DDL.
+
+    Slow path  — if the workspaces table is genuinely absent (first deploy
+    against a fresh Postgres DB before init_db() has run), runs
+    Base.metadata.create_all + _apply_runtime_migrations so workspace
+    queries don't crash with "relation does not exist".
+
+    Seeding the default workspace is intentionally excluded here — that is
+    init_db()'s responsibility, called unconditionally from app/main.py
+    before any page renders.  Excluding seeding keeps this function safe to
+    call from library helpers: it will not create workspace rows in tests
+    that deliberately start with an empty workspaces table.
+
+    Returns True when the schema is ready, False if an unexpected error
+    prevented table creation.
+    """
+    try:
+        from src.db import is_db_initialized, engine as _engine
+        if is_db_initialized():
+            return True  # init_db() already ran — all tables and columns are ready.
+        from sqlalchemy import inspect as _inspect
+        if "workspaces" in set(_inspect(_engine).get_table_names()):
+            return True  # table exists; may be unseeded — that's fine, return None below.
+        # Table is genuinely missing: create it (and add workspace_id columns to
+        # existing tables) without seeding workspace rows.
+        from src import models as _models  # noqa: F401  register on Base.metadata
+        from src.db import Base as _Base, _apply_runtime_migrations
+        _Base.metadata.create_all(_engine)
+        _apply_runtime_migrations()
+        return True
+    except Exception as exc:
+        log.warning(
+            "ensure_workspace_schema_failed",
+            extra={"error": f"{type(exc).__name__}: {exc}"},
+        )
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Seeding
 # ---------------------------------------------------------------------------
 
@@ -111,6 +161,7 @@ def _row_to_dict(row: Workspace) -> dict[str, Any]:
 
 def get_default_workspace() -> dict[str, Any] | None:
     """Return the workspace marked is_default=True as a plain dict, or None."""
+    ensure_workspace_schema()
     with session_scope() as session:
         row = session.execute(
             select(Workspace)
@@ -141,6 +192,7 @@ def get_or_create_default_workspace() -> dict[str, Any]:
 
 def get_workspace_by_id(workspace_id: int) -> dict[str, Any] | None:
     """Return a workspace dict by primary key, or None if not found."""
+    ensure_workspace_schema()
     with session_scope() as session:
         row = session.get(Workspace, workspace_id)
         if row is None:
@@ -150,6 +202,7 @@ def get_workspace_by_id(workspace_id: int) -> dict[str, Any] | None:
 
 def get_active_workspaces() -> list[dict[str, Any]]:
     """Return all active workspaces ordered by id ascending."""
+    ensure_workspace_schema()
     with session_scope() as session:
         rows = session.execute(
             select(Workspace)

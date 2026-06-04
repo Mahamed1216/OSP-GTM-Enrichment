@@ -14,6 +14,17 @@ class Base(DeclarativeBase):
 engine = create_engine(settings.database_url, echo=False, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
+# Process-level flag — True once init_db() has completed for this Python process.
+# Unlike st.session_state (which is per browser session and can be rehydrated by
+# Streamlit Cloud across server restarts), this flag resets to False whenever the
+# OS process is restarted, so init_db() always runs on a fresh deploy.
+_db_initialized: bool = False
+
+
+def is_db_initialized() -> bool:
+    """Return True if init_db() has completed successfully for this process."""
+    return _db_initialized
+
 
 # (table_name, column_name, DDL fragment). Kept ordered so a fresh DB and an
 # existing DB both end up identical. Each entry must be idempotent:
@@ -101,16 +112,24 @@ def _apply_runtime_migrations() -> None:
     existing_tables = set(inspector.get_table_names())
 
     # Pass 1 — add missing columns.
+    # Postgres supports ADD COLUMN IF NOT EXISTS, which makes concurrent
+    # startup safe (two workers both see the column absent and both try to
+    # add it — the second one is a harmless no-op instead of an error).
+    # SQLite does not support IF NOT EXISTS in this form, so we keep the
+    # Python-level pre-check for SQLite.
+    use_if_not_exists = engine.dialect.name == "postgresql"
     for table_name, col_name, ddl_type in _RUNTIME_COLUMN_ADDS:
         if table_name not in existing_tables:
             continue  # create_all just made it with the new column already in place
         cols = {c["name"] for c in inspector.get_columns(table_name)}
         if col_name in cols:
             continue
+        if use_if_not_exists:
+            ddl = f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {col_name} {ddl_type}"
+        else:
+            ddl = f"ALTER TABLE {table_name} ADD COLUMN {col_name} {ddl_type}"
         with engine.begin() as conn:
-            conn.execute(
-                text(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {ddl_type}")
-            )
+            conn.execute(text(ddl))
 
     # Pass 2 — widen string columns on Postgres.
     if engine.dialect.name == "postgresql":
@@ -133,13 +152,30 @@ def _apply_runtime_migrations() -> None:
 
 
 def init_db() -> None:
-    from src import models  # noqa: F401  registers tables on Base.metadata
-    Base.metadata.create_all(engine)
-    _apply_runtime_migrations()
-    # Lazy imports avoid circular dependency: src.workspace imports src.db.
-    from src.workspace import backfill_default_workspace_ids, seed_default_workspace
-    seed_default_workspace()
-    backfill_default_workspace_ids()
+    """Create all tables, run column migrations, seed the default workspace.
+
+    Guarded by a process-level flag so repeated calls are instant no-ops.
+    The flag is set at the *start* of the work (not the end) so that
+    workspace helpers called from within this function (e.g. via
+    backfill_default_workspace_ids → get_default_workspace_id) do not
+    recursively trigger init_db() again.  The flag is cleared on failure
+    so the next request can retry.
+    """
+    global _db_initialized
+    if _db_initialized:
+        return
+    _db_initialized = True  # Prevent re-entry; cleared below if we fail.
+    try:
+        from src import models  # noqa: F401  registers tables on Base.metadata
+        Base.metadata.create_all(engine)
+        _apply_runtime_migrations()
+        # Lazy imports avoid circular dependency: src.workspace imports src.db.
+        from src.workspace import backfill_default_workspace_ids, seed_default_workspace
+        seed_default_workspace()
+        backfill_default_workspace_ids()
+    except Exception:
+        _db_initialized = False  # Allow the next caller to retry.
+        raise
 
 
 @contextmanager
