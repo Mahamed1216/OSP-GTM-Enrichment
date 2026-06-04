@@ -15,6 +15,7 @@ import streamlit as st
 from app.lib.badges import pill, status_badge, tier_badge
 from app.lib.components import fit_score_viz
 from app.lib.db_queries import get_lead_full
+from app.lib.workspace_state import get_current_workspace_id, render_workspace_banner
 from app.lib.formatters import fmt_duration_ms, fmt_timestamp, source_status_display
 from app.lib.rating_runner import (
     delete_lead_sync,
@@ -137,6 +138,8 @@ def _render_rating_block(content_id: int) -> None:
             st.error(f"Could not save rating: {exc}")
 
 
+_ws_id = get_current_workspace_id()
+
 # ---------- Guard: must have a selected lead ----------
 selected_id = st.session_state.get("selected_lead_id")
 if selected_id is None:
@@ -148,13 +151,16 @@ if selected_id is None:
 
 # ---------- Load ----------
 try:
-    bundle = get_lead_full(int(selected_id))
+    bundle = get_lead_full(int(selected_id), workspace_id=_ws_id)
 except Exception as exc:
     st.error(f"Could not load lead {selected_id}: {exc}")
     st.stop()
 
 if bundle is None:
-    st.warning(f"Lead {selected_id} not found.")
+    st.warning(
+        f"Lead {selected_id} not found in the current workspace. "
+        "It may belong to a different workspace."
+    )
     if st.button("Back to Leads", key="ld_back_missing"):
         st.switch_page("pages/2_leads.py")
     st.stop()
@@ -164,6 +170,8 @@ enrichment = bundle["enrichment"]
 score = bundle["score"]
 contents = bundle["contents"]
 engagements = bundle["engagements"]
+
+render_workspace_banner()
 
 # ---------- Header ----------
 if st.button("← Back", key="ld_back_btn"):

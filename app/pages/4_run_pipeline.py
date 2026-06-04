@@ -26,6 +26,7 @@ from app.lib.db_queries import (
     kpi_counts,
     list_leads,
 )
+from app.lib.workspace_state import get_current_workspace_id, render_workspace_banner
 from app.lib.ingest_runner import (
     IngestResult,
     auto_detect_and_validate,
@@ -439,14 +440,17 @@ st.divider()
 # =========================================================
 st.header("2) Run pipeline")
 
+_ws_id = get_current_workspace_id()
+render_workspace_banner()
+
 try:
-    leads_df = list_leads()
+    leads_df = list_leads(workspace_id=_ws_id)
 except Exception as exc:
     st.error(f"Could not load leads: {exc}")
     leads_df = pd.DataFrame()
 
 total_leads = len(leads_df)
-st.caption(f"{total_leads} lead(s) currently in the database.")
+st.caption(f"{total_leads} lead(s) in the current workspace.")
 
 if total_leads == 0:
     st.info("No leads to run. Ingest a CSV first.")
@@ -463,15 +467,15 @@ specific_ids_input = st.text_input(
 )
 
 try:
-    _unenriched_ids = get_unenriched_lead_ids()
+    _unenriched_ids = get_unenriched_lead_ids(workspace_id=_ws_id)
 except Exception:
     _unenriched_ids = []
 try:
-    _unscored_ids = get_unscored_lead_ids()
+    _unscored_ids = get_unscored_lead_ids(workspace_id=_ws_id)
 except Exception:
     _unscored_ids = []
 try:
-    _content_pending_ids = get_content_pending_lead_ids()
+    _content_pending_ids = get_content_pending_lead_ids(workspace_id=_ws_id)
 except Exception:
     _content_pending_ids = []
 
@@ -525,7 +529,7 @@ selected_tier_set: list[str] = st.multiselect(
 # Precompute counts so the buttons can advertise sizes and gate disabled state.
 try:
     _tier_id_cache: dict[str, list[int]] = {
-        t: get_lead_ids_by_tiers([t]) for t in ["A", "B", "C", "D"]
+        t: get_lead_ids_by_tiers([t], workspace_id=_ws_id) for t in ["A", "B", "C", "D"]
     }
 except Exception as exc:
     st.error(f"Could not load tier counts: {exc}")
@@ -641,7 +645,7 @@ with c2:
         key="run_limit",
     )
     try:
-        _enriched_n = int(kpi_counts().get("enriched", 0) or 0)
+        _enriched_n = int(kpi_counts(workspace_id=_ws_id).get("enriched", 0) or 0)
     except Exception:
         _enriched_n = 0
     if _enriched_n > 0 and _enriched_n <= total_leads:
@@ -1003,7 +1007,8 @@ skip_current_version = bool(resume_mode) and not bool(force_regen)
 
 try:
     tier_candidate_ids = (
-        get_leads_with_content_by_tier(selected_tiers) if selected_tiers else []
+        get_leads_with_content_by_tier(selected_tiers, workspace_id=_ws_id)
+        if selected_tiers else []
     )
     # Tier-filtered, sorted by lead_id ascending (stable order) — this is
     # the ordered list the Skip/Max inputs index into.

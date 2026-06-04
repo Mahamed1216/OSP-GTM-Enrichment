@@ -19,9 +19,12 @@ from src.models import (
 )
 
 
-def _email_content_subq():
-    """Subquery: latest email GeneratedContent row per lead."""
-    return (
+def _email_content_subq(workspace_id: int | None = None):
+    """Subquery: latest email GeneratedContent row per lead.
+
+    When workspace_id is given, restricts to content rows in that workspace.
+    """
+    stmt = (
         select(
             GeneratedContent.lead_id.label("lead_id"),
             func.max(GeneratedContent.id).label("content_id"),
@@ -31,15 +34,24 @@ def _email_content_subq():
         )
         .where(GeneratedContent.kind == "email")
         .group_by(GeneratedContent.lead_id)
-        .subquery()
     )
+    if workspace_id is not None:
+        stmt = stmt.where(GeneratedContent.workspace_id == workspace_id)
+    return stmt.subquery()
 
 
-def kpi_counts() -> dict[str, int]:
+def kpi_counts(workspace_id: int | None = None) -> dict[str, int]:
     with session_scope() as session:
-        leads_total = session.execute(select(func.count(Lead.id))).scalar() or 0
-        enriched = session.execute(select(func.count(Enrichment.id))).scalar() or 0
-        scored = session.execute(select(func.count(Score.id))).scalar() or 0
+        leads_q = select(func.count(Lead.id))
+        enriched_q = select(func.count(Enrichment.id))
+        scored_q = select(func.count(Score.id))
+        if workspace_id is not None:
+            leads_q = leads_q.where(Lead.workspace_id == workspace_id)
+            enriched_q = enriched_q.where(Enrichment.workspace_id == workspace_id)
+            scored_q = scored_q.where(Score.workspace_id == workspace_id)
+        leads_total = session.execute(leads_q).scalar() or 0
+        enriched = session.execute(enriched_q).scalar() or 0
+        scored = session.execute(scored_q).scalar() or 0
         # `sent` was previously COUNT(delivered_at IS NOT NULL), which counts
         # leads we PUSHED to Instantly — not leads Instantly has actually sent
         # an email to. The campaign cadence means a chunk of pushes are still
@@ -56,6 +68,10 @@ def kpi_counts() -> dict[str, int]:
             .join(GeneratedContent, Engagement.content_id == GeneratedContent.id)
             .where(GeneratedContent.kind == "email")
         )
+        if workspace_id is not None:
+            eng_bool_stmt = eng_bool_stmt.where(
+                GeneratedContent.workspace_id == workspace_id
+            )
         row = session.execute(eng_bool_stmt).one()
         return {
             "leads_total": int(leads_total),
@@ -69,7 +85,7 @@ def kpi_counts() -> dict[str, int]:
         }
 
 
-def tier_distribution() -> dict[str, int]:
+def tier_distribution(workspace_id: int | None = None) -> dict[str, int]:
     """Counts per tier including unscored.
 
     Returns A/B/C/D plus an "—" bucket for leads that have no Score row yet.
@@ -77,10 +93,13 @@ def tier_distribution() -> dict[str, int]:
     "no-tier" group as a neutral track.
     """
     with session_scope() as session:
-        rows = session.execute(
-            select(Score.tier, func.count(Score.id)).group_by(Score.tier)
-        ).all()
-        leads_total = session.execute(select(func.count(Lead.id))).scalar() or 0
+        tier_q = select(Score.tier, func.count(Score.id)).group_by(Score.tier)
+        leads_q = select(func.count(Lead.id))
+        if workspace_id is not None:
+            tier_q = tier_q.where(Score.workspace_id == workspace_id)
+            leads_q = leads_q.where(Lead.workspace_id == workspace_id)
+        rows = session.execute(tier_q).all()
+        leads_total = session.execute(leads_q).scalar() or 0
     out: dict[str, int] = {"A": 0, "B": 0, "C": 0, "D": 0}
     for tier, count in rows:
         if tier and tier.upper() in out:
@@ -90,7 +109,7 @@ def tier_distribution() -> dict[str, int]:
     return out
 
 
-def recent_activity(limit: int = 8) -> list[dict[str, Any]]:
+def recent_activity(limit: int = 8, workspace_id: int | None = None) -> list[dict[str, Any]]:
     """Most-recent events across enrich/gen/send/reply/rate, newest first.
 
     Pulls up to `limit` events from each source then merges + truncates so a
@@ -102,7 +121,7 @@ def recent_activity(limit: int = 8) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
 
     with session_scope() as session:
-        enrichments = session.execute(
+        enrich_q = (
             select(
                 Enrichment.enriched_at,
                 Lead.first_name,
@@ -112,14 +131,17 @@ def recent_activity(limit: int = 8) -> list[dict[str, Any]]:
             .join(Lead, Lead.id == Enrichment.lead_id)
             .order_by(Enrichment.enriched_at.desc())
             .limit(limit)
-        ).all()
+        )
+        if workspace_id is not None:
+            enrich_q = enrich_q.where(Lead.workspace_id == workspace_id)
+        enrichments = session.execute(enrich_q).all()
         for r in enrichments:
             name = f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip() or "(no name)"
             company = (r.company or "").strip()
             text = f"Enriched {name}" + (f" at {company}" if company else "")
             events.append({"kind": "enrich", "text": text, "when": r.enriched_at})
 
-        gens = session.execute(
+        gen_q = (
             select(
                 GeneratedContent.created_at,
                 GeneratedContent.kind,
@@ -130,7 +152,10 @@ def recent_activity(limit: int = 8) -> list[dict[str, Any]]:
             .where(GeneratedContent.superseded_by_id.is_(None))
             .order_by(GeneratedContent.created_at.desc())
             .limit(limit)
-        ).all()
+        )
+        if workspace_id is not None:
+            gen_q = gen_q.where(Lead.workspace_id == workspace_id)
+        gens = session.execute(gen_q).all()
         kind_label = {"email": "email", "call_script": "call script", "linkedin_msg": "LinkedIn DM"}
         for r in gens:
             name = f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip() or "(no name)"
@@ -140,7 +165,7 @@ def recent_activity(limit: int = 8) -> list[dict[str, Any]]:
                 "when": r.created_at,
             })
 
-        sends = session.execute(
+        sends_q = (
             select(
                 GeneratedContent.delivered_at,
                 Lead.first_name,
@@ -150,7 +175,10 @@ def recent_activity(limit: int = 8) -> list[dict[str, Any]]:
             .where(GeneratedContent.delivered_at.is_not(None))
             .order_by(GeneratedContent.delivered_at.desc())
             .limit(limit)
-        ).all()
+        )
+        if workspace_id is not None:
+            sends_q = sends_q.where(Lead.workspace_id == workspace_id)
+        sends = session.execute(sends_q).all()
         for r in sends:
             name = f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip() or "(no name)"
             events.append({
@@ -159,7 +187,7 @@ def recent_activity(limit: int = 8) -> list[dict[str, Any]]:
                 "when": r.delivered_at,
             })
 
-        replies = session.execute(
+        replies_q = (
             select(
                 Engagement.synced_at,
                 Lead.first_name,
@@ -171,14 +199,17 @@ def recent_activity(limit: int = 8) -> list[dict[str, Any]]:
             .where(Engagement.replied.is_(True))
             .order_by(Engagement.synced_at.desc())
             .limit(limit)
-        ).all()
+        )
+        if workspace_id is not None:
+            replies_q = replies_q.where(Lead.workspace_id == workspace_id)
+        replies = session.execute(replies_q).all()
         for r in replies:
             name = f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip() or "(no name)"
             company = (r.company or "").strip()
             text = f"Reply from {name}" + (f" at {company}" if company else "")
             events.append({"kind": "reply", "text": text, "when": r.synced_at})
 
-        ratings = session.execute(
+        ratings_q = (
             select(
                 ContentRating.rated_at,
                 ContentRating.rating,
@@ -189,7 +220,10 @@ def recent_activity(limit: int = 8) -> list[dict[str, Any]]:
             .join(Lead, Lead.id == GeneratedContent.lead_id)
             .order_by(ContentRating.rated_at.desc())
             .limit(limit)
-        ).all()
+        )
+        if workspace_id is not None:
+            ratings_q = ratings_q.where(Lead.workspace_id == workspace_id)
+        ratings = session.execute(ratings_q).all()
         for r in ratings:
             name = f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip() or "(no name)"
             verb = "Thumbs-up" if r.rating == "up" else "Thumbs-down"
@@ -204,7 +238,7 @@ def recent_activity(limit: int = 8) -> list[dict[str, Any]]:
     return events[:limit]
 
 
-def ready_to_send_count() -> int:
+def ready_to_send_count(workspace_id: int | None = None) -> int:
     """Leads with active email content that hasn't been delivered yet.
 
     Used to drive the Dashboard promo CTA. Counts distinct leads with at
@@ -221,12 +255,14 @@ def ready_to_send_count() -> int:
                 func.coalesce(GeneratedContent.delivery_status, "") != "in_progress",
             )
         )
+        if workspace_id is not None:
+            stmt = stmt.where(GeneratedContent.workspace_id == workspace_id)
         return int(session.execute(stmt).scalar() or 0)
 
 
-def list_leads() -> pd.DataFrame:
+def list_leads(workspace_id: int | None = None) -> pd.DataFrame:
     """Lead list with joined score/enrichment/email-delivery/reply flags."""
-    email_sub = _email_content_subq()
+    email_sub = _email_content_subq(workspace_id=workspace_id)
     stmt = (
         select(
             Lead.id.label("id"),
@@ -269,6 +305,8 @@ def list_leads() -> pd.DataFrame:
         )
         .order_by(Lead.id.asc())
     )
+    if workspace_id is not None:
+        stmt = stmt.where(Lead.workspace_id == workspace_id)
     with session_scope() as session:
         rows = session.execute(stmt).all()
 
@@ -319,51 +357,60 @@ def get_all_lead_ids() -> list[int]:
     return [r[0] for r in rows]
 
 
-def get_unenriched_lead_ids() -> list[int]:
+def get_unenriched_lead_ids(workspace_id: int | None = None) -> list[int]:
     """Return IDs of all leads with no Enrichment row, ordered by id."""
     enriched_subq = select(Enrichment.lead_id).subquery()
+    stmt = (
+        select(Lead.id)
+        .where(Lead.id.notin_(select(enriched_subq.c.lead_id)))
+        .order_by(Lead.id.asc())
+    )
+    if workspace_id is not None:
+        stmt = stmt.where(Lead.workspace_id == workspace_id)
     with session_scope() as session:
-        rows = session.execute(
-            select(Lead.id)
-            .where(Lead.id.notin_(select(enriched_subq.c.lead_id)))
-            .order_by(Lead.id.asc())
-        ).all()
+        rows = session.execute(stmt).all()
     return [r[0] for r in rows]
 
 
-def get_unscored_lead_ids() -> list[int]:
+def get_unscored_lead_ids(workspace_id: int | None = None) -> list[int]:
     """Return IDs of leads that have enrichment but no Score row yet."""
     enriched_subq = select(Enrichment.lead_id).subquery()
     scored_subq = select(Score.lead_id).subquery()
+    stmt = (
+        select(Lead.id)
+        .where(
+            Lead.id.in_(select(enriched_subq.c.lead_id)),
+            Lead.id.notin_(select(scored_subq.c.lead_id)),
+        )
+        .order_by(Lead.id.asc())
+    )
+    if workspace_id is not None:
+        stmt = stmt.where(Lead.workspace_id == workspace_id)
     with session_scope() as session:
-        rows = session.execute(
-            select(Lead.id)
-            .where(
-                Lead.id.in_(select(enriched_subq.c.lead_id)),
-                Lead.id.notin_(select(scored_subq.c.lead_id)),
-            )
-            .order_by(Lead.id.asc())
-        ).all()
+        rows = session.execute(stmt).all()
     return [r[0] for r in rows]
 
 
-def get_content_pending_lead_ids() -> list[int]:
+def get_content_pending_lead_ids(workspace_id: int | None = None) -> list[int]:
     """Return IDs of leads that have a Score but no GeneratedContent row yet."""
     scored_subq = select(Score.lead_id).subquery()
     content_subq = select(GeneratedContent.lead_id).subquery()
+    stmt = (
+        select(Lead.id)
+        .where(
+            Lead.id.in_(select(scored_subq.c.lead_id)),
+            Lead.id.notin_(select(content_subq.c.lead_id)),
+        )
+        .order_by(Lead.id.asc())
+    )
+    if workspace_id is not None:
+        stmt = stmt.where(Lead.workspace_id == workspace_id)
     with session_scope() as session:
-        rows = session.execute(
-            select(Lead.id)
-            .where(
-                Lead.id.in_(select(scored_subq.c.lead_id)),
-                Lead.id.notin_(select(content_subq.c.lead_id)),
-            )
-            .order_by(Lead.id.asc())
-        ).all()
+        rows = session.execute(stmt).all()
     return [r[0] for r in rows]
 
 
-def get_lead_ids_by_tiers(tiers: list[str]) -> list[int]:
+def get_lead_ids_by_tiers(tiers: list[str], workspace_id: int | None = None) -> list[int]:
     """Return lead IDs whose Score.tier is in `tiers`, ascending by lead id.
 
     Same tier source as the Leads table (`list_leads` joins `Score` 1:1 with
@@ -374,33 +421,41 @@ def get_lead_ids_by_tiers(tiers: list[str]) -> list[int]:
     normalized = [t.upper() for t in tiers if t]
     if not normalized:
         return []
+    stmt = (
+        select(Lead.id)
+        .join(Score, Score.lead_id == Lead.id)
+        .where(Score.tier.in_(normalized))
+        .order_by(Lead.id.asc())
+    )
+    if workspace_id is not None:
+        stmt = stmt.where(Lead.workspace_id == workspace_id)
     with session_scope() as session:
-        rows = session.execute(
-            select(Lead.id)
-            .join(Score, Score.lead_id == Lead.id)
-            .where(Score.tier.in_(normalized))
-            .order_by(Lead.id.asc())
-        ).all()
+        rows = session.execute(stmt).all()
     return [r[0] for r in rows]
 
 
-def get_leads_with_content_by_tier(tiers: list[str]) -> list[int]:
+def get_leads_with_content_by_tier(
+    tiers: list[str], workspace_id: int | None = None
+) -> list[int]:
     """Return lead IDs whose Score.tier is in `tiers` AND that have at least
     one active (non-superseded) GeneratedContent row. Used by the bulk
     regenerate UI to scope a tier-targeted refresh."""
     if not tiers:
         return []
+    stmt = (
+        select(Lead.id)
+        .join(Score, Score.lead_id == Lead.id)
+        .join(GeneratedContent, GeneratedContent.lead_id == Lead.id)
+        .where(
+            Score.tier.in_(tiers),
+            GeneratedContent.superseded_by_id.is_(None),
+        )
+        .distinct()
+    )
+    if workspace_id is not None:
+        stmt = stmt.where(Lead.workspace_id == workspace_id)
     with session_scope() as session:
-        rows = session.execute(
-            select(Lead.id)
-            .join(Score, Score.lead_id == Lead.id)
-            .join(GeneratedContent, GeneratedContent.lead_id == Lead.id)
-            .where(
-                Score.tier.in_(tiers),
-                GeneratedContent.superseded_by_id.is_(None),
-            )
-            .distinct()
-        ).all()
+        rows = session.execute(stmt).all()
     return sorted(r[0] for r in rows)
 
 
@@ -425,15 +480,21 @@ def get_content_lead_ids(lead_ids: list[int], kind: str) -> set[int]:
     return {r[0] for r in rows}
 
 
-def get_lead_full(lead_id: int) -> dict[str, Any] | None:
+def get_lead_full(
+    lead_id: int, workspace_id: int | None = None
+) -> dict[str, Any] | None:
     """Bundle Lead + Enrichment + Score + GeneratedContent[] + Engagement[] as plain dicts.
 
-    Returns None when the lead does not exist. All ORM attributes are read inside
-    the session so the caller never touches detached objects.
+    Returns None when the lead does not exist or when workspace_id is given
+    and the lead belongs to a different workspace (requirement 7: do not fall
+    back to another workspace).  All ORM attributes are read inside the session
+    so the caller never touches detached objects.
     """
     with session_scope() as session:
         lead = session.get(Lead, lead_id)
         if lead is None:
+            return None
+        if workspace_id is not None and lead.workspace_id != workspace_id:
             return None
 
         lead_dict = {
@@ -551,7 +612,7 @@ def get_lead_full(lead_id: int) -> dict[str, Any] | None:
         }
 
 
-def latest_instantly_snapshot() -> dict[str, Any] | None:
+def latest_instantly_snapshot(workspace_id: int | None = None) -> dict[str, Any] | None:
     """Most-recent Instantly analytics snapshot, as a plain dict.
 
     Returns None when no snapshot exists yet (e.g. the GitHub Actions job
@@ -564,11 +625,16 @@ def latest_instantly_snapshot() -> dict[str, Any] | None:
     addition so no data is lost across the migration.
     """
     with session_scope() as session:
-        snap = session.execute(
+        snap_q = (
             select(InstantlyAnalyticsSnapshot)
             .order_by(InstantlyAnalyticsSnapshot.synced_at.desc())
             .limit(1)
-        ).scalar_one_or_none()
+        )
+        if workspace_id is not None:
+            snap_q = snap_q.where(
+                InstantlyAnalyticsSnapshot.workspace_id == workspace_id
+            )
+        snap = session.execute(snap_q).scalar_one_or_none()
         if snap is None:
             return None
         raw = snap.raw or {}
@@ -625,31 +691,36 @@ def latest_instantly_snapshot() -> dict[str, Any] | None:
         }
 
 
-def local_sent_count() -> int:
+def local_sent_count(workspace_id: int | None = None) -> int:
     """Count of email GeneratedContent rows with delivery_status='sent'.
 
     Used to surface the Instantly-vs-local discrepancy on the Engagement
     page. Mirrors the count behind the "Sent folder" list.
     """
     with session_scope() as session:
-        return int(
-            session.execute(
-                select(func.count(GeneratedContent.id)).where(
-                    GeneratedContent.kind == "email",
-                    GeneratedContent.delivery_status == "sent",
-                )
-            ).scalar()
-            or 0
+        stmt = select(func.count(GeneratedContent.id)).where(
+            GeneratedContent.kind == "email",
+            GeneratedContent.delivery_status == "sent",
         )
+        if workspace_id is not None:
+            stmt = stmt.where(GeneratedContent.workspace_id == workspace_id)
+        return int(session.execute(stmt).scalar() or 0)
 
 
-def last_sync_time() -> datetime | None:
+def last_sync_time(workspace_id: int | None = None) -> datetime | None:
     with session_scope() as session:
-        ts = session.execute(select(func.max(Engagement.synced_at))).scalar()
+        stmt = select(func.max(Engagement.synced_at))
+        if workspace_id is not None:
+            stmt = (
+                stmt
+                .join(GeneratedContent, Engagement.content_id == GeneratedContent.id)
+                .where(GeneratedContent.workspace_id == workspace_id)
+            )
+        ts = session.execute(stmt).scalar()
     return ts
 
 
-def recent_engagement(limit: int = 20) -> pd.DataFrame:
+def recent_engagement(limit: int = 20, workspace_id: int | None = None) -> pd.DataFrame:
     """Most-recent successful email pushes, joined with optional engagement.
 
     Source is `GeneratedContent` (delivery_status='sent', kind='email') —
@@ -698,6 +769,8 @@ def recent_engagement(limit: int = 20) -> pd.DataFrame:
         )
         .limit(limit)
     )
+    if workspace_id is not None:
+        stmt = stmt.where(GeneratedContent.workspace_id == workspace_id)
     with session_scope() as session:
         rows = session.execute(stmt).all()
     return pd.DataFrame.from_records(
@@ -735,7 +808,7 @@ def recent_engagement(limit: int = 20) -> pd.DataFrame:
     )
 
 
-def sent_emails() -> pd.DataFrame:
+def sent_emails(workspace_id: int | None = None) -> pd.DataFrame:
     """All email GeneratedContent rows that were successfully pushed to Instantly.
 
     Filters on delivery_status = "sent" (the Phase 9 outcome flag for a
@@ -764,6 +837,8 @@ def sent_emails() -> pd.DataFrame:
             GeneratedContent.id.desc(),
         )
     )
+    if workspace_id is not None:
+        stmt = stmt.where(GeneratedContent.workspace_id == workspace_id)
     with session_scope() as session:
         rows = session.execute(stmt).all()
     return pd.DataFrame.from_records(
@@ -782,7 +857,7 @@ def sent_emails() -> pd.DataFrame:
     )
 
 
-def reply_rate_series(days: int = 30) -> pd.DataFrame:
+def reply_rate_series(days: int = 30, workspace_id: int | None = None) -> pd.DataFrame:
     """Aggregate replies / sends by date(synced_at) over the last N days."""
     cutoff = datetime.utcnow() - timedelta(days=days)
     with session_scope() as session:
@@ -802,6 +877,8 @@ def reply_rate_series(days: int = 30) -> pd.DataFrame:
             .group_by(func.date(Engagement.synced_at))
             .order_by(func.date(Engagement.synced_at).asc())
         )
+        if workspace_id is not None:
+            stmt = stmt.where(GeneratedContent.workspace_id == workspace_id)
         rows = session.execute(stmt).all()
     df = pd.DataFrame(
         [{"date": r.day, "sent": int(r.sent or 0), "replied": int(r.replied or 0)} for r in rows]

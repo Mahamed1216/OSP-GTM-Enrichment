@@ -15,6 +15,7 @@ import streamlit as st
 from app.lib.async_runner import run_async
 from app.lib.badges import status_pill, tier_badge
 from app.lib.db_queries import list_leads
+from app.lib.workspace_state import get_current_workspace_id, render_workspace_banner
 from app.styles import inject_styles
 from src.config import settings
 from src.db import session_scope
@@ -34,8 +35,8 @@ _CONFIRM_TTL = 5.0  # seconds for two-click confirm window
 _BULK_PUSH_HARD_LIMIT = 10  # over this requires "I understand" checkbox
 
 @st.cache_data(ttl=30)
-def _list_leads_cached() -> pd.DataFrame:
-    return list_leads()
+def _list_leads_cached(workspace_id: int | None) -> pd.DataFrame:
+    return list_leads(workspace_id=workspace_id)
 
 
 def _row_status(row: pd.Series) -> str:
@@ -53,6 +54,8 @@ def _row_status(row: pd.Series) -> str:
     return status_pill("pending")
 
 
+_ws_id = get_current_workspace_id()
+
 st.markdown(
     '<div style="margin-bottom: 3rem;">'
     '<h1 class="hero-headline" style="font-size: 72px;">Leads.</h1>'
@@ -61,8 +64,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+render_workspace_banner()
+
 try:
-    df = _list_leads_cached()
+    df = _list_leads_cached(workspace_id=_ws_id)
 except Exception as exc:
     st.error(f"Could not load leads: {exc}")
     st.stop()

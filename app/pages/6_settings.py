@@ -20,6 +20,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import streamlit as st
 
+from app.lib.workspace_state import get_current_workspace, get_current_workspace_id, render_workspace_banner
 from app.styles import inject_styles
 from src.workspace import (
     get_campaign_id_source,
@@ -68,7 +69,21 @@ st.markdown(
 )
 st.write(_last_saved_caption(CONFIG_PATH))
 
-# ---------- Workspace foundation (read-only, Phase 2) ----------
+render_workspace_banner()
+
+# ---------- Workspace foundation (read-only, Phase 2 + Phase 3) ----------
+# Phase 3: show the currently selected workspace prominently.
+_selected_ws = get_current_workspace()
+_selected_ws_id = get_current_workspace_id()
+if _selected_ws:
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    sc1.metric("Selected workspace", _selected_ws.get("name") or "—")
+    sc2.metric("Workspace ID", str(_selected_ws.get("id") or "—"))
+    _sel_campaign_id = _selected_ws.get("instantly_campaign_id") or "—"
+    _sel_src = get_campaign_id_source(_selected_ws_id)
+    sc3.metric("Campaign ID", _sel_campaign_id)
+    sc4.metric("Campaign source", _sel_src)
+
 with st.expander("Workspace foundation (read-only)", expanded=False):
     try:
         _ws = get_default_workspace()

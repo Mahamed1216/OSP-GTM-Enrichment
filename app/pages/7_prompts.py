@@ -21,6 +21,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import streamlit as st
 
+from app.lib.workspace_state import render_workspace_banner
 from app.styles import inject_styles
 from src.prompts.call_script import DEFAULT_CALL_SCRIPT_PROMPT_BODY
 from src.prompts.email import DEFAULT_EMAIL_PROMPT_BODY
@@ -234,6 +235,7 @@ st.markdown(
     '</div>',
     unsafe_allow_html=True,
 )
+render_workspace_banner()
 st.write(_last_saved_caption())
 
 for channel, label, default_body in CHANNELS:

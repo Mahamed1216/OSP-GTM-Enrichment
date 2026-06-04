@@ -36,6 +36,7 @@ from app.lib.db_queries import (
     reply_rate_series,
     sent_emails,
 )
+from app.lib.workspace_state import get_current_workspace_id, render_workspace_banner
 from app.styles import inject_styles
 
 inject_styles()
@@ -84,18 +85,18 @@ _TYPE_FILTER_OPTIONS = ["All", "email", "call_script", "linkedin_msg"]
 
 
 @st.cache_data(ttl=15)
-def _kpi_counts_cached() -> dict[str, int]:
-    return kpi_counts()
+def _kpi_counts_cached(workspace_id: int | None) -> dict[str, int]:
+    return kpi_counts(workspace_id=workspace_id)
 
 
 @st.cache_data(ttl=15)
-def _instantly_snapshot_cached() -> dict | None:
-    return latest_instantly_snapshot()
+def _instantly_snapshot_cached(workspace_id: int | None) -> dict | None:
+    return latest_instantly_snapshot(workspace_id=workspace_id)
 
 
 @st.cache_data(ttl=15)
-def _local_sent_cached() -> int:
-    return local_sent_count()
+def _local_sent_cached(workspace_id: int | None) -> int:
+    return local_sent_count(workspace_id=workspace_id)
 
 
 @st.cache_data(ttl=15)
@@ -109,13 +110,13 @@ def _recommendations_cached() -> list[dict]:
 
 
 @st.cache_data(ttl=15)
-def _last_sync_cached() -> datetime | None:
-    return last_sync_time()
+def _last_sync_cached(workspace_id: int | None) -> datetime | None:
+    return last_sync_time(workspace_id=workspace_id)
 
 
 @st.cache_data(ttl=15)
-def _reply_rate_cached(days: int) -> pd.DataFrame:
-    return reply_rate_series(days=days)
+def _reply_rate_cached(days: int, workspace_id: int | None = None) -> pd.DataFrame:
+    return reply_rate_series(days=days, workspace_id=workspace_id)
 
 
 @st.cache_data(ttl=15)
@@ -129,13 +130,13 @@ def _negatives_cached() -> list[dict]:
 
 
 @st.cache_data(ttl=15)
-def _recent_engagement_cached(limit: int) -> "pd.DataFrame":
-    return recent_engagement(limit=limit)
+def _recent_engagement_cached(limit: int, workspace_id: int | None = None) -> "pd.DataFrame":
+    return recent_engagement(limit=limit, workspace_id=workspace_id)
 
 
 @st.cache_data(ttl=15)
-def _sent_emails_cached() -> "pd.DataFrame":
-    return sent_emails()
+def _sent_emails_cached(workspace_id: int | None = None) -> "pd.DataFrame":
+    return sent_emails(workspace_id=workspace_id)
 
 
 def _format_event_when(ts) -> str:
@@ -271,6 +272,8 @@ if not _ensure_ws():
     )
     st.stop()
 
+_ws_id = get_current_workspace_id()
+
 st.markdown(
     '<div style="margin-bottom: 3rem;">'
     '<h1 class="hero-headline" style="font-size: 72px;">Engagement.</h1>'
@@ -279,8 +282,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+render_workspace_banner()
+
 # ---------- Sync controls ----------
-_snapshot = _instantly_snapshot_cached()
+_snapshot = _instantly_snapshot_cached(workspace_id=_ws_id)
 if _snapshot is not None:
     st.caption(
         f"Last synced from Instantly: {_format_timestamp(_snapshot.get('synced_at'))} "
@@ -316,7 +321,7 @@ if sync_clicked:
     per_lead: dict | None = None
     sync_error: str | None = None
     mismatch_debug: dict | None = None
-    local_before = _local_sent_cached()
+    local_before = _local_sent_cached(workspace_id=_ws_id)
     try:
         with st.spinner("Syncing from Instantly…"):
             analytics_result = run_async(sync_campaign_analytics())
@@ -446,7 +451,7 @@ if _snapshot is not None:
 # Sync-hygiene warning: surfaced ONLY here, never as a self-improvement
 # recommendation. The loop's delivery branch is informational; this
 # warning is the operator-facing version.
-_local_sent = _local_sent_cached()
+_local_sent = _local_sent_cached(workspace_id=_ws_id)
 if _snapshot is not None and contacted and abs(contacted - _local_sent) >= 5:
     st.warning(
         f"Sync hygiene: Instantly has {contacted:,} sequence started, but "
@@ -1033,7 +1038,7 @@ days = st.number_input(
     help="Window for the reply-rate trend below.",
 )
 try:
-    rr_df = _reply_rate_cached(int(days))
+    rr_df = _reply_rate_cached(int(days), workspace_id=_ws_id)
 except Exception as exc:
     st.error(f"Could not load reply-rate series: {exc}")
     rr_df = pd.DataFrame()
@@ -1250,7 +1255,7 @@ recent_limit = st.number_input(
     "Show last", min_value=5, max_value=200, value=20, step=5, key="eng_recent_limit",
 )
 try:
-    recent_df = _recent_engagement_cached(int(recent_limit))
+    recent_df = _recent_engagement_cached(int(recent_limit), workspace_id=_ws_id)
 except Exception as exc:
     st.error(f"Could not load recent engagement: {exc}")
     recent_df = pd.DataFrame()
@@ -1298,7 +1303,7 @@ st.divider()
 st.subheader("Sent folder")
 st.caption("All emails successfully pushed to Instantly. Newest first.")
 try:
-    sent_df = _sent_emails_cached()
+    sent_df = _sent_emails_cached(workspace_id=_ws_id)
 except Exception as exc:
     st.error(f"Could not load sent folder: {exc}")
     sent_df = pd.DataFrame()

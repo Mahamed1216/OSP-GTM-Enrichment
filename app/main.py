@@ -53,14 +53,6 @@ if is_auth_enabled() and not is_authenticated():
             st.error("Incorrect password.")
     st.stop()
 
-with st.sidebar:
-    if is_auth_enabled():
-        if st.button("Sign out", use_container_width=True, key="sidebar_signout"):
-            logout()
-            st.rerun()
-    else:
-        st.caption(":orange[Dev mode — auth disabled]")
-
 # setup_logging is guarded by session state (calling it twice in a session
 # is harmless, but we skip the overhead when already done for this session).
 if not st.session_state.get("_app_initialized"):
@@ -77,6 +69,57 @@ if not st.session_state.get("_app_initialized"):
 # workspace_id columns uncreated in production Postgres.
 from src.db import init_db
 init_db()
+
+# Phase 3: ensure session state has a valid current workspace selection.
+from app.lib.workspace_state import (  # noqa: E402  after init_db
+    get_current_workspace_id,
+    get_current_workspace,
+    init_workspace_state,
+    set_current_workspace,
+)
+from src.workspace import get_active_workspaces
+init_workspace_state()
+
+# -----------------------------------------------------------------------
+# Sidebar — workspace selector (bottom-left, above sign-out)
+# -----------------------------------------------------------------------
+with st.sidebar:
+    # Workspace selector — profile-switcher style.
+    try:
+        _ws_list = get_active_workspaces()
+    except Exception:
+        _ws_list = []
+
+    if _ws_list:
+        _ws_ids = [ws["id"] for ws in _ws_list]
+        _ws_names = {ws["id"]: ws["name"] for ws in _ws_list}
+        _cur_ws_id = get_current_workspace_id()
+        _default_idx = _ws_ids.index(_cur_ws_id) if _cur_ws_id in _ws_ids else 0
+
+        st.markdown("**Workspace**")
+        _selected_ws_id = st.selectbox(
+            "workspace_select",
+            options=_ws_ids,
+            format_func=lambda wid: _ws_names.get(wid, f"#{wid}"),
+            index=_default_idx,
+            key="sidebar_ws_selector",
+            label_visibility="collapsed",
+            help="Switch the active workspace. All pages scope data to this selection.",
+        )
+        if _selected_ws_id is not None and _selected_ws_id != _cur_ws_id:
+            set_current_workspace(_selected_ws_id)
+            st.rerun()
+    else:
+        st.caption(":gray[No workspaces found]")
+
+    st.divider()
+
+    if is_auth_enabled():
+        if st.button("Sign out", use_container_width=True, key="sidebar_signout"):
+            logout()
+            st.rerun()
+    else:
+        st.caption(":orange[Dev mode — auth disabled]")
 
 _PAGES_DIR = Path(__file__).parent / "pages"
 

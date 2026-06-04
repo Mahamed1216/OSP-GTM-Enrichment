@@ -27,29 +27,30 @@ from app.lib.db_queries import (
     tier_distribution,
 )
 from app.lib.formatters import fmt_timestamp
+from app.lib.workspace_state import get_current_workspace_id, render_workspace_banner
 from app.styles import inject_styles
 
 inject_styles()
 
 
 @st.cache_data(ttl=30)
-def _kpi_counts_cached() -> dict:
-    return kpi_counts()
+def _kpi_counts_cached(workspace_id: int | None) -> dict:
+    return kpi_counts(workspace_id=workspace_id)
 
 
 @st.cache_data(ttl=30)
-def _tier_distribution_cached() -> dict:
-    return tier_distribution()
+def _tier_distribution_cached(workspace_id: int | None) -> dict:
+    return tier_distribution(workspace_id=workspace_id)
 
 
 @st.cache_data(ttl=30)
-def _recent_activity_cached(limit: int = 8) -> list[dict]:
-    return recent_activity(limit=limit)
+def _recent_activity_cached(limit: int = 8, workspace_id: int | None = None) -> list[dict]:
+    return recent_activity(limit=limit, workspace_id=workspace_id)
 
 
 @st.cache_data(ttl=30)
-def _ready_to_send_cached() -> int:
-    return ready_to_send_count()
+def _ready_to_send_cached(workspace_id: int | None) -> int:
+    return ready_to_send_count(workspace_id=workspace_id)
 
 
 @st.cache_data(ttl=30)
@@ -65,6 +66,8 @@ def _rating_trends_cached(days: int = 30) -> pd.DataFrame:
     return rating_summary_per_content_type(days=days)
 
 
+_ws_id = get_current_workspace_id()
+
 st.markdown(
     '<div class="hero-block">'
     '<h1 class="hero-headline">Outbound that lands.</h1>'
@@ -74,9 +77,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+render_workspace_banner()
+
 # ----- KPIs -----
 try:
-    kpis = _kpi_counts_cached()
+    kpis = _kpi_counts_cached(workspace_id=_ws_id)
 except Exception as exc:
     st.error(f"Could not load KPIs: {exc}")
     kpis = {
@@ -86,7 +91,7 @@ except Exception as exc:
 
 verified_emails = kpis["enriched"]  # enrichment success implies verified email
 try:
-    ready_n = _ready_to_send_cached()
+    ready_n = _ready_to_send_cached(workspace_id=_ws_id)
 except Exception:
     ready_n = max(0, kpis.get("scored", 0) - kpis.get("sent", 0))
 
@@ -130,7 +135,7 @@ col_left, col_right = st.columns([1, 1])
 
 with col_left:
     try:
-        dist = _tier_distribution_cached()
+        dist = _tier_distribution_cached(workspace_id=_ws_id)
     except Exception as exc:
         st.error(f"Could not load tier distribution: {exc}")
         dist = {}
@@ -141,7 +146,7 @@ with col_left:
 
 with col_right:
     try:
-        feed_events = _recent_activity_cached(limit=8)
+        feed_events = _recent_activity_cached(limit=8, workspace_id=_ws_id)
     except Exception as exc:
         st.error(f"Could not load activity: {exc}")
         feed_events = []
