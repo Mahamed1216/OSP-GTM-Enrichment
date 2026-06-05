@@ -589,6 +589,25 @@ def get_api_key_for_workspace(workspace_id: int | None = None) -> str | None:
     return env_key or None
 
 
+def get_calendar_link_for_workspace(workspace_id: int | None = None) -> str | None:
+    """Return the calendar / booking link stored in workspace.icp_config, or None.
+
+    Reads from ``workspace.icp_config["calendar_link"]``. Returns None when the
+    workspace has no icp_config, or the key is absent / blank.
+    """
+    workspace: dict[str, Any] | None = (
+        get_workspace_by_id(workspace_id) if workspace_id is not None
+        else get_default_workspace()
+    )
+    if workspace:
+        cfg = workspace.get("icp_config") or {}
+        if isinstance(cfg, dict):
+            link = (cfg.get("calendar_link") or "").strip()
+            if link:
+                return link
+    return None
+
+
 def get_api_key_source(workspace_id: int | None = None) -> str:
     """Return a human-readable label for where the API key comes from."""
     workspace: dict[str, Any] | None = None

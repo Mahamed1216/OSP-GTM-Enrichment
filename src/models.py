@@ -408,7 +408,7 @@ class PromptConfig(Base):
 
 
 class ReplyDraft(Base):
-    """Reply draft produced by the Reply Agent. Draft-only — nothing is sent automatically."""
+    """Reply draft produced by the Manual Draft Tester. Draft-only — nothing sent automatically."""
     __tablename__ = "reply_drafts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -421,6 +421,56 @@ class ReplyDraft(Base):
     recommended_action: Mapped[str] = mapped_column(String(64), nullable=False)
     draft_body: Mapped[str] = mapped_column(Text, nullable=False)
     human_review_notes: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=now_utc, onupdate=now_utc, nullable=False
+    )
+
+
+class ReplyThread(Base):
+    """One inbound reply synced from Instantly, with auto-generated draft.
+
+    Status lifecycle:
+      needs_review → (operator approves) → approved → (send attempt)
+                   → sent | failed | manual_send_required
+      needs_review → skipped  (operator dismissed)
+      needs_human_review  (unsubscribe/angry/placeholder text)
+
+    Deduplication: (workspace_id, campaign_id, dedup_key) must be unique.
+      dedup_key = "msg:{message_id}"        if message_id available
+               = "lead:{instantly_lead_id}" if lead_id available
+               = "hash:{sha256(email+reply[:200])[:32]}" fallback
+    """
+    __tablename__ = "reply_threads"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id", "campaign_id", "dedup_key",
+            name="uq_reply_threads_workspace_campaign_dedup",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workspace_id: Mapped[Optional[int]] = mapped_column(Integer, default=_default_workspace_id, index=True)
+    lead_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    campaign_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    instantly_lead_id: Mapped[Optional[str]] = mapped_column(String(256))
+    prospect_email: Mapped[str] = mapped_column(String(256), nullable=False)
+    prospect_name: Mapped[Optional[str]] = mapped_column(String(256))
+    company_name: Mapped[Optional[str]] = mapped_column(String(256))
+    thread_id: Mapped[Optional[str]] = mapped_column(String(256))
+    message_id: Mapped[Optional[str]] = mapped_column(String(256))
+    inbound_reply_text: Mapped[str] = mapped_column(Text, nullable=False)
+    original_outbound_email: Mapped[Optional[str]] = mapped_column(Text)
+    reply_received_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    classification: Mapped[str] = mapped_column(String(64), nullable=False, default="needs_human_review")
+    recommended_action: Mapped[str] = mapped_column(String(64), nullable=False, default="route_to_human")
+    draft_body: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    human_review_notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="needs_review", index=True)
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    send_error: Mapped[Optional[str]] = mapped_column(Text)
+    raw_payload: Mapped[Optional[dict]] = mapped_column(JSON)
+    dedup_key: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=now_utc, onupdate=now_utc, nullable=False

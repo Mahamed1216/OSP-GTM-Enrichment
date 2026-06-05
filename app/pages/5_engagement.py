@@ -57,6 +57,19 @@ from src.feedback.reply_agent import (
     classify_and_draft_reply,
     save_reply_draft,
 )
+from src.feedback.reply_sync import (
+    STATUS_APPROVED,
+    STATUS_MANUAL_SEND,
+    STATUS_NEEDS_HUMAN,
+    STATUS_NEEDS_REVIEW,
+    STATUS_SENT,
+    STATUS_SKIPPED,
+    get_reply_queue,
+    get_send_blocked_reason,
+    sync_reply_queue,
+    try_send_reply,
+    update_reply_thread,
+)
 from src.feedback.self_improvement import (
     DEFAULT_BOUNCE_RATE_MAX,
     DEFAULT_OPEN_RATE_TARGET,
@@ -485,11 +498,11 @@ st.divider()
 
 # ---------- Reply Agent ----------
 st.subheader("Reply Agent")
-st.caption("Classify replies, draft responses, and help book meetings.")
+st.caption("Review opportunity replies, approve drafts, and send responses through Instantly.")
 if _current_ws:
     st.caption(f"Current workspace: **{_current_ws.get('name')}**")
 
-_ACTION_LABELS = {
+_RA_ACTION_LABELS = {
     "book_meeting": "📅 Book meeting",
     "ask_clarifying_question": "❓ Ask a clarifying question",
     "send_info": "📧 Send info",
@@ -498,108 +511,377 @@ _ACTION_LABELS = {
     "stop_sequence": "🛑 Stop sequence (opt-out)",
     "do_not_reply": "⏭ Do not reply",
 }
+_RA_STATUS_ICONS = {
+    STATUS_NEEDS_REVIEW: "🔔 Needs review",
+    STATUS_NEEDS_HUMAN: "🚨 Needs human",
+    STATUS_SENT: "✅ Sent",
+    STATUS_SKIPPED: "⏭ Skipped",
+    "failed": "❌ Failed",
+    STATUS_MANUAL_SEND: "📋 Manual send required",
+    STATUS_APPROVED: "✓ Approved",
+}
 
-with st.form("reply_agent_form", clear_on_submit=False):
-    _ra_col1, _ra_col2 = st.columns(2)
-    with _ra_col1:
-        _ra_inbound = st.text_area(
-            "Paste inbound reply",
-            placeholder="Paste the prospect reply here",
-            height=120,
-            key="ra_inbound",
-        )
-        _ra_original = st.text_area(
-            "Original outbound email",
-            placeholder="Paste the original email if available",
-            height=80,
-            key="ra_original",
-        )
-    with _ra_col2:
-        _ra_context = st.text_area(
-            "Lead or company context",
-            placeholder="Add anything useful about the lead, company, offer, or ICP",
-            height=80,
-            key="ra_context",
-        )
-        _ra_calendar = st.text_input(
-            "Calendar link",
-            placeholder="Paste booking link",
-            key="ra_calendar",
-        )
-    _ra_submit = st.form_submit_button("Generate reply draft", type="primary")
+# Load workspace calendar link (used for auto-drafts)
+try:
+    from src.workspace import get_calendar_link_for_workspace as _get_cal_link
+    _ws_calendar_link = _get_cal_link(_ws_id) or ""
+except Exception:
+    _ws_calendar_link = ""
 
-if _ra_submit:
-    if not _ra_inbound.strip():
-        st.warning("Paste an inbound reply to continue.")
-    else:
-        with st.spinner("Classifying and drafting reply…"):
+_tab_queue, _tab_manual = st.tabs(["Reply Queue", "Manual Draft Tester"])
+
+# ── Tab 1: Reply Queue ────────────────────────────────────────────────────
+with _tab_queue:
+
+    # Sync button
+    _rq_sync_col, _rq_info_col = st.columns([2, 4])
+    with _rq_sync_col:
+        _rq_sync_clicked = st.button(
+            "Sync opportunity replies from Instantly",
+            type="primary",
+            key="rq_sync_btn",
+        )
+    with _rq_info_col:
+        if _ws_calendar_link:
+            st.caption(f"Workspace calendar link: `{_ws_calendar_link}`")
+        else:
+            st.caption(
+                ":orange[No calendar link set for this workspace — reply drafts will ask to set up a time. "
+                "Add `calendar_link` to workspace icp_config to auto-include it.]"
+            )
+
+    if _rq_sync_clicked:
+        with st.spinner("Fetching opportunity replies from Instantly…"):
             try:
-                _ra_result = run_async(classify_and_draft_reply(
-                    inbound_reply=_ra_inbound,
-                    original_outbound_email=_ra_original,
-                    lead_context=_ra_context,
-                    calendar_link=_ra_calendar,
-                    workspace_id=_ws_id,
-                ))
-                st.session_state["ra_last_result"] = {
-                    "result": _ra_result,
-                    "inbound_snippet": _ra_inbound[:80],
-                }
-                # Append to session history (newest first, cap at 10)
-                _ra_history = st.session_state.get("ra_history", [])
-                _ra_history.insert(0, {
-                    "result": _ra_result,
-                    "inbound_snippet": _ra_inbound[:80],
-                })
-                st.session_state["ra_history"] = _ra_history[:10]
-                # Best-effort DB persist
-                save_reply_draft(
-                    _ra_result,
-                    inbound_reply=_ra_inbound,
-                    original_outbound_email=_ra_original,
-                    lead_context=_ra_context,
-                    workspace_id=_ws_id,
-                )
-            except Exception as _ra_exc:
-                st.error(f"Reply Agent failed: {_ra_exc}")
-                st.session_state.pop("ra_last_result", None)
+                _rq_sync_result = run_async(sync_reply_queue(workspace_id=_ws_id))
+                st.session_state["rq_last_sync"] = _rq_sync_result
+                st.cache_data.clear()
+            except Exception as _rq_exc:
+                st.error(f"Reply Queue sync failed: {_rq_exc}")
+                _rq_sync_result = None
 
-# Show the last generated draft (persists until a new draft is generated)
-if "ra_last_result" in st.session_state:
-    _ra_entry = st.session_state["ra_last_result"]
-    _ra_r = _ra_entry["result"]
-    with st.container(border=True):
-        _ra_action_label = _ACTION_LABELS.get(_ra_r.recommended_action, _ra_r.recommended_action)
-        _ra_left, _ra_right = st.columns(2)
-        with _ra_left:
-            st.markdown(f"**Intent:** `{_ra_r.classification}`")
-        with _ra_right:
-            st.markdown(f"**Recommended action:** {_ra_action_label}")
-        if _ra_r.human_review_notes:
-            st.info(f"**Review notes:** {_ra_r.human_review_notes}")
-        st.markdown("**Suggested reply draft** — copy manually before sending:")
-        st.text_area(
-            "Draft",
-            value=_ra_r.draft_body,
-            height=150,
-            key="ra_draft_output",
-            label_visibility="collapsed",
+        if _rq_sync_result is not None:
+            _rq_new = _rq_sync_result.get("new", 0)
+            _rq_upd = _rq_sync_result.get("updated", 0)
+            _rq_pos = _rq_sync_result.get("synced", 0)
+            _rq_skip = _rq_sync_result.get("skipped_no_text", 0)
+            st.success(
+                f"Sync complete — {_rq_pos} positive leads found, "
+                f"{_rq_new} new draft(s) created, "
+                f"{_rq_upd} existing record(s) refreshed. "
+                f"API key: {_rq_sync_result.get('api_key_source', '?')}."
+            )
+            if _rq_skip:
+                st.info(
+                    f"{_rq_skip} lead(s) had no reply text available from Instantly API — "
+                    "marked needs_human_review. Check the Instantly dashboard for their actual replies."
+                )
+
+            # Show per-lead email endpoint debug
+            _rq_debug_emails = _rq_sync_result.get("debug_emails_endpoint") or []
+            if _rq_debug_emails:
+                with st.expander(f"Debug — emails endpoint ({len(_rq_debug_emails)} lead(s) probed)"):
+                    for _d in _rq_debug_emails:
+                        st.json({k: v for k, v in _d.items() if k != "params"})
+            st.rerun()
+
+    # ── Summary KPIs ────────────────────────────────────────────────────
+    try:
+        _rq_threads = get_reply_queue(workspace_id=_ws_id)
+    except Exception as _rq_load_exc:
+        st.error(f"Could not load reply queue: {_rq_load_exc}")
+        _rq_threads = []
+
+    if _rq_threads:
+        from collections import Counter as _Counter
+        _rq_status_counts = _Counter(t["status"] for t in _rq_threads)
+        _k1, _k2, _k3, _k4 = st.columns(4)
+        with _k1:
+            kpi_card("Needs review", str(_rq_status_counts.get(STATUS_NEEDS_REVIEW, 0) + _rq_status_counts.get(STATUS_NEEDS_HUMAN, 0)))
+        with _k2:
+            kpi_card("Ready drafts", str(_rq_status_counts.get(STATUS_NEEDS_REVIEW, 0)))
+        with _k3:
+            kpi_card("Sent", str(_rq_status_counts.get(STATUS_SENT, 0)))
+        with _k4:
+            kpi_card(
+                "Manual / Failed",
+                str(_rq_status_counts.get(STATUS_MANUAL_SEND, 0) + _rq_status_counts.get("failed", 0)),
+            )
+
+    # ── Reply list table ─────────────────────────────────────────────────
+    if not _rq_threads:
+        st.info(
+            "No opportunity replies in the queue yet for this workspace. "
+            "Click **Sync opportunity replies from Instantly** above."
+        )
+    else:
+        _rq_rows = []
+        for _t in _rq_threads:
+            _recv = _t.get("reply_received_at")
+            _recv_str = _recv.strftime("%Y-%m-%d %H:%M") if _recv else "—"
+            _snippet = (_t.get("inbound_reply_text") or "")[:60].replace("\n", " ").strip()
+            _rq_rows.append({
+                "id": _t["id"],
+                "Prospect": _t.get("prospect_name") or _t.get("prospect_email") or "—",
+                "Company": _t.get("company_name") or "—",
+                "Received": _recv_str,
+                "Classification": _t.get("classification") or "—",
+                "Action": _RA_ACTION_LABELS.get(_t.get("recommended_action") or "", _t.get("recommended_action") or "—"),
+                "Status": _RA_STATUS_ICONS.get(_t.get("status") or "", _t.get("status") or "—"),
+                "Snippet": _snippet + ("…" if len(_t.get("inbound_reply_text", "")) > 60 else ""),
+            })
+        _rq_df = pd.DataFrame.from_records(
+            _rq_rows,
+            columns=["id", "Prospect", "Company", "Received", "Classification", "Action", "Status", "Snippet"],
+        )
+        _rq_selection = st.dataframe(
+            _rq_df,
+            hide_index=True,
+            use_container_width=True,
+            selection_mode="single-row",
+            on_select="rerun",
+            key="rq_table",
+        )
+        _rq_selected_rows = (
+            _rq_selection.selection.rows if _rq_selection and _rq_selection.selection else []
         )
 
-# Session history
-if st.session_state.get("ra_history"):
-    with st.expander(
-        f"Reply draft history — this session "
-        f"({len(st.session_state['ra_history'])} draft(s))"
-    ):
-        for _ra_i, _ra_h in enumerate(st.session_state["ra_history"]):
-            _r = _ra_h["result"]
-            with st.container(border=True):
-                st.caption(
-                    f"#{_ra_i + 1} · {_r.classification} → {_r.recommended_action} "
-                    f"· {_ra_h['inbound_snippet']}…"
-                )
-                st.text(_r.draft_body[:300])
+        if not _rq_selected_rows:
+            st.caption("Select a row above to review and act on the reply.")
+        else:
+            _rq_row_idx = _rq_selected_rows[0]
+            _rq_thread_id = _rq_df.iloc[_rq_row_idx]["id"]
+            _rq_thread = next((t for t in _rq_threads if t["id"] == _rq_thread_id), None)
+
+            if _rq_thread:
+                with st.container(border=True):
+                    _rq_h1, _rq_h2, _rq_h3 = st.columns(3)
+                    with _rq_h1:
+                        st.markdown(f"**Prospect:** {_rq_thread.get('prospect_name') or '—'} `{_rq_thread.get('prospect_email')}`")
+                    with _rq_h2:
+                        st.markdown(f"**Company:** {_rq_thread.get('company_name') or '—'}")
+                    with _rq_h3:
+                        _rq_status_label = _RA_STATUS_ICONS.get(_rq_thread["status"], _rq_thread["status"])
+                        st.markdown(f"**Status:** {_rq_status_label}")
+
+                    st.markdown("**Inbound reply:**")
+                    st.text_area(
+                        "Inbound reply",
+                        value=_rq_thread["inbound_reply_text"],
+                        height=100,
+                        disabled=True,
+                        key=f"rq_inbound_{_rq_thread_id}",
+                        label_visibility="collapsed",
+                    )
+
+                    if _rq_thread.get("original_outbound_email"):
+                        with st.expander("Original outbound email"):
+                            st.text(_rq_thread["original_outbound_email"])
+
+                    if _rq_thread.get("human_review_notes"):
+                        st.warning(f"**Review notes:** {_rq_thread['human_review_notes']}")
+
+                    _rq_action_label = _RA_ACTION_LABELS.get(
+                        _rq_thread.get("recommended_action") or "", _rq_thread.get("recommended_action") or "—"
+                    )
+                    _rq_info_left, _rq_info_right = st.columns(2)
+                    with _rq_info_left:
+                        st.caption(f"Intent: `{_rq_thread.get('classification') or '—'}`")
+                    with _rq_info_right:
+                        st.caption(f"Recommended: {_rq_action_label}")
+
+                    st.markdown("**Reply draft** — edit before approving:")
+                    _rq_draft_key = f"rq_draft_edit_{_rq_thread_id}"
+                    _rq_edited_draft = st.text_area(
+                        "Draft",
+                        value=st.session_state.get(_rq_draft_key, _rq_thread["draft_body"]),
+                        height=150,
+                        key=_rq_draft_key,
+                        label_visibility="collapsed",
+                        help="Edit the draft before approving. This does not save automatically.",
+                    )
+
+                    # Action buttons
+                    _rq_send_blocked = get_send_blocked_reason(_rq_thread)
+                    _rq_is_terminal = _rq_thread["status"] in (STATUS_SENT, STATUS_SKIPPED)
+
+                    _btn_a, _btn_b, _btn_c = st.columns(3)
+                    with _btn_a:
+                        _rq_approve_clicked = st.button(
+                            "Approve and send",
+                            type="primary",
+                            key=f"rq_approve_{_rq_thread_id}",
+                            disabled=bool(_rq_send_blocked or _rq_is_terminal),
+                            help=_rq_send_blocked or ("Already in terminal state." if _rq_is_terminal else None),
+                        )
+                    with _btn_b:
+                        _rq_skip_clicked = st.button(
+                            "Skip",
+                            type="secondary",
+                            key=f"rq_skip_{_rq_thread_id}",
+                            disabled=_rq_is_terminal,
+                        )
+                    with _btn_c:
+                        _rq_regen_clicked = st.button(
+                            "Regenerate draft",
+                            type="secondary",
+                            key=f"rq_regen_{_rq_thread_id}",
+                            disabled=_rq_is_terminal,
+                        )
+
+                    if _rq_approve_clicked and not _rq_send_blocked:
+                        with st.spinner("Sending reply via Instantly…"):
+                            _rq_send_result = run_async(try_send_reply(
+                                int(_rq_thread_id),
+                                workspace_id=_ws_id,
+                                draft_override=_rq_edited_draft or None,
+                            ))
+                        if _rq_send_result["status"] == STATUS_SENT:
+                            st.success("Reply sent successfully.")
+                            st.cache_data.clear()
+                            st.rerun()
+                        elif _rq_send_result["status"] == STATUS_MANUAL_SEND:
+                            st.warning(_rq_send_result["detail"])
+                            if _rq_send_result.get("debug"):
+                                with st.expander("Send debug"):
+                                    st.json(_rq_send_result["debug"])
+                            st.cache_data.clear()
+                            st.rerun()
+                        else:
+                            st.error(f"Send failed: {_rq_send_result['detail']}")
+
+                    if _rq_skip_clicked:
+                        update_reply_thread(int(_rq_thread_id), status=STATUS_SKIPPED)
+                        st.cache_data.clear()
+                        st.rerun()
+
+                    if _rq_regen_clicked:
+                        with st.spinner("Regenerating draft…"):
+                            try:
+                                _rq_regen_result = run_async(classify_and_draft_reply(
+                                    inbound_reply=_rq_thread["inbound_reply_text"],
+                                    original_outbound_email=_rq_thread.get("original_outbound_email") or "",
+                                    calendar_link=_ws_calendar_link,
+                                    workspace_id=_ws_id,
+                                ))
+                                update_reply_thread(
+                                    int(_rq_thread_id),
+                                    classification=_rq_regen_result.classification,
+                                    recommended_action=_rq_regen_result.recommended_action,
+                                    draft_body=_rq_regen_result.draft_body,
+                                    human_review_notes=_rq_regen_result.human_review_notes,
+                                )
+                                # Clear the edited draft key so it shows the new draft
+                                st.session_state.pop(_rq_draft_key, None)
+                                st.cache_data.clear()
+                                st.rerun()
+                            except Exception as _rq_regen_exc:
+                                st.error(f"Regenerate failed: {_rq_regen_exc}")
+
+# ── Tab 2: Manual Draft Tester ────────────────────────────────────────────
+with _tab_manual:
+    st.caption(
+        "Paste a reply manually to test the draft agent. "
+        "This does not sync from Instantly and does not send anything."
+    )
+
+    with st.form("reply_agent_form", clear_on_submit=False):
+        _ra_col1, _ra_col2 = st.columns(2)
+        with _ra_col1:
+            _ra_inbound = st.text_area(
+                "Paste inbound reply",
+                placeholder="Paste the prospect reply here",
+                height=120,
+                key="ra_inbound",
+            )
+            _ra_original = st.text_area(
+                "Original outbound email",
+                placeholder="Paste the original email if available",
+                height=80,
+                key="ra_original",
+            )
+        with _ra_col2:
+            _ra_context = st.text_area(
+                "Lead or company context",
+                placeholder="Add anything useful about the lead, company, offer, or ICP",
+                height=80,
+                key="ra_context",
+            )
+            _ra_calendar = st.text_input(
+                "Calendar link",
+                placeholder="Paste booking link (or leave blank to use workspace default)",
+                key="ra_calendar",
+                value=_ws_calendar_link,
+            )
+        _ra_submit = st.form_submit_button("Generate reply draft", type="primary")
+
+    if _ra_submit:
+        if not _ra_inbound.strip():
+            st.warning("Paste an inbound reply to continue.")
+        else:
+            with st.spinner("Classifying and drafting reply…"):
+                try:
+                    _ra_result = run_async(classify_and_draft_reply(
+                        inbound_reply=_ra_inbound,
+                        original_outbound_email=_ra_original,
+                        lead_context=_ra_context,
+                        calendar_link=_ra_calendar or _ws_calendar_link,
+                        workspace_id=_ws_id,
+                    ))
+                    st.session_state["ra_last_result"] = {
+                        "result": _ra_result,
+                        "inbound_snippet": _ra_inbound[:80],
+                    }
+                    _ra_history = st.session_state.get("ra_history", [])
+                    _ra_history.insert(0, {
+                        "result": _ra_result,
+                        "inbound_snippet": _ra_inbound[:80],
+                    })
+                    st.session_state["ra_history"] = _ra_history[:10]
+                    save_reply_draft(
+                        _ra_result,
+                        inbound_reply=_ra_inbound,
+                        original_outbound_email=_ra_original,
+                        lead_context=_ra_context,
+                        workspace_id=_ws_id,
+                    )
+                except Exception as _ra_exc:
+                    st.error(f"Reply Agent failed: {_ra_exc}")
+                    st.session_state.pop("ra_last_result", None)
+
+    if "ra_last_result" in st.session_state:
+        _ra_entry = st.session_state["ra_last_result"]
+        _ra_r = _ra_entry["result"]
+        with st.container(border=True):
+            _ra_action_label = _RA_ACTION_LABELS.get(_ra_r.recommended_action, _ra_r.recommended_action)
+            _ra_left, _ra_right = st.columns(2)
+            with _ra_left:
+                st.markdown(f"**Intent:** `{_ra_r.classification}`")
+            with _ra_right:
+                st.markdown(f"**Recommended action:** {_ra_action_label}")
+            if _ra_r.human_review_notes:
+                st.info(f"**Review notes:** {_ra_r.human_review_notes}")
+            st.markdown("**Suggested reply draft** — copy manually before sending:")
+            st.text_area(
+                "Draft",
+                value=_ra_r.draft_body,
+                height=150,
+                key="ra_draft_output",
+                label_visibility="collapsed",
+            )
+
+    if st.session_state.get("ra_history"):
+        with st.expander(
+            f"Draft history — this session ({len(st.session_state['ra_history'])} draft(s))"
+        ):
+            for _ra_i, _ra_h in enumerate(st.session_state["ra_history"]):
+                _r = _ra_h["result"]
+                with st.container(border=True):
+                    st.caption(
+                        f"#{_ra_i + 1} · {_r.classification} → {_r.recommended_action} "
+                        f"· {_ra_h['inbound_snippet']}…"
+                    )
+                    st.text(_r.draft_body[:300])
 
 with st.expander("Sync debug — raw Instantly analytics + DB comparison"):
     if _snapshot is None:
