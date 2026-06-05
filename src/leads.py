@@ -54,7 +54,12 @@ def reset_lead_sequence(session: Session) -> bool:
     if dialect == "postgresql":
         session.execute(text("ALTER SEQUENCE leads_id_seq RESTART WITH 1"))
     elif dialect == "sqlite":
-        session.execute(text("DELETE FROM sqlite_sequence WHERE name='leads'"))
+        # sqlite_sequence only exists after the first AUTOINCREMENT insert;
+        # if it doesn't exist yet, skip silently — no sequence to reset.
+        try:
+            session.execute(text("DELETE FROM sqlite_sequence WHERE name='leads'"))
+        except Exception:
+            pass
     else:
         # Unknown dialect — log and skip rather than guess.
         log.warning("reset_lead_sequence_skipped", extra={"dialect": dialect})

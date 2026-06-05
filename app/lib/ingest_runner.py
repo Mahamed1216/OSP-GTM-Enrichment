@@ -89,13 +89,17 @@ def _write_mapping_tempfile(mapping: dict[str, str | None], near: Path) -> Path:
 def run_ingest_subprocess(
     csv_path: Path,
     mapping: dict[str, str | None] | None = None,
+    *,
+    workspace_id: int | None = None,
 ) -> IngestResult:
-    """Run `python scripts/ingest_leads.py <csv_path> [--mapping map.json]`."""
+    """Run `python scripts/ingest_leads.py <csv_path> [--mapping map.json] [--workspace-id N]`."""
     cmd = [sys.executable, str(_INGEST_SCRIPT), str(csv_path)]
     mapping_path: Path | None = None
     if mapping is not None:
         mapping_path = _write_mapping_tempfile(mapping, near=csv_path)
         cmd.extend(["--mapping", str(mapping_path)])
+    if workspace_id is not None:
+        cmd.extend(["--workspace-id", str(workspace_id)])
 
     try:
         proc = subprocess.run(

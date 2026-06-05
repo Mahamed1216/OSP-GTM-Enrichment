@@ -46,6 +46,14 @@ def main() -> int:
         help="Optional path to a JSON file mapping {canonical_field: source_column}. "
         "If omitted, columns are auto-detected from the CSV header.",
     )
+    parser.add_argument(
+        "--workspace-id",
+        type=int,
+        default=None,
+        dest="workspace_id",
+        help="Workspace ID to assign imported leads to. "
+        "If omitted, leads are assigned to the default OSP workspace.",
+    )
     args = parser.parse_args()
 
     if not args.csv_path.exists():
@@ -91,7 +99,7 @@ def main() -> int:
             canonical_rows.append(canonical)
 
     with session_scope() as session:
-        stats = ingest_rows(canonical_rows, session)
+        stats = ingest_rows(canonical_rows, session, workspace_id=args.workspace_id)
 
     log.info("ingest_complete", extra=dataclasses.asdict(stats))
 

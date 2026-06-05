@@ -42,9 +42,10 @@ _CLIENT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 _API_BASE = "https://api.instantly.ai/api/v2"
 
 
-def _auth_headers() -> dict[str, str]:
+def _auth_headers(api_key: str | None = None) -> dict[str, str]:
+    key = api_key or settings.instantly_api_key or ""
     return {
-        "Authorization": f"Bearer {settings.instantly_api_key}",
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
 
@@ -106,11 +107,11 @@ async def get_lead(remote_lead_id: str) -> dict:
 
 
 @retry_api
-async def _post_lead_to_campaign(payload: dict) -> dict:
+async def _post_lead_to_campaign(payload: dict, api_key: str | None = None) -> dict:
     async with httpx.AsyncClient(timeout=_CLIENT_TIMEOUT) as client:
         resp = await client.post(
             f"{_API_BASE}/leads",
-            headers=_auth_headers(),
+            headers=_auth_headers(api_key),
             json=payload,
         )
         resp.raise_for_status()
@@ -171,7 +172,7 @@ async def patch_lead(remote_lead_id: str, payload: dict) -> dict:
         return resp.json()
 
 
-def _build_payload(lead: Lead, content: GeneratedContent) -> dict:
+def _build_payload(lead: Lead, content: GeneratedContent, *, campaign_id: str | None = None) -> dict:
     """Build the Instantly /api/v2/leads payload.
 
     Body + subject are passed via custom_variables. The campaign sequence
@@ -180,9 +181,10 @@ def _build_payload(lead: Lead, content: GeneratedContent) -> dict:
     template content and the generated copy never reaches the recipient.
 
     Top-level field is `campaign` (not `campaign_id`) per Instantly v2 API.
+    Phase 6: campaign_id param overrides the env default.
     """
     return {
-        "campaign": settings.instantly_campaign_id,
+        "campaign": campaign_id or settings.instantly_campaign_id,
         "email": lead.email,
         "first_name": lead.first_name,
         "last_name": lead.last_name,
@@ -201,6 +203,7 @@ async def deliver_email(
     *,
     dry_run: bool = False,
     strict_verification: bool = False,
+    workspace_id: int | None = None,
 ) -> DeliveryResult:
     """Run pre-send guards then deliver to Instantly."""
     with session_scope() as session:
@@ -254,11 +257,15 @@ async def deliver_email(
     if not _accept_verification(verify.status, strict=strict_verification):
         return await _record_skip(content_id, "email_invalid", lead_id, tier_snapshot, verify_status=verify.status)
 
-    # All guards passed — build payload + send
+    # All guards passed — build payload + send.
+    # Phase 6: resolve campaign_id and api_key from workspace.
+    from src.workspace import get_campaign_id_for_workspace, get_api_key_for_workspace
+    _campaign_id = get_campaign_id_for_workspace(workspace_id)
+    _api_key = get_api_key_for_workspace(workspace_id)
     with session_scope() as session:
         lead = session.get(Lead, lead_id)
         content = session.get(GeneratedContent, content_id)
-        payload = _build_payload(lead, content)
+        payload = _build_payload(lead, content, campaign_id=_campaign_id)
 
     if dry_run:
         log.info("delivery_dry_run", extra={
@@ -276,7 +283,7 @@ async def deliver_email(
 
     start = time.monotonic()
     try:
-        response = await _post_lead_to_campaign(payload)
+        response = await _post_lead_to_campaign(payload, api_key=_api_key)
     except Exception as exc:
         # @retry_api has already exhausted retries for 5xx/429 — this is terminal.
         err_text = _format_error(exc)

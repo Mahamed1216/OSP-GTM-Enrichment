@@ -28,7 +28,7 @@ def _patch_email_generator(monkeypatch):
     """Replace generate_email with a fake that inserts a row and returns dummy result."""
     captured: dict = {}
 
-    async def _fake(lead_id: int, *, regeneration_feedback: str | None = None):
+    async def _fake(lead_id: int, *, regeneration_feedback: str | None = None, workspace_id: int | None = None):
         captured["lead_id"] = lead_id
         captured["regeneration_feedback"] = regeneration_feedback
         with session_scope() as s:

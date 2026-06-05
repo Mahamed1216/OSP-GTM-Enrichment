@@ -85,11 +85,15 @@ class Workspace(Base):
 
 class Lead(Base):
     __tablename__ = "leads"
+    __table_args__ = (
+        # Phase 6: allow same email in different workspaces; dedupe within workspace only.
+        UniqueConstraint("email", "workspace_id", name="uq_leads_email_workspace"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     first_name: Mapped[str] = mapped_column(String(128))
     last_name: Mapped[str] = mapped_column(String(128))
-    email: Mapped[str] = mapped_column(String(256), unique=True, index=True)
+    email: Mapped[str] = mapped_column(String(256), index=True)
     title: Mapped[Optional[str]] = mapped_column(String(256))
     company: Mapped[Optional[str]] = mapped_column(String(256))
     company_domain: Mapped[Optional[str]] = mapped_column(String(256))
@@ -256,6 +260,9 @@ class WinningExample(Base):
     manually_flagged: Mapped[bool] = mapped_column(Boolean, default=False)
     promoted_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc)
     workspace_id: Mapped[Optional[int]] = mapped_column(Integer, default=_default_workspace_id)
+    # Phase 6: content type (email | call_script | linkedin_msg). Nullable for
+    # legacy rows; defaults to "email" at read time (all legacy examples are emails).
+    content_type: Mapped[Optional[str]] = mapped_column(String(32))
 
 
 class InstantlyAnalyticsSnapshot(Base):
@@ -398,3 +405,23 @@ class PromptConfig(Base):
     updated_by: Mapped[Optional[str]] = mapped_column(String(64))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     workspace_id: Mapped[Optional[int]] = mapped_column(Integer, default=_default_workspace_id)
+
+
+class ReplyDraft(Base):
+    """Reply draft produced by the Reply Agent. Draft-only — nothing is sent automatically."""
+    __tablename__ = "reply_drafts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workspace_id: Mapped[Optional[int]] = mapped_column(Integer, default=_default_workspace_id)
+    lead_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    inbound_reply: Mapped[str] = mapped_column(Text, nullable=False)
+    original_outbound_email: Mapped[Optional[str]] = mapped_column(Text)
+    lead_context: Mapped[Optional[str]] = mapped_column(Text)
+    classification: Mapped[str] = mapped_column(String(64), nullable=False)
+    recommended_action: Mapped[str] = mapped_column(String(64), nullable=False)
+    draft_body: Mapped[str] = mapped_column(Text, nullable=False)
+    human_review_notes: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=now_utc, onupdate=now_utc, nullable=False
+    )

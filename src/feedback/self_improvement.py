@@ -780,6 +780,7 @@ def save_recommendation(
     *,
     metric_snapshot: dict[str, Any] | None = None,
     snapshot_id: int | None = None,
+    workspace_id: int | None = None,
 ) -> int | None:
     """Persist a Diagnosis IFF it's an actionable prompt-change candidate.
 
@@ -810,10 +811,6 @@ def save_recommendation(
                 recommended_change=diag.recommended_change,
                 expected_impact=diag.expected_impact,
                 risk_level=diag.risk_level,
-                # Write to both columns: `proposed_addendum` is canonical
-                # going forward; `proposed_prompt` is kept in sync so any
-                # consumer still reading the legacy column sees the same
-                # text. New code reads addendum first, prompt as fallback.
                 proposed_addendum=diag.proposed_addendum,
                 proposed_prompt=diag.proposed_addendum,
                 previous_prompt_snapshot=diag.previous_prompt_snapshot,
@@ -825,6 +822,7 @@ def save_recommendation(
                 metric_snapshot=metric_snapshot,
                 analytics_snapshot_id=snapshot_id,
                 drafted_at=drafted_at,
+                workspace_id=workspace_id,
             )
             session.add(rec)
             session.flush()
@@ -846,7 +844,7 @@ def save_recommendation(
         return None
 
 
-def approve_recommendation(rec_id: int, *, approved_by: str) -> dict[str, Any]:
+def approve_recommendation(rec_id: int, *, approved_by: str, workspace_id: int | None = None) -> dict[str, Any]:
     """Approve and APPEND the addendum to the current overlay.
 
     The addendum is appended, not substituted, so the operator's existing
@@ -873,18 +871,14 @@ def approve_recommendation(rec_id: int, *, approved_by: str) -> dict[str, Any]:
         addendum = addendum_text
         # Re-read the current overlay HERE (not at diagnosis time) so a
         # concurrent edit by the operator can't be silently overwritten.
-        previous = get_effective_prompt(channel, DEFAULT_EMAIL_PROMPT_BODY)
+        # Phase 6: scoped to the recommendation's workspace (or caller's workspace_id).
+        _ws_id = workspace_id if workspace_id is not None else rec.workspace_id
+        previous = get_effective_prompt(channel, DEFAULT_EMAIL_PROMPT_BODY, workspace_id=_ws_id)
         rec.previous_prompt_snapshot = previous
 
-    # Merge into a SINGLE `# SELF IMPROVEMENT ADDENDUM` section. Prior
-    # versions appended raw text to the bottom of the overlay; repeated
-    # approvals stacked addendums as new top-level sections and let
-    # `# EXAMPLE — MATCH THIS VOICE EXACTLY` accumulate ten copies in
-    # the live prompt. The controlled-section merge cannot duplicate
-    # headers no matter how many times it's run.
     from src.prompts.cleanup import merge_self_improvement_addendum
     merged = merge_self_improvement_addendum(previous, addendum)
-    save_overlay(channel, merged, updated_by=f"self_improvement:{approved_by}")
+    save_overlay(channel, merged, updated_by=f"self_improvement:{approved_by}", workspace_id=_ws_id)
     log.info(
         "self_improvement_addendum_applied",
         extra={"rec_id": rec_id, "channel": channel, "approved_by": approved_by},
@@ -915,7 +909,7 @@ def save_as_draft(rec_id: int) -> None:
         rec.drafted_at = datetime.utcnow()
 
 
-def rollback_recommendation(rec_id: int) -> dict[str, Any]:
+def rollback_recommendation(rec_id: int, *, workspace_id: int | None = None) -> dict[str, Any]:
     """Restore `previous_prompt_snapshot` for an approved row."""
     with session_scope() as session:
         rec = session.get(PromptRecommendation, rec_id)
@@ -925,8 +919,9 @@ def rollback_recommendation(rec_id: int) -> dict[str, Any]:
             raise ValueError("Nothing to roll back — no channel/snapshot stored.")
         channel = rec.channel
         previous = rec.previous_prompt_snapshot
+        _ws_id = workspace_id if workspace_id is not None else rec.workspace_id
         rec.status = "rejected"
-    save_overlay(channel, previous)
+    save_overlay(channel, previous, workspace_id=_ws_id)
     log.info("self_improvement_rolled_back", extra={"rec_id": rec_id, "channel": channel})
     return {"id": rec_id, "channel": channel}
 
@@ -1002,15 +997,20 @@ def performance_by_prompt_version() -> list[dict[str, Any]]:
     return out
 
 
-def list_recommendations(limit: int = 20) -> list[dict[str, Any]]:
+def list_recommendations(limit: int = 20, *, workspace_id: int | None = None) -> list[dict[str, Any]]:
     """Most-recent PromptRecommendation rows for the audit log. Only
     actionable rows live here (wait/diagnose-only never write to this
-    table), so the history stays signal-rich."""
+    table), so the history stays signal-rich.
+
+    Phase 6: when workspace_id is given, only rows for that workspace are
+    returned. When None, falls back to the default workspace for backward compat.
+    """
     with session_scope() as session:
+        stmt = select(PromptRecommendation)
+        if workspace_id is not None:
+            stmt = stmt.where(PromptRecommendation.workspace_id == workspace_id)
         rows = session.execute(
-            select(PromptRecommendation)
-            .order_by(PromptRecommendation.created_at.desc())
-            .limit(limit)
+            stmt.order_by(PromptRecommendation.created_at.desc()).limit(limit)
         ).scalars().all()
         return [
             {

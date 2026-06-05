@@ -66,6 +66,7 @@ async def regenerate_direct(
             )
         kind = source.kind
         lead_id = source.lead_id
+        workspace_id = source.workspace_id  # inherit workspace from source row
 
     generator = _KIND_DISPATCH.get(kind)
     if generator is None:
@@ -75,7 +76,7 @@ async def regenerate_direct(
         "regenerate_direct_started",
         extra={"content_id": generated_content_id, "kind": kind, "lead_id": lead_id},
     )
-    await generator(lead_id, regeneration_feedback=feedback)
+    await generator(lead_id, regeneration_feedback=feedback, workspace_id=workspace_id)
 
     with session_scope() as session:
         new_row = session.execute(
@@ -155,6 +156,7 @@ async def regenerate_with_feedback(generated_content_id: int) -> int:
         # Pull primitive fields out before leaving the session.
         kind = source.kind
         lead_id = source.lead_id
+        workspace_id = source.workspace_id  # inherit workspace from source row
 
     generator = _KIND_DISPATCH.get(kind)
     if generator is None:
@@ -164,7 +166,7 @@ async def regenerate_with_feedback(generated_content_id: int) -> int:
         "regenerate_started",
         extra={"content_id": generated_content_id, "kind": kind, "lead_id": lead_id},
     )
-    await generator(lead_id, regeneration_feedback=feedback)
+    await generator(lead_id, regeneration_feedback=feedback, workspace_id=workspace_id)
 
     # Look up the new row (single-threaded per session, deterministic newest-by-id).
     with session_scope() as session:

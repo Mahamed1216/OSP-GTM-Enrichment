@@ -104,7 +104,7 @@ def test_deliver_email_persists_sent_status_on_success(file_db, monkeypatch):
     async def fake_verify(_lead_id):
         return VerifyResult(status="valid", provider="instantly", raw={})
 
-    async def fake_post(_payload):
+    async def fake_post(_payload, api_key=None):
         return {"id": "remote-abc-123"}
 
     monkeypatch.setattr(inst, "verify_email", fake_verify)
@@ -146,7 +146,7 @@ def test_deliver_email_persists_error_status_on_http_failure(file_db, monkeypatc
     async def fake_verify(_lead_id):
         return VerifyResult(status="valid", provider="instantly", raw={})
 
-    async def fake_post_502(_payload):
+    async def fake_post_502(_payload, api_key=None):
         request = httpx.Request("POST", "https://api.instantly.ai/api/v2/leads")
         response = httpx.Response(502, text="Bad Gateway", request=request)
         raise httpx.HTTPStatusError("502", request=request, response=response)

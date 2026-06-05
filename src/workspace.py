@@ -861,3 +861,73 @@ def create_workspace(
             )
 
     return new_ws_dict
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: JSON winners migration to OSP DB (idempotent startup task)
+# ---------------------------------------------------------------------------
+
+def migrate_json_winners_to_osp_db() -> int:
+    """Migrate winning_examples.json entries into the WinningExample DB table
+    for the OSP workspace. Idempotent: skips if OSP already has DB winners.
+
+    After migration, load_top_winners_for() can serve OSP winners from DB,
+    making winners fully workspace-scoped. Non-OSP workspaces use DB only
+    (no JSON fallback), so they start with an empty library by default.
+
+    Returns the number of rows inserted (0 on skip).
+    """
+    try:
+        from sqlalchemy import func
+        default_id = get_default_workspace_id()
+        if default_id is None:
+            return 0
+
+        from src.models import WinningExample
+        with session_scope() as session:
+            existing_count = session.execute(
+                select(func.count(WinningExample.id))
+                .where(WinningExample.workspace_id == default_id)
+            ).scalar() or 0
+        if existing_count > 0:
+            return 0  # already migrated
+
+        from src.content.winners import (
+            _load_json_array,
+            _entry_content_type,
+            WINNERS_PATH,
+        )
+        items = _load_json_array(WINNERS_PATH)
+        if not items:
+            return 0
+
+        count = 0
+        with session_scope() as session:
+            for entry in items:
+                ct = _entry_content_type(entry) or "email"
+                content_block = entry.get("content") or {}
+                subject = (
+                    content_block.get("subject") if isinstance(content_block, dict) else None
+                ) or entry.get("subject") or ""
+                body = (
+                    content_block.get("body") if isinstance(content_block, dict) else None
+                ) or entry.get("body") or ""
+                session.add(WinningExample(
+                    lead_context=entry.get("lead_context") or {},
+                    subject=subject,
+                    body=body,
+                    reply_rate=float(entry.get("reply_rate") or entry.get("score") or 0.0),
+                    manually_flagged=bool(entry.get("manually_flagged", False)),
+                    workspace_id=default_id,
+                    content_type=ct,
+                ))
+                count += 1
+
+        log.info("migrate_json_winners_to_osp_db_done", extra={"rows_inserted": count})
+        return count
+    except Exception as exc:
+        log.warning(
+            "migrate_json_winners_to_osp_db_failed",
+            extra={"error": f"{type(exc).__name__}: {exc}"},
+        )
+        return 0

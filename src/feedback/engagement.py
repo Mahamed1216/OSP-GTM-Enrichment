@@ -121,34 +121,40 @@ def _extract_items(payload: dict) -> list[dict]:
 
 @retry_api
 async def _fetch_leads_page(
-    client: httpx.AsyncClient, starting_after: str | None
+    client: httpx.AsyncClient,
+    starting_after: str | None,
+    campaign_id: str | None = None,
+    api_key: str | None = None,
 ) -> dict:
     body: dict[str, Any] = {
-        "campaign": settings.instantly_campaign_id,
+        "campaign": campaign_id or settings.instantly_campaign_id,
         "limit": _PAGE_SIZE,
     }
     if starting_after:
         body["starting_after"] = starting_after
     resp = await client.post(
         f"{_API_BASE}/leads/list",
-        headers=_auth_headers(),
+        headers=_auth_headers(api_key),
         json=body,
     )
     resp.raise_for_status()
     return resp.json()
 
 
-async def _iter_campaign_leads() -> AsyncIterator[dict]:
+async def _iter_campaign_leads(
+    campaign_id: str | None = None, api_key: str | None = None
+) -> AsyncIterator[dict]:
     """Yield every lead in the configured campaign, paginated."""
-    if not settings.instantly_campaign_id:
+    _campaign_id = campaign_id or settings.instantly_campaign_id
+    if not _campaign_id:
         raise RuntimeError(
-            "INSTANTLY_CAMPAIGN_ID is not set — cannot sync engagement"
+            "INSTANTLY_CAMPAIGN_ID is not configured for this workspace — cannot sync engagement"
         )
 
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         starting_after: str | None = None
         while True:
-            payload = await _fetch_leads_page(client, starting_after)
+            payload = await _fetch_leads_page(client, starting_after, _campaign_id, api_key)
             items = _extract_items(payload)
             for item in items:
                 yield item
@@ -324,7 +330,7 @@ def _classify_positive_lead(raw: dict) -> str | None:
     return None
 
 
-async def count_positive_campaign_leads() -> tuple[int, str]:
+async def count_positive_campaign_leads(campaign_id: str | None = None, api_key: str | None = None) -> tuple[int, str]:
     """Count leads with positive-engagement statuses in the configured campaign.
 
     Iterates every lead in the campaign via the paginated leads API and
@@ -339,7 +345,7 @@ async def count_positive_campaign_leads() -> tuple[int, str]:
     count = 0
     source_set: set[str] = set()
     try:
-        async for raw in _iter_campaign_leads():
+        async for raw in _iter_campaign_leads(campaign_id, api_key):
             hit = _classify_positive_lead(raw)
             if hit is not None:
                 count += 1
@@ -551,7 +557,7 @@ async def sync_campaign_analytics(workspace_id: int | None = None) -> dict:
         and parsed.get("opportunity_count") is None
     ):
         try:
-            leads_positive, leads_source = await count_positive_campaign_leads()
+            leads_positive, leads_source = await count_positive_campaign_leads(campaign_id, api_key)
             parsed["opportunity_count"] = leads_positive
             raw_opportunity_source = f"leads:{leads_source}"
             log.info(
@@ -619,13 +625,17 @@ async def sync_campaign_analytics(workspace_id: int | None = None) -> dict:
     }
 
 
-async def sync_engagement() -> dict:
+async def sync_engagement(workspace_id: int | None = None) -> dict:
     """Bulk-pull every lead in the campaign and upsert Engagement rows.
 
+    Phase 6: uses workspace-resolved campaign_id and api_key.
     Builds a {delivery_id -> content_id} map up front so each API lead can
     be matched in O(1). Leads we don't recognise locally are skipped (they
     might be from a manual import) and counted under `unknown`.
     """
+    from src.workspace import get_campaign_id_for_workspace, get_api_key_for_workspace
+    _campaign_id = get_campaign_id_for_workspace(workspace_id)
+    _api_key = get_api_key_for_workspace(workspace_id)
     with session_scope() as session:
         rows = session.execute(
             select(GeneratedContent.id, GeneratedContent.delivery_id).where(
@@ -643,7 +653,7 @@ async def sync_engagement() -> dict:
     failed = 0
 
     try:
-        async for raw in _iter_campaign_leads():
+        async for raw in _iter_campaign_leads(_campaign_id, _api_key):
             remote_id = str(raw.get("id") or raw.get("lead_id") or "")
             if not remote_id:
                 continue

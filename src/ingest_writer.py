@@ -134,13 +134,18 @@ def _build_lead_fields(canonical_row: dict) -> dict[str, object]:
     return fields
 
 
-def _upsert_one(session: Session, row: dict) -> str:
+def _upsert_one(session: Session, row: dict, workspace_id: int | None = None) -> str:
     """Apply one row inside a SAVEPOINT. Returns 'inserted' or 'updated'.
-    Raises on any DB error so caller can categorize."""
+    Raises on any DB error so caller can categorize.
+    Phase 6: deduplication is scoped to (email, workspace_id) so the same
+    email can exist in different workspaces."""
     fields = _build_lead_fields(row)
     email = fields["email"]  # already lowercased + stripped by dedup
 
-    existing = session.query(Lead).filter_by(email=email).one_or_none()
+    q = session.query(Lead).filter(Lead.email == email)
+    if workspace_id is not None:
+        q = q.filter(Lead.workspace_id == workspace_id)
+    existing = q.one_or_none()
     if existing is not None:
         # Preserve already-populated fields: only overwrite when the new
         # value is truthy. (COALESCE-style behavior, locked by spec.)
@@ -149,7 +154,10 @@ def _upsert_one(session: Session, row: dict) -> str:
                 setattr(existing, key, value)
         session.flush()
         return "updated"
-    session.add(Lead(**fields))
+    lead_fields = {**fields}
+    if workspace_id is not None:
+        lead_fields["workspace_id"] = workspace_id
+    session.add(Lead(**lead_fields))
     session.flush()
     return "inserted"
 
@@ -159,6 +167,7 @@ def ingest_rows(
     session: Session,
     *,
     pre_deduped: bool = False,
+    workspace_id: int | None = None,
 ) -> IngestStats:
     """Insert/update one row at a time, isolated by SAVEPOINT.
 
@@ -197,7 +206,7 @@ def ingest_rows(
 
         try:
             with session.begin_nested():  # SAVEPOINT — isolates this row
-                outcome = _upsert_one(session, row)
+                outcome = _upsert_one(session, row, workspace_id=workspace_id)
         except IntegrityError as exc:
             stats._bump_skip(SKIP_INTEGRITY)
             log.warning(

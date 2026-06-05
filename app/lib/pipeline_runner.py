@@ -273,11 +273,12 @@ async def _phase_deliver(
     *,
     dry_run: bool,
     on_update: Callable[[PhaseUpdate], None] | None,
+    workspace_id: int | None = None,
 ) -> None:
     total = len(lead_ids)
     for idx, lid in enumerate(lead_ids, start=1):
         try:
-            result = await deliver_email(lid, dry_run=dry_run)
+            result = await deliver_email(lid, dry_run=dry_run, workspace_id=workspace_id)
             payload = {
                 "delivered": result.delivered,
                 "skip_reason": result.skip_reason,
@@ -581,7 +582,7 @@ def process_single_lead(
             if run_email:
                 have_email = _has_email_content_lead_ids(eligible)
                 if have_email:
-                    run_async(_phase_deliver(have_email, dry_run=dry_run, on_update=on_update))
+                    run_async(_phase_deliver(have_email, dry_run=dry_run, on_update=on_update, workspace_id=workspace_id))
 
 
 def run_phased_pipeline(

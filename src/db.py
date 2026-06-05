@@ -72,6 +72,8 @@ _RUNTIME_COLUMN_ADDS: list[tuple[str, str, str]] = [
     ("prompt_recommendations", "analytics_snapshot_id", "INTEGER"),
     # Phase 4 hotfix: workspace-scoped ICP/company settings on the workspace row.
     ("workspaces", "icp_config", "JSON"),
+    # Phase 6: content type on WinningExample for workspace-scoped winners.
+    ("winning_examples", "content_type", "VARCHAR(32)"),
     # Phase 2: workspace_id added to every workspace-scoped table.
     # Nullable so existing rows survive migration; backfilled to the default
     # OSP workspace by backfill_default_workspace_ids() called from init_db().
@@ -97,6 +99,43 @@ _RUNTIME_COLUMN_WIDENS_PG: list[tuple[str, str, str]] = [
     # "ready_for_approval" = 19 chars; original column was VARCHAR(16).
     ("prompt_recommendations", "status", "VARCHAR(32)"),
 ]
+
+
+def _migrate_leads_email_composite_unique() -> None:
+    """Phase 6: change leads unique index from (email) to (email, workspace_id).
+
+    Allows the same email address to exist in different workspaces while
+    still preventing duplicates within a workspace. Idempotent — only runs
+    on PostgreSQL; SQLite tests use fresh schema each run.
+    """
+    if engine.dialect.name != "postgresql":
+        return
+    try:
+        with engine.connect() as conn:
+            exists = conn.execute(text(
+                "SELECT 1 FROM pg_indexes "
+                "WHERE tablename = 'leads' "
+                "AND indexname = 'uq_leads_email_workspace'"
+            )).scalar()
+        if exists:
+            return
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE leads DROP CONSTRAINT IF EXISTS leads_email_key"
+            ))
+        with engine.begin() as conn:
+            conn.execute(text("DROP INDEX IF EXISTS ix_leads_email"))
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_leads_email_workspace "
+                "ON leads (email, workspace_id)"
+            ))
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "leads_email_composite_unique_migration_failed",
+            extra={"error": f"{type(exc).__name__}: {exc}"},
+        )
 
 
 def _migrate_prompt_configs_composite_unique() -> None:
@@ -172,6 +211,8 @@ def _apply_runtime_migrations() -> None:
 
     # Pass 1b — Phase 4: change prompt_configs unique index to composite.
     _migrate_prompt_configs_composite_unique()
+    # Pass 1c — Phase 6: change leads unique index from (email) to (email, workspace_id).
+    _migrate_leads_email_composite_unique()
 
     # Pass 2 — widen string columns on Postgres.
     if engine.dialect.name == "postgresql":
@@ -215,11 +256,13 @@ def init_db() -> None:
         from src.workspace import (
             backfill_default_workspace_ids,
             backfill_osp_icp_config,
+            migrate_json_winners_to_osp_db,
             seed_default_workspace,
         )
         seed_default_workspace()
         backfill_default_workspace_ids()
         backfill_osp_icp_config()
+        migrate_json_winners_to_osp_db()
     except Exception:
         _db_initialized = False  # Allow the next caller to retry.
         raise

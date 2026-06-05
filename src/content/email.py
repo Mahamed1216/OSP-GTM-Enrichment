@@ -192,8 +192,8 @@ async def generate_email(
             signals_cited=nr_signals,
         )
 
-    winners = load_top_winners_for("email", k=3)
-    negatives = load_top_negatives("email", k=2)
+    winners = load_top_winners_for("email", k=3, workspace_id=workspace_id)
+    negatives = load_top_negatives("email", k=2, workspace_id=workspace_id)
     icp = load_workspace_icp_config(workspace_id)
     sender_first_name = get_secret("SENDER_FIRST_NAME", "Mohammed")
     system = build_email_system(winners, negatives, icp, sender_first_name=sender_first_name, workspace_id=workspace_id)

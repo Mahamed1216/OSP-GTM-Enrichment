@@ -53,6 +53,10 @@ from src.feedback.engagement import (
     sync_engagement,
 )
 from src.feedback.learning import cleanup_invalid_winners, process_ratings, promote_winners
+from src.feedback.reply_agent import (
+    classify_and_draft_reply,
+    save_reply_draft,
+)
 from src.feedback.self_improvement import (
     DEFAULT_BOUNCE_RATE_MAX,
     DEFAULT_OPEN_RATE_TARGET,
@@ -105,8 +109,8 @@ def _perf_by_prompt_cached() -> list[dict]:
 
 
 @st.cache_data(ttl=15)
-def _recommendations_cached() -> list[dict]:
-    return list_recommendations(limit=10)
+def _recommendations_cached(workspace_id: int | None = None) -> list[dict]:
+    return list_recommendations(limit=10, workspace_id=workspace_id)
 
 
 @st.cache_data(ttl=15)
@@ -343,7 +347,7 @@ if sync_clicked:
     try:
         with st.spinner("Syncing from Instantly…"):
             analytics_result = run_async(sync_campaign_analytics(workspace_id=_ws_id))
-            per_lead = run_async(sync_engagement())
+            per_lead = run_async(sync_engagement(workspace_id=_ws_id))
     except CampaignAnalyticsMismatch as exc:
         sync_error = str(exc)
         mismatch_debug = exc.debug
@@ -476,6 +480,126 @@ if _snapshot is not None and contacted and abs(contacted - _local_sent) >= 5:
         f"local DB has {_local_sent:,} sent records for this campaign. "
         "Investigate the gap — this is a tracking issue, not a copy issue."
     )
+
+st.divider()
+
+# ---------- Reply Agent ----------
+st.subheader("Reply Agent")
+st.caption("Classify replies, draft responses, and help book meetings.")
+if _current_ws:
+    st.caption(f"Current workspace: **{_current_ws.get('name')}**")
+
+_ACTION_LABELS = {
+    "book_meeting": "📅 Book meeting",
+    "ask_clarifying_question": "❓ Ask a clarifying question",
+    "send_info": "📧 Send info",
+    "route_to_human": "🚨 Route to human",
+    "mark_not_interested": "🔴 Mark not interested",
+    "stop_sequence": "🛑 Stop sequence (opt-out)",
+    "do_not_reply": "⏭ Do not reply",
+}
+
+with st.form("reply_agent_form", clear_on_submit=False):
+    _ra_col1, _ra_col2 = st.columns(2)
+    with _ra_col1:
+        _ra_inbound = st.text_area(
+            "Paste inbound reply",
+            placeholder="Paste the prospect reply here",
+            height=120,
+            key="ra_inbound",
+        )
+        _ra_original = st.text_area(
+            "Original outbound email",
+            placeholder="Paste the original email if available",
+            height=80,
+            key="ra_original",
+        )
+    with _ra_col2:
+        _ra_context = st.text_area(
+            "Lead or company context",
+            placeholder="Add anything useful about the lead, company, offer, or ICP",
+            height=80,
+            key="ra_context",
+        )
+        _ra_calendar = st.text_input(
+            "Calendar link",
+            placeholder="Paste booking link",
+            key="ra_calendar",
+        )
+    _ra_submit = st.form_submit_button("Generate reply draft", type="primary")
+
+if _ra_submit:
+    if not _ra_inbound.strip():
+        st.warning("Paste an inbound reply to continue.")
+    else:
+        with st.spinner("Classifying and drafting reply…"):
+            try:
+                _ra_result = run_async(classify_and_draft_reply(
+                    inbound_reply=_ra_inbound,
+                    original_outbound_email=_ra_original,
+                    lead_context=_ra_context,
+                    calendar_link=_ra_calendar,
+                    workspace_id=_ws_id,
+                ))
+                st.session_state["ra_last_result"] = {
+                    "result": _ra_result,
+                    "inbound_snippet": _ra_inbound[:80],
+                }
+                # Append to session history (newest first, cap at 10)
+                _ra_history = st.session_state.get("ra_history", [])
+                _ra_history.insert(0, {
+                    "result": _ra_result,
+                    "inbound_snippet": _ra_inbound[:80],
+                })
+                st.session_state["ra_history"] = _ra_history[:10]
+                # Best-effort DB persist
+                save_reply_draft(
+                    _ra_result,
+                    inbound_reply=_ra_inbound,
+                    original_outbound_email=_ra_original,
+                    lead_context=_ra_context,
+                    workspace_id=_ws_id,
+                )
+            except Exception as _ra_exc:
+                st.error(f"Reply Agent failed: {_ra_exc}")
+                st.session_state.pop("ra_last_result", None)
+
+# Show the last generated draft (persists until a new draft is generated)
+if "ra_last_result" in st.session_state:
+    _ra_entry = st.session_state["ra_last_result"]
+    _ra_r = _ra_entry["result"]
+    with st.container(border=True):
+        _ra_action_label = _ACTION_LABELS.get(_ra_r.recommended_action, _ra_r.recommended_action)
+        _ra_left, _ra_right = st.columns(2)
+        with _ra_left:
+            st.markdown(f"**Intent:** `{_ra_r.classification}`")
+        with _ra_right:
+            st.markdown(f"**Recommended action:** {_ra_action_label}")
+        if _ra_r.human_review_notes:
+            st.info(f"**Review notes:** {_ra_r.human_review_notes}")
+        st.markdown("**Suggested reply draft** — copy manually before sending:")
+        st.text_area(
+            "Draft",
+            value=_ra_r.draft_body,
+            height=150,
+            key="ra_draft_output",
+            label_visibility="collapsed",
+        )
+
+# Session history
+if st.session_state.get("ra_history"):
+    with st.expander(
+        f"Reply draft history — this session "
+        f"({len(st.session_state['ra_history'])} draft(s))"
+    ):
+        for _ra_i, _ra_h in enumerate(st.session_state["ra_history"]):
+            _r = _ra_h["result"]
+            with st.container(border=True):
+                st.caption(
+                    f"#{_ra_i + 1} · {_r.classification} → {_r.recommended_action} "
+                    f"· {_ra_h['inbound_snippet']}…"
+                )
+                st.text(_r.draft_body[:300])
 
 with st.expander("Sync debug — raw Instantly analytics + DB comparison"):
     if _snapshot is None:
@@ -754,6 +878,7 @@ else:
                     diag,
                     metric_snapshot=_metrics,
                     snapshot_id=_snapshot.get("id") if _snapshot else None,
+                    workspace_id=_ws_id,
                 )
             rec_id = st.session_state[pending_rec_key]
 
@@ -790,7 +915,7 @@ else:
 
                 if approve and diag.loop_status == LOOP_READY:
                     try:
-                        approve_recommendation(rec_id, approved_by="demo_sdr")
+                        approve_recommendation(rec_id, approved_by="demo_sdr", workspace_id=_ws_id)
                     except Exception as exc:
                         st.error(f"Approval failed: {exc}")
                     else:
@@ -834,7 +959,7 @@ else:
 
 # ---------- Recommendation history ----------
 with st.expander("Recommendation history & rollback"):
-    recs = _recommendations_cached()
+    recs = _recommendations_cached(workspace_id=_ws_id)
 
     # Staleness reference values from the current snapshot.
     _current_snap_id = _snapshot.get("id") if _snapshot else None
@@ -960,7 +1085,7 @@ with st.expander("Recommendation history & rollback"):
                         type="secondary",
                     ):
                         try:
-                            rollback_recommendation(rec["id"])
+                            rollback_recommendation(rec["id"], workspace_id=_ws_id)
                         except Exception as exc:
                             st.error(f"Rollback failed: {exc}")
                         else:

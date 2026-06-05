@@ -224,11 +224,19 @@ st.markdown(
 # Section A — CSV ingest
 # =========================================================
 st.header("1) Ingest CSV")
+_ingest_ws_id = get_current_workspace_id()
+try:
+    from src.workspace import get_workspace_by_id as _get_iws
+    _ingest_ws = _get_iws(_ingest_ws_id) if _ingest_ws_id else None
+    _ingest_ws_name = _ingest_ws.get("name") if _ingest_ws else "OSP (default)"
+    st.info(f"Importing into workspace: **{_ingest_ws_name}**")
+except Exception:
+    pass
 st.caption(
     "Upload a CSV from Apollo, ZoomInfo, Sales Navigator, Lusha, or a "
     "snake_case export. Columns are auto-detected against the canonical "
     f"schema ({', '.join(REQUIRED_FIELDS)} required). "
-    "Confirm or remap below before ingesting. Ingest is idempotent on email."
+    "Confirm or remap below before ingesting. Ingest is idempotent on email within the same workspace."
 )
 
 uploaded = st.file_uploader(
@@ -366,6 +374,7 @@ if st.button(
             result: IngestResult = run_ingest_subprocess(
                 saved_csv_path,
                 mapping=final_mapping,
+                workspace_id=_ingest_ws_id,
             )
     except Exception as exc:
         st.error(f"Ingest failed before subprocess: {exc}")

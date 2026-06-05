@@ -188,21 +188,78 @@ def list_all_negatives() -> list[dict]:
     return _load_json_array(NEGATIVES_PATH)
 
 
-def load_top_winners_for(content_type: str, k: int = 3) -> list[dict]:
-    """Filter `winning_examples.json` by content_type, sort, return top-k.
+def _is_osp_workspace(workspace_id: int | None) -> bool:
+    """Return True if workspace_id is the default OSP workspace (or None)."""
+    if workspace_id is None:
+        return True
+    try:
+        from src.workspace import get_default_workspace_id
+        return workspace_id == get_default_workspace_id()
+    except Exception:
+        return True
+
+
+def _load_db_winners_for(content_type: str, workspace_id: int, k: int) -> list[dict]:
+    """Load top-k winners from the WinningExample DB table for a workspace."""
+    try:
+        from sqlalchemy import select
+        from src.db import session_scope
+        from src.models import WinningExample
+        with session_scope() as session:
+            rows = session.execute(
+                select(WinningExample)
+                .where(
+                    WinningExample.workspace_id == workspace_id,
+                    # content_type NULL treated as "email" (legacy rows)
+                    (WinningExample.content_type == content_type)
+                    | (
+                        (WinningExample.content_type.is_(None))
+                        & (content_type == "email")
+                    ),
+                )
+                .order_by(WinningExample.reply_rate.desc())
+                .limit(k)
+            ).scalars().all()
+            return [
+                {
+                    "lead_context": row.lead_context or {},
+                    "subject": row.subject or "",
+                    "body": row.body or "",
+                    "reply_rate": row.reply_rate,
+                    "manually_flagged": row.manually_flagged,
+                    "winner_reason": "seed",
+                    "is_active": True,
+                    "content_type": row.content_type or "email",
+                }
+                for row in rows
+            ]
+    except Exception as exc:
+        log.warning("db_winners_for_load_failed", extra={"error": str(exc)})
+        return []
+
+
+def load_top_winners_for(content_type: str, k: int = 3, *, workspace_id: int | None = None) -> list[dict]:
+    """Return top-k winners for a content type, scoped to the given workspace.
+
+    Phase 6: fully workspace-scoped via WinningExample DB table.
+    - Non-OSP workspaces: DB only; empty if no winners migrated/copied.
+    - OSP workspace (workspace_id=None or default): DB first (migrated from JSON),
+      falls back to JSON if DB is empty for backward compatibility.
 
     Only includes entries that are:
       - active (is_active != False)
-      - have a valid winner_reason (seed, manual_positive_rating, positive_reply,
-        opportunity, booked_meeting, conversion)
-
-    engagement_reply entries without an explicit valid winner_reason are skipped —
-    a reply alone does not confirm positive intent. After running
-    `cleanup_invalid_winners()` the library only carries confirmed entries.
-
-    Pre-migration entries with no winner_reason field but with source="seed"
-    or manually_flagged=True still pass (backward compatible).
+      - have a valid winner_reason
     """
+    if not _is_osp_workspace(workspace_id):
+        return _load_db_winners_for(content_type, workspace_id, k)  # type: ignore[arg-type]
+
+    # OSP: try DB first (post-migration), fall back to JSON if empty.
+    if workspace_id is not None:
+        db_items = _load_db_winners_for(content_type, workspace_id, k)
+        if db_items:
+            return db_items
+
+    # JSON fallback (OSP legacy or pre-migration).
     items = [
         e for e in _load_json_array(WINNERS_PATH)
         if _entry_content_type(e) == content_type
@@ -216,12 +273,15 @@ def load_top_winners_for(content_type: str, k: int = 3) -> list[dict]:
     return items[:k]
 
 
-def load_top_negatives(content_type: str, k: int = 2) -> list[dict]:
-    """Most-recent first by `added_at`; falls back to file order on ties.
+def load_top_negatives(content_type: str, k: int = 2, *, workspace_id: int | None = None) -> list[dict]:
+    """Return top-k negative examples for a content type.
 
-    Skips entries with ``is_active: false`` so a demoted negative example
-    does not pollute future content prompts.
+    Phase 6: negatives are OSP-specific (from JSON). Non-OSP workspaces
+    get an empty list — they have no negative examples yet.
     """
+    if not _is_osp_workspace(workspace_id):
+        return []
+
     items = [
         e for e in _load_json_array(NEGATIVES_PATH)
         if e.get("content_type") == content_type
