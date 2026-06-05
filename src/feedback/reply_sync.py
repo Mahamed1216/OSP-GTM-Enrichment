@@ -33,6 +33,20 @@ from src.retry import retry_api
 log = logging.getLogger(__name__)
 
 _API_BASE = "https://api.instantly.ai/api/v2"
+
+
+def ensure_reply_agent_schema() -> bool:
+    """Ensure reply_drafts and reply_threads tables exist in the live DB.
+
+    Idempotent — safe to call on every page load. This is the page-level
+    safety net for production Postgres deployments where init_db() ran
+    against an older schema (before these tables were added).
+
+    Returns True if the tables exist or were successfully created.
+    Returns False if creation failed — caller should show a warning.
+    """
+    from src.db import ensure_tables
+    return ensure_tables("reply_drafts", "reply_threads")
 _TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
 # Status constants

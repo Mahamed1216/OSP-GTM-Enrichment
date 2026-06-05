@@ -64,6 +64,7 @@ from src.feedback.reply_sync import (
     STATUS_NEEDS_REVIEW,
     STATUS_SENT,
     STATUS_SKIPPED,
+    ensure_reply_agent_schema,
     get_reply_queue,
     get_send_blocked_reason,
     sync_reply_queue,
@@ -521,6 +522,18 @@ _RA_STATUS_ICONS = {
     STATUS_APPROVED: "✓ Approved",
 }
 
+# Belt-and-suspenders: ensure reply_threads table exists before any query.
+# init_db() normally handles this on startup, but on Streamlit Cloud the
+# Python process may not restart on a hot-deploy, leaving _db_initialized=True
+# while the new table was never created.  ensure_reply_agent_schema() is NOT
+# gated by _db_initialized so it always checks and creates if needed.
+_reply_schema_ready = ensure_reply_agent_schema()
+if not _reply_schema_ready:
+    st.warning(
+        "Reply Agent tables are initializing. "
+        "Reboot the app or refresh the page in a few seconds to continue."
+    )
+
 # Load workspace calendar link (used for auto-drafts)
 try:
     from src.workspace import get_calendar_link_for_workspace as _get_cal_link
@@ -589,7 +602,15 @@ with _tab_queue:
     try:
         _rq_threads = get_reply_queue(workspace_id=_ws_id)
     except Exception as _rq_load_exc:
-        st.error(f"Could not load reply queue: {_rq_load_exc}")
+        _rq_err_str = str(_rq_load_exc)
+        if "undefined" in _rq_err_str.lower() or "does not exist" in _rq_err_str.lower():
+            st.warning(
+                "Reply Agent tables are initializing — the `reply_threads` table "
+                "was not yet created in this database. "
+                "Reboot or refresh the app in a few seconds to continue."
+            )
+        else:
+            st.error(f"Could not load reply queue: {_rq_load_exc}")
         _rq_threads = []
 
     if _rq_threads:

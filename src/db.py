@@ -29,6 +29,54 @@ def is_db_initialized() -> bool:
 # (table_name, column_name, DDL fragment). Kept ordered so a fresh DB and an
 # existing DB both end up identical. Each entry must be idempotent:
 # `_apply_runtime_migrations` skips when the column already exists.
+# Tables added after the initial production deployment. `_apply_runtime_migrations`
+# creates these via `ensure_tables()` so they exist even when `init_db()` ran
+# against an older schema (e.g. the process didn't restart after a deploy).
+_RUNTIME_NEW_TABLES: tuple[str, ...] = (
+    "reply_drafts",
+    "reply_threads",
+)
+
+
+def ensure_tables(*table_names: str) -> bool:
+    """Create the named tables if they are missing from the live DB.
+
+    Unlike ``init_db()``, this is NOT gated by ``_db_initialized``.  It is safe
+    to call at any point in the request lifecycle — including from feature pages
+    that need to ensure their tables exist before querying them.
+
+    Idempotent: uses ``checkfirst=True`` so concurrent calls on a cold deploy
+    are safe (the second call finds the table already exists and skips it).
+
+    Returns True on success, False if creation failed (warning is logged and
+    the exception is swallowed so the caller can decide how to degrade).
+    """
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
+    try:
+        from src import models as _m  # noqa: F401  register all models on Base.metadata
+        _inspector = inspect(engine)
+        existing = set(_inspector.get_table_names())
+        to_create = [
+            Base.metadata.tables[name]
+            for name in table_names
+            if name in Base.metadata.tables and name not in existing
+        ]
+        if to_create:
+            Base.metadata.create_all(engine, tables=to_create, checkfirst=True)
+            _log.info(
+                "ensure_tables_created",
+                extra={"created": [t.name for t in to_create]},
+            )
+        return True
+    except Exception as exc:
+        _log.warning(
+            "ensure_tables_failed",
+            extra={"tables": list(table_names), "error": f"{type(exc).__name__}: {exc}"},
+        )
+        return False
+
+
 _RUNTIME_COLUMN_ADDS: list[tuple[str, str, str]] = [
     # Added so bulk-regen resume can fingerprint the prompt that produced
     # a row, rather than relying on the unchanging prompt_version constant.
@@ -178,14 +226,19 @@ def _migrate_prompt_configs_composite_unique() -> None:
 def _apply_runtime_migrations() -> None:
     """Idempotently bring existing tables in line with the current model.
 
-    Two passes:
-      1. ADD COLUMN for any model column missing from the live table.
-         Cross-dialect: both SQLite and Postgres accept the plain
-         `ALTER TABLE ... ADD COLUMN` form.
-      2. ALTER COLUMN TYPE for Postgres-only widening of VARCHARs that
-         outgrew their original cap. Skipped on SQLite because SQLite's
-         VARCHAR(N) doesn't enforce N anyway.
+    Pass 0 — create new tables added after the initial production deployment.
+             Uses ensure_tables() so this is safe even when called multiple
+             times or when the process did not restart after a deploy.
+    Pass 1 — ADD COLUMN for any model column missing from the live table.
+             Cross-dialect: both SQLite and Postgres accept the plain
+             `ALTER TABLE ... ADD COLUMN` form.
+    Pass 2 — ALTER COLUMN TYPE for Postgres-only widening of VARCHARs that
+             outgrew their original cap. Skipped on SQLite because SQLite's
+             VARCHAR(N) doesn't enforce N anyway.
     """
+    # Pass 0 — create tables that weren't present in the original schema.
+    ensure_tables(*_RUNTIME_NEW_TABLES)
+
     inspector = inspect(engine)
     existing_tables = set(inspector.get_table_names())
 
