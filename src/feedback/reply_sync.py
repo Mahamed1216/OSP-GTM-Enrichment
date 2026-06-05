@@ -19,7 +19,7 @@ from sqlalchemy.exc import IntegrityError
 
 from src.config import settings
 from src.db import session_scope
-from src.feedback.engagement import _classify_positive_lead, _iter_campaign_leads
+from src.feedback.engagement import _iter_campaign_leads
 from src.feedback.reply_agent import (
     ACTION_HUMAN,
     ACTION_STOP,
@@ -47,6 +47,8 @@ def ensure_reply_agent_schema() -> bool:
     """
     from src.db import ensure_tables
     return ensure_tables("reply_drafts", "reply_threads")
+
+
 _TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
 # Status constants
@@ -62,6 +64,84 @@ _SEND_BLOCKED_CLASSIFICATIONS = frozenset({INTENT_UNSUBSCRIBE, INTENT_ANGRY})
 _SEND_BLOCKED_ACTIONS = frozenset({ACTION_STOP, ACTION_HUMAN})
 
 _PLACEHOLDER_PREFIX = "[Reply text not available"
+
+# ---------------------------------------------------------------------------
+# Opportunity filter — strictly more selective than the engagement analytics
+# _classify_positive_lead which includes status=2 (any generic reply).
+#
+# Instantly integer status codes:
+#   -1 = Bounced          0 = Not contacted      1 = Active/in-sequence
+#    2 = Replied (generic — OOO/negative/unsubscribe all land here)
+#    3 = Interested        4 = Opportunity        5 = Booked
+#    6 = Converted/Customer
+#
+# status=2 explains why a 968-send campaign with 0.5% reply rate would
+# produce 309 records: ~32% of leads opened/clicked and get status=2 in
+# some Instantly configurations, OR every lead that replied in any way
+# (including OOO, negative) lands at status=2.  We only want status >= 3.
+# ---------------------------------------------------------------------------
+_OPPORTUNITY_STATUS_INTS: frozenset[int] = frozenset({3, 4, 5, 6})
+
+_OPPORTUNITY_STATUS_STRS: frozenset[str] = frozenset({
+    "interested", "meeting_booked", "opportunity", "customer",
+    "booked", "converted", "won", "qualified", "hot",
+    # "positive" intentionally excluded — too generic in Instantly's taxonomy
+    # "replied"  intentionally excluded — status=2 maps to this
+})
+
+# Fields scanned for the opportunity signal in raw lead payloads.
+_OPPORTUNITY_SIGNAL_FIELDS_INT = (
+    "status", "lead_status", "email_status", "interest_status",
+    "reply_status", "campaign_status",
+)
+_OPPORTUNITY_BOOL_FLAGS = (
+    "is_interested", "has_opportunity", "opportunity",
+    "is_opportunity", "interested", "is_booked",
+)
+_OPPORTUNITY_CATEGORY_FIELDS = ("categories", "labels", "tags")
+
+
+def _truthy(value: object) -> bool:
+    if value is None or value is False:
+        return False
+    if isinstance(value, (int, float)):
+        return value > 0
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "none", "null")
+    return True
+
+
+def _is_opportunity_lead(raw: dict) -> str | None:
+    """Return 'field=value' if this lead is a confirmed opportunity, else None.
+
+    Stricter than the engagement analytics ``_classify_positive_lead``:
+      - Integer status 2 (generic replied) is EXCLUDED.  All generic replies
+        land at status=2 in Instantly; only status >= 3 indicates actual
+        interest/opportunity.
+      - String statuses must be in the explicit opportunity set (no "positive").
+      - Boolean flags and category labels are still accepted.
+
+    This is the gate that aligns Reply Agent queue size with the KPI card
+    "Opportunities: N" (sourced from the campaign analytics endpoint).
+    """
+    for field in _OPPORTUNITY_SIGNAL_FIELDS_INT:
+        val = raw.get(field)
+        if val is None:
+            continue
+        if isinstance(val, int) and val in _OPPORTUNITY_STATUS_INTS:
+            return f"{field}={val}"
+        if isinstance(val, str) and val.strip().lower() in _OPPORTUNITY_STATUS_STRS:
+            return f"{field}={val.strip()}"
+    for field in _OPPORTUNITY_BOOL_FLAGS:
+        if _truthy(raw.get(field)):
+            return f"{field}=true"
+    for field in _OPPORTUNITY_CATEGORY_FIELDS:
+        cats = raw.get(field)
+        if isinstance(cats, list):
+            for cat in cats:
+                if isinstance(cat, str) and cat.strip().lower() in _OPPORTUNITY_STATUS_STRS:
+                    return f"{field}={cat.strip()}"
+    return None
 
 
 def _auth_headers(api_key: str | None = None) -> dict[str, str]:
@@ -235,19 +315,33 @@ async def sync_reply_queue(workspace_id: int | None = None) -> dict:
 
     _ws_id = workspace_id if workspace_id is not None else get_default_workspace_id()
 
-    synced_positive = 0
+    total_leads_scanned = 0
+    opportunity_leads_found = 0
+    ignored_not_opportunity = 0
     new_count = 0
     updated_count = 0
     skipped_no_text = 0
     error_count = 0
     debug_emails: list[dict] = []
+    # Sample of raw signals seen on skipped leads (up to 20) for debug output.
+    debug_skipped_signals: list[dict] = []
 
     async for raw_lead in _iter_campaign_leads(campaign_id, api_key):
-        pos_signal = _classify_positive_lead(raw_lead)
-        if pos_signal is None:
+        total_leads_scanned += 1
+
+        opp_signal = _is_opportunity_lead(raw_lead)
+        if opp_signal is None:
+            ignored_not_opportunity += 1
+            if len(debug_skipped_signals) < 20:
+                debug_skipped_signals.append({
+                    "email": raw_lead.get("email", "?"),
+                    "status": raw_lead.get("status"),
+                    "email_reply_count": raw_lead.get("email_reply_count"),
+                    "reason": "no_opportunity_signal",
+                })
             continue
 
-        synced_positive += 1
+        opportunity_leads_found += 1
         instantly_lead_id = str(raw_lead.get("id") or raw_lead.get("lead_id") or "").strip()
         prospect_email = str(raw_lead.get("email") or "").strip()
         if not prospect_email:
@@ -264,7 +358,7 @@ async def sync_reply_queue(workspace_id: int | None = None) -> dict:
             prospect_email, campaign_id, api_key
         )
         email_debug["prospect_email"] = prospect_email
-        email_debug["pos_signal"] = pos_signal
+        email_debug["opp_signal"] = opp_signal
         debug_emails.append(email_debug)
 
         # Pick most-recent reply email
@@ -290,7 +384,7 @@ async def sync_reply_queue(workspace_id: int | None = None) -> dict:
         if not has_real_text:
             reply_text = (
                 f"[Reply text not available from Instantly API — "
-                f"positive signal: {pos_signal}. "
+                f"opportunity signal: {opp_signal}. "
                 f"Check Instantly dashboard for the actual reply, "
                 f"then use the Manual Draft Tester below.]"
             )
@@ -397,20 +491,107 @@ async def sync_reply_queue(workspace_id: int | None = None) -> dict:
         "reply_queue_sync_complete",
         extra={
             "workspace_id": _ws_id,
-            "positive_leads": synced_positive,
+            "total_scanned": total_leads_scanned,
+            "opportunity_leads": opportunity_leads_found,
+            "ignored_not_opportunity": ignored_not_opportunity,
             "new": new_count,
             "updated": updated_count,
             "errors": error_count,
         },
     )
     return {
-        "synced": synced_positive,
+        "total_leads_scanned": total_leads_scanned,
+        "opportunity_leads_found": opportunity_leads_found,
+        "ignored_not_opportunity": ignored_not_opportunity,
+        "synced": opportunity_leads_found,   # kept for backward compat with UI
         "new": new_count,
         "updated": updated_count,
         "skipped_no_text": skipped_no_text,
         "errors": error_count,
         "api_key_source": api_key_source,
         "debug_emails_endpoint": debug_emails,
+        "debug_skipped_signals": debug_skipped_signals,
+    }
+
+
+def archive_non_opportunity_threads(
+    workspace_id: int | None = None,
+    *,
+    dry_run: bool = False,
+) -> dict:
+    """Archive ReplyThread records that lack a confirmed opportunity signal.
+
+    Used to clean up records incorrectly imported when the sync used the
+    broad _classify_positive_lead (status >= 2) filter instead of the
+    strict _is_opportunity_lead (status >= 3) filter.
+
+    A record is archived (status → 'skipped') if:
+      - Its raw_payload has NO opportunity signal (_is_opportunity_lead returns None)
+      - AND its status is NOT 'sent' (already acted on — always preserved)
+
+    Records whose raw_payload PASSES _is_opportunity_lead are preserved unchanged.
+    Records with no raw_payload at all are skipped (cannot verify — left unchanged).
+
+    dry_run=True: reports counts without writing anything.
+
+    Returns:
+      archived: int  — records updated to status='skipped'
+      preserved: int — records kept because they have a true opportunity signal
+      no_payload: int — records unchanged because raw_payload was absent
+      sent_preserved: int — records kept because they were already sent
+      dry_run: bool
+    """
+    from src.workspace import get_default_workspace_id
+    _ws_id = workspace_id if workspace_id is not None else get_default_workspace_id()
+
+    archived = 0
+    preserved = 0
+    no_payload = 0
+    sent_preserved = 0
+
+    with session_scope() as session:
+        rows = session.execute(
+            select(ReplyThread).where(ReplyThread.workspace_id == _ws_id)
+        ).scalars().all()
+
+        for row in rows:
+            # Always preserve sent records
+            if row.status == STATUS_SENT:
+                sent_preserved += 1
+                continue
+
+            if not row.raw_payload:
+                no_payload += 1
+                continue
+
+            signal = _is_opportunity_lead(row.raw_payload)
+            if signal is not None:
+                preserved += 1
+            else:
+                archived += 1
+                if not dry_run:
+                    row.status = STATUS_SKIPPED
+                    existing_notes = row.human_review_notes or ""
+                    note = "Archived: not_actual_opportunity — imported when sync filter was too broad."
+                    row.human_review_notes = (note + " " + existing_notes).strip()
+
+    log.info(
+        "non_opportunity_cleanup_complete",
+        extra={
+            "workspace_id": _ws_id,
+            "archived": archived,
+            "preserved": preserved,
+            "no_payload": no_payload,
+            "sent_preserved": sent_preserved,
+            "dry_run": dry_run,
+        },
+    )
+    return {
+        "archived": archived,
+        "preserved": preserved,
+        "no_payload": no_payload,
+        "sent_preserved": sent_preserved,
+        "dry_run": dry_run,
     }
 
 

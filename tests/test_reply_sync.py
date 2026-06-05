@@ -11,6 +11,11 @@ from sqlalchemy import select
 
 import src.feedback.reply_sync as reply_sync_mod
 from src.db import session_scope
+from src.feedback.reply_sync import (
+    STATUS_SKIPPED,
+    _is_opportunity_lead,
+    archive_non_opportunity_threads,
+)
 from src.feedback.reply_agent import (
     ACTION_BOOK_MEETING,
     ACTION_HUMAN,
@@ -58,8 +63,13 @@ def _make_positive_lead(email: str = "alice@example.com", lead_id: str = "il-001
         "first_name": "Alice",
         "last_name": "Prospect",
         "company_name": "Acme Corp",
-        "status": 2,  # positive integer status
+        "status": 3,  # Interested — passes the strict opportunity filter
     }
+
+
+def _make_generic_replied_lead(email: str, lead_id: str) -> dict:
+    """status=2 = generic replied (OOO/negative/unsubscribe all land here)."""
+    return {"id": lead_id, "email": email, "status": 2, "email_reply_count": 1}
 
 
 def _fake_positive_iter(*leads):
@@ -727,3 +737,274 @@ def test_get_send_blocked_reason_blocks_empty_draft():
     reason = get_send_blocked_reason(thread)
     assert reason is not None
     assert "empty" in reason.lower()
+
+
+# ===========================================================================
+# Opportunity filter — new tests for the strict _is_opportunity_lead gate
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 1. Campaign with 2 opportunities and 309 generic replies imports only 2
+# ---------------------------------------------------------------------------
+
+def test_campaign_2_opportunities_309_generic_imports_2(monkeypatch):
+    osp_id = _seed_osp()
+    opportunity_lead = _make_positive_lead(email="opp@example.com", lead_id="il-opp")
+    # 309 leads with status=2 (generic replied — OOO/negative/unsubscribe)
+    generic_leads = [
+        _make_generic_replied_lead(email=f"lead{i}@example.com", lead_id=f"il-gen-{i}")
+        for i in range(309)
+    ]
+    all_leads = [opportunity_lead] + generic_leads
+
+    _run_sync_with_overrides(
+        osp_id, "camp-x", "key-x", osp_id,
+        monkeypatch, all_leads, _fake_emails(), _fake_draft(),
+    )
+
+    with session_scope() as session:
+        count = len(session.execute(select(ReplyThread)).scalars().all())
+    assert count == 1, f"Expected 1 opportunity record, got {count} (generic replies must be excluded)"
+
+
+# ---------------------------------------------------------------------------
+# 2. Generic replied (status=2) is NOT imported
+# ---------------------------------------------------------------------------
+
+def test_generic_replied_status_not_imported(monkeypatch):
+    osp_id = _seed_osp()
+    _run_sync_with_overrides(
+        osp_id, "camp-x", "key-x", osp_id,
+        monkeypatch,
+        [_make_generic_replied_lead("generic@example.com", "il-gen")],
+        _fake_emails(), _fake_draft(),
+    )
+    with session_scope() as session:
+        count = len(session.execute(select(ReplyThread)).scalars().all())
+    assert count == 0, "status=2 (generic replied) must not be imported into Reply Agent queue"
+
+
+# ---------------------------------------------------------------------------
+# 3. has_reply=True (email_reply_count>0) alone is not enough
+# ---------------------------------------------------------------------------
+
+def test_has_reply_true_not_enough(monkeypatch):
+    osp_id = _seed_osp()
+    lead = {
+        "id": "il-replied", "email": "replied@example.com",
+        "status": 2,  # generic replied — not opportunity
+        "email_reply_count": 1,
+        "has_reply": True,
+    }
+    _run_sync_with_overrides(
+        osp_id, "camp-x", "key-x", osp_id,
+        monkeypatch, [lead], _fake_emails(), _fake_draft(),
+    )
+    with session_scope() as session:
+        count = len(session.execute(select(ReplyThread)).scalars().all())
+    assert count == 0, "email_reply_count>0 alone must not trigger import"
+
+
+# ---------------------------------------------------------------------------
+# 4. Opened lead is NOT imported
+# ---------------------------------------------------------------------------
+
+def test_opened_lead_not_imported(monkeypatch):
+    osp_id = _seed_osp()
+    lead = {
+        "id": "il-opened", "email": "opened@example.com",
+        "status": 1,  # active in sequence — just opened
+        "email_open_count": 3,
+    }
+    _run_sync_with_overrides(
+        osp_id, "camp-x", "key-x", osp_id,
+        monkeypatch, [lead], _fake_emails(), _fake_draft(),
+    )
+    with session_scope() as session:
+        count = len(session.execute(select(ReplyThread)).scalars().all())
+    assert count == 0, "Opened lead (status=1) must not be imported"
+
+
+# ---------------------------------------------------------------------------
+# 5. Actual opportunity (status=4) IS imported
+# ---------------------------------------------------------------------------
+
+def test_opportunity_status_4_is_imported(monkeypatch):
+    osp_id = _seed_osp()
+    lead = {
+        "id": "il-opp4", "email": "opp4@example.com",
+        "status": 4,  # Opportunity
+    }
+    _run_sync_with_overrides(
+        osp_id, "camp-x", "key-x", osp_id,
+        monkeypatch, [lead], _fake_emails(), _fake_draft(),
+    )
+    with session_scope() as session:
+        count = len(session.execute(select(ReplyThread)).scalars().all())
+    assert count == 1, "status=4 (Opportunity) must be imported"
+
+
+# ---------------------------------------------------------------------------
+# 6. String status "interested" IS imported
+# ---------------------------------------------------------------------------
+
+def test_interested_string_status_imported(monkeypatch):
+    osp_id = _seed_osp()
+    lead = {
+        "id": "il-int", "email": "int@example.com",
+        "status": "interested",
+    }
+    _run_sync_with_overrides(
+        osp_id, "camp-x", "key-x", osp_id,
+        monkeypatch, [lead], _fake_emails(), _fake_draft(),
+    )
+    with session_scope() as session:
+        count = len(session.execute(select(ReplyThread)).scalars().all())
+    assert count == 1, 'status="interested" must be imported as opportunity'
+
+
+# ---------------------------------------------------------------------------
+# 7. Dedup still works with new filter
+# ---------------------------------------------------------------------------
+
+def test_dedup_still_works_with_new_filter(monkeypatch):
+    osp_id = _seed_osp()
+    lead = {"id": "il-dedup", "email": "dedup@example.com", "status": 3}
+    for _ in range(3):
+        _run_sync_with_overrides(
+            osp_id, "camp-x", "key-x", osp_id,
+            monkeypatch, [lead], _fake_emails(msg_id="msg-dedup"), _fake_draft(),
+        )
+    with session_scope() as session:
+        count = len(session.execute(select(ReplyThread)).scalars().all())
+    assert count == 1, "Dedup must prevent duplicate records even with multiple syncs"
+
+
+# ---------------------------------------------------------------------------
+# 8. Cleanup archives non-opportunity imported records
+# ---------------------------------------------------------------------------
+
+def test_cleanup_archives_non_opportunity_records():
+    osp_id = _seed_osp()
+    # Create a record with raw_payload that has status=2 (generic replied)
+    with session_scope() as session:
+        row = ReplyThread(
+            workspace_id=osp_id,
+            campaign_id="camp-1",
+            prospect_email="bad@example.com",
+            inbound_reply_text="OOO: I am out of office.",
+            classification="out_of_office",
+            recommended_action="do_not_reply",
+            draft_body="",
+            human_review_notes="",
+            status=STATUS_NEEDS_REVIEW,
+            dedup_key="lead:il-bad",
+            raw_payload={"status": 2, "email": "bad@example.com"},
+        )
+        session.add(row)
+        session.flush()
+        bad_id = row.id
+
+    result = archive_non_opportunity_threads(osp_id, dry_run=False)
+    assert result["archived"] >= 1
+
+    with session_scope() as session:
+        row = session.get(ReplyThread, bad_id)
+        assert row.status == STATUS_SKIPPED
+        assert "not_actual_opportunity" in row.human_review_notes.lower()
+
+
+# ---------------------------------------------------------------------------
+# 9. Cleanup does NOT archive true opportunity records
+# ---------------------------------------------------------------------------
+
+def test_cleanup_preserves_true_opportunity_records():
+    osp_id = _seed_osp()
+    # Create a record with raw_payload that has status=3 (Interested)
+    with session_scope() as session:
+        row = ReplyThread(
+            workspace_id=osp_id,
+            campaign_id="camp-1",
+            prospect_email="real@example.com",
+            inbound_reply_text="I'm interested.",
+            classification=INTENT_POSITIVE_INTEREST,
+            recommended_action=ACTION_BOOK_MEETING,
+            draft_body="Let's connect.",
+            human_review_notes="",
+            status=STATUS_NEEDS_REVIEW,
+            dedup_key="lead:il-real",
+            raw_payload={"status": 3, "email": "real@example.com"},
+        )
+        session.add(row)
+        session.flush()
+        good_id = row.id
+
+    result = archive_non_opportunity_threads(osp_id, dry_run=False)
+    assert result["preserved"] >= 1
+
+    with session_scope() as session:
+        row = session.get(ReplyThread, good_id)
+        assert row.status == STATUS_NEEDS_REVIEW, \
+            "True opportunity records must not be archived by cleanup"
+
+
+# ---------------------------------------------------------------------------
+# 10. Reply Agent queue is workspace scoped (via _is_opportunity_lead)
+# ---------------------------------------------------------------------------
+
+def test_opportunity_filter_is_workspace_scoped(monkeypatch):
+    osp_id = _seed_osp()
+    other_ws = create_workspace(name="Scope Test", slug="scope-test", instantly_campaign_id="camp-scope")
+    other_id = other_ws["id"]
+
+    _run_sync_with_overrides(
+        osp_id, "camp-osp", "key-osp", osp_id,
+        monkeypatch,
+        [_make_positive_lead(email="scoped@example.com", lead_id="il-scoped")],
+        _fake_emails(msg_id="msg-scoped"),
+        _fake_draft(),
+    )
+
+    # Other workspace must have empty queue
+    other_queue = get_reply_queue(workspace_id=other_id)
+    assert len(other_queue) == 0
+
+    # OSP workspace has the record
+    osp_queue = get_reply_queue(workspace_id=osp_id)
+    assert len(osp_queue) == 1
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _is_opportunity_lead
+# ---------------------------------------------------------------------------
+
+def test_is_opportunity_lead_rejects_status_2():
+    assert _is_opportunity_lead({"status": 2}) is None
+
+
+def test_is_opportunity_lead_rejects_status_1():
+    assert _is_opportunity_lead({"status": 1}) is None
+
+
+def test_is_opportunity_lead_rejects_open_only():
+    assert _is_opportunity_lead({"email_open_count": 5, "status": 1}) is None
+
+
+def test_is_opportunity_lead_accepts_status_3():
+    assert _is_opportunity_lead({"status": 3}) is not None
+
+
+def test_is_opportunity_lead_accepts_status_4():
+    assert _is_opportunity_lead({"status": 4}) is not None
+
+
+def test_is_opportunity_lead_accepts_interested_string():
+    assert _is_opportunity_lead({"status": "interested"}) is not None
+
+
+def test_is_opportunity_lead_accepts_bool_flag():
+    assert _is_opportunity_lead({"is_interested": True}) is not None
+
+
+def test_is_opportunity_lead_accepts_opportunity_category():
+    assert _is_opportunity_lead({"categories": ["opportunity"]}) is not None

@@ -64,6 +64,7 @@ from src.feedback.reply_sync import (
     STATUS_NEEDS_REVIEW,
     STATUS_SENT,
     STATUS_SKIPPED,
+    archive_non_opportunity_threads,
     ensure_reply_agent_schema,
     get_reply_queue,
     get_send_blocked_reason,
@@ -574,28 +575,53 @@ with _tab_queue:
                 _rq_sync_result = None
 
         if _rq_sync_result is not None:
-            _rq_new = _rq_sync_result.get("new", 0)
-            _rq_upd = _rq_sync_result.get("updated", 0)
-            _rq_pos = _rq_sync_result.get("synced", 0)
-            _rq_skip = _rq_sync_result.get("skipped_no_text", 0)
+            _rq_total   = _rq_sync_result.get("total_leads_scanned", 0)
+            _rq_opp     = _rq_sync_result.get("opportunity_leads_found", 0)
+            _rq_ignored = _rq_sync_result.get("ignored_not_opportunity", 0)
+            _rq_new     = _rq_sync_result.get("new", 0)
+            _rq_upd     = _rq_sync_result.get("updated", 0)
+            _rq_skip    = _rq_sync_result.get("skipped_no_text", 0)
+
             st.success(
-                f"Sync complete — {_rq_pos} positive leads found, "
-                f"{_rq_new} new draft(s) created, "
-                f"{_rq_upd} existing record(s) refreshed. "
+                f"Sync complete — "
+                f"**{_rq_opp} opportunity reply lead(s)** found from {_rq_total} total. "
+                f"{_rq_new} new draft(s) · {_rq_upd} refreshed. "
                 f"API key: {_rq_sync_result.get('api_key_source', '?')}."
             )
+            if _rq_ignored:
+                st.info(
+                    f"{_rq_ignored} lead(s) had a generic reply signal (e.g. status=2) "
+                    "but were **not** confirmed opportunities — they were ignored. "
+                    "This is expected behavior and aligns the queue with the KPI Opportunities card."
+                )
             if _rq_skip:
                 st.info(
-                    f"{_rq_skip} lead(s) had no reply text available from Instantly API — "
-                    "marked needs_human_review. Check the Instantly dashboard for their actual replies."
+                    f"{_rq_skip} opportunity lead(s) had no reply text available from the Instantly "
+                    "emails endpoint — marked needs_human_review. Check Instantly dashboard for "
+                    "actual reply content."
                 )
 
-            # Show per-lead email endpoint debug
+            # Debug expanders
             _rq_debug_emails = _rq_sync_result.get("debug_emails_endpoint") or []
-            if _rq_debug_emails:
-                with st.expander(f"Debug — emails endpoint ({len(_rq_debug_emails)} lead(s) probed)"):
-                    for _d in _rq_debug_emails:
-                        st.json({k: v for k, v in _d.items() if k != "params"})
+            _rq_debug_skipped = _rq_sync_result.get("debug_skipped_signals") or []
+            if _rq_debug_emails or _rq_debug_skipped:
+                with st.expander(
+                    f"Sync debug — "
+                    f"{_rq_total} scanned · {_rq_opp} opportunity · "
+                    f"{_rq_ignored} ignored · {_rq_new} imported"
+                ):
+                    st.markdown(f"**Opportunity filter:** `status in {{3,4,5,6}}` or explicit interest/opportunity flags")
+                    st.markdown(
+                        f"**Note:** `status=2` (generic replied — includes OOO/negative/unsubscribe) "
+                        "is intentionally excluded."
+                    )
+                    if _rq_debug_emails:
+                        st.markdown(f"**Emails endpoint probed for {len(_rq_debug_emails)} opportunity lead(s):**")
+                        for _d in _rq_debug_emails:
+                            st.json({k: v for k, v in _d.items() if k != "params"})
+                    if _rq_debug_skipped:
+                        st.markdown(f"**Sample of {len(_rq_debug_skipped)} skipped leads (no opportunity signal):**")
+                        st.dataframe(pd.DataFrame(_rq_debug_skipped), hide_index=True)
             st.rerun()
 
     # ── Summary KPIs ────────────────────────────────────────────────────
@@ -629,15 +655,63 @@ with _tab_queue:
                 str(_rq_status_counts.get(STATUS_MANUAL_SEND, 0) + _rq_status_counts.get("failed", 0)),
             )
 
+    # ── Cleanup button (for bad imports from previous broad filter) ──────
+    _rq_active_count = sum(
+        1 for t in _rq_threads
+        if t.get("status") not in (STATUS_SKIPPED, STATUS_SENT, "archived")
+    )
+    if len(_rq_threads) > 5 and _rq_active_count > 5:
+        with st.expander("Clean non-opportunity drafts (use after upgrading from old sync)"):
+            st.caption(
+                "If a previous sync imported too many records (e.g. 309 instead of 2), "
+                "click below to archive records that have no confirmed opportunity signal "
+                "in their stored Instantly payload. Sent records are always preserved."
+            )
+            _rq_dry_col, _rq_clean_col = st.columns(2)
+            with _rq_dry_col:
+                if st.button("Preview cleanup (dry run)", key="rq_cleanup_dry"):
+                    _preview = archive_non_opportunity_threads(_ws_id, dry_run=True)
+                    st.info(
+                        f"Dry run — would archive {_preview['archived']} record(s), "
+                        f"preserve {_preview['preserved']} (true opportunities), "
+                        f"skip {_preview['no_payload']} (no payload to check), "
+                        f"keep {_preview['sent_preserved']} sent."
+                    )
+            with _rq_clean_col:
+                if st.button(
+                    "Archive non-opportunity records",
+                    key="rq_cleanup_run",
+                    type="secondary",
+                    help="Sets status=skipped for records without an opportunity signal in their Instantly payload.",
+                ):
+                    _cleanup = archive_non_opportunity_threads(_ws_id, dry_run=False)
+                    st.success(
+                        f"Cleanup done — archived {_cleanup['archived']}, "
+                        f"preserved {_cleanup['preserved']} real opportunity records."
+                    )
+                    st.cache_data.clear()
+                    st.rerun()
+
     # ── Reply list table ─────────────────────────────────────────────────
-    if not _rq_threads:
+    _rq_display_threads = [
+        t for t in _rq_threads
+        if t.get("status") != STATUS_SKIPPED or t.get("status") == STATUS_SENT
+    ]
+    if not _rq_display_threads:
         st.info(
             "No opportunity replies in the queue yet for this workspace. "
             "Click **Sync opportunity replies from Instantly** above."
         )
+        if len(_rq_threads) != len(_rq_display_threads):
+            st.caption(
+                f"{len(_rq_threads) - len(_rq_display_threads)} skipped/archived record(s) hidden. "
+            )
     else:
+        st.caption(
+            f"Showing opportunity replies only · {len(_rq_display_threads)} record(s)"
+        )
         _rq_rows = []
-        for _t in _rq_threads:
+        for _t in _rq_display_threads:
             _recv = _t.get("reply_received_at")
             _recv_str = _recv.strftime("%Y-%m-%d %H:%M") if _recv else "—"
             _snippet = (_t.get("inbound_reply_text") or "")[:60].replace("\n", " ").strip()
@@ -672,7 +746,7 @@ with _tab_queue:
         else:
             _rq_row_idx = _rq_selected_rows[0]
             _rq_thread_id = _rq_df.iloc[_rq_row_idx]["id"]
-            _rq_thread = next((t for t in _rq_threads if t["id"] == _rq_thread_id), None)
+            _rq_thread = next((t for t in _rq_display_threads if t["id"] == _rq_thread_id), None)
 
             if _rq_thread:
                 with st.container(border=True):
