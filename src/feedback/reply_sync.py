@@ -1,10 +1,16 @@
-"""Reply queue: sync opportunity replies from Instantly and auto-draft responses.
+"""Reply queue: sync opportunity replies from Instantly, classify, auto-draft.
 
-MVP constraints (hard):
+Hard constraints (never relaxed):
 - Never auto-sends a reply.
 - Never modifies campaigns or email copy.
-- All send attempts require explicit operator approval from the UI.
-- If Instantly reply-send endpoint is not available, status = manual_send_required.
+- All send attempts require explicit operator approval.
+- If Instantly reply-send endpoint unavailable → manual_send_required.
+- No placeholder records in needs_review — missing reply body → missing_reply_text.
+
+Opportunity filter: only leads with Instantly status >= 3 (Interested / Opportunity /
+Booked / Converted) or explicit opportunity/interest flags are processed.
+Status 2 (generic replied) is intentionally excluded because it includes OOO,
+unsubscribe, and negative replies — it would flood the queue.
 """
 from __future__ import annotations
 
@@ -27,69 +33,50 @@ from src.feedback.reply_agent import (
     INTENT_UNSUBSCRIBE,
     classify_and_draft_reply,
 )
-from src.models import ReplyThread
+from src.models import Engagement, GeneratedContent, Lead, ReplyThread
 from src.retry import retry_api
 
 log = logging.getLogger(__name__)
 
 _API_BASE = "https://api.instantly.ai/api/v2"
-
-
-def ensure_reply_agent_schema() -> bool:
-    """Ensure reply_drafts and reply_threads tables exist in the live DB.
-
-    Idempotent — safe to call on every page load. This is the page-level
-    safety net for production Postgres deployments where init_db() ran
-    against an older schema (before these tables were added).
-
-    Returns True if the tables exist or were successfully created.
-    Returns False if creation failed — caller should show a warning.
-    """
-    from src.db import ensure_tables
-    return ensure_tables("reply_drafts", "reply_threads")
-
-
 _TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
+# ---------------------------------------------------------------------------
 # Status constants
+# ---------------------------------------------------------------------------
 STATUS_NEEDS_REVIEW = "needs_review"
-STATUS_APPROVED = "approved"  # set when operator approves, before send attempt
+STATUS_APPROVED = "approved"
 STATUS_SENT = "sent"
 STATUS_SKIPPED = "skipped"
 STATUS_FAILED = "failed"
 STATUS_NEEDS_HUMAN = "needs_human_review"
 STATUS_MANUAL_SEND = "manual_send_required"
+STATUS_MISSING_TEXT = "missing_reply_text"   # opportunity/replied lead, body unavailable
 
 _SEND_BLOCKED_CLASSIFICATIONS = frozenset({INTENT_UNSUBSCRIBE, INTENT_ANGRY})
 _SEND_BLOCKED_ACTIONS = frozenset({ACTION_STOP, ACTION_HUMAN})
 
 _PLACEHOLDER_PREFIX = "[Reply text not available"
 
+# Classifications that warrant a needs_review draft
+POSITIVE_CLASSIFICATIONS = frozenset({
+    "positive_interest",
+    "meeting_request",
+    "commercial_terms_shared",
+    "revshare_or_bounty_offer",
+    "pricing_question",
+})
+
 # ---------------------------------------------------------------------------
-# Opportunity filter — strictly more selective than the engagement analytics
-# _classify_positive_lead which includes status=2 (any generic reply).
-#
-# Instantly integer status codes:
-#   -1 = Bounced          0 = Not contacted      1 = Active/in-sequence
-#    2 = Replied (generic — OOO/negative/unsubscribe all land here)
-#    3 = Interested        4 = Opportunity        5 = Booked
-#    6 = Converted/Customer
-#
-# status=2 explains why a 968-send campaign with 0.5% reply rate would
-# produce 309 records: ~32% of leads opened/clicked and get status=2 in
-# some Instantly configurations, OR every lead that replied in any way
-# (including OOO, negative) lands at status=2.  We only want status >= 3.
+# Opportunity filter
 # ---------------------------------------------------------------------------
 _OPPORTUNITY_STATUS_INTS: frozenset[int] = frozenset({3, 4, 5, 6})
 
 _OPPORTUNITY_STATUS_STRS: frozenset[str] = frozenset({
     "interested", "meeting_booked", "opportunity", "customer",
     "booked", "converted", "won", "qualified", "hot",
-    # "positive" intentionally excluded — too generic in Instantly's taxonomy
-    # "replied"  intentionally excluded — status=2 maps to this
 })
 
-# Fields scanned for the opportunity signal in raw lead payloads.
 _OPPORTUNITY_SIGNAL_FIELDS_INT = (
     "status", "lead_status", "email_status", "interest_status",
     "reply_status", "campaign_status",
@@ -114,15 +101,9 @@ def _truthy(value: object) -> bool:
 def _is_opportunity_lead(raw: dict) -> str | None:
     """Return 'field=value' if this lead is a confirmed opportunity, else None.
 
-    Stricter than the engagement analytics ``_classify_positive_lead``:
-      - Integer status 2 (generic replied) is EXCLUDED.  All generic replies
-        land at status=2 in Instantly; only status >= 3 indicates actual
-        interest/opportunity.
-      - String statuses must be in the explicit opportunity set (no "positive").
-      - Boolean flags and category labels are still accepted.
-
-    This is the gate that aligns Reply Agent queue size with the KPI card
-    "Opportunities: N" (sourced from the campaign analytics endpoint).
+    status=2 (generic replied) is EXCLUDED — it includes OOO, unsubscribe,
+    and negative replies, causing the 309-record flood.
+    Only status >= 3 (Interested/Opportunity/Booked/Converted) passes.
     """
     for field in _OPPORTUNITY_SIGNAL_FIELDS_INT:
         val = raw.get(field)
@@ -144,6 +125,20 @@ def _is_opportunity_lead(raw: dict) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Schema safety
+# ---------------------------------------------------------------------------
+
+def ensure_reply_agent_schema() -> bool:
+    """Ensure reply_drafts and reply_threads tables exist. Idempotent."""
+    from src.db import ensure_tables
+    return ensure_tables("reply_drafts", "reply_threads")
+
+
+# ---------------------------------------------------------------------------
+# Auth / dedup helpers
+# ---------------------------------------------------------------------------
+
 def _auth_headers(api_key: str | None = None) -> dict[str, str]:
     key = api_key or settings.instantly_api_key or ""
     return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
@@ -153,7 +148,7 @@ def _make_dedup_key(
     message_id: str | None,
     instantly_lead_id: str | None,
     prospect_email: str,
-    reply_text: str,
+    reply_text: str = "",
 ) -> str:
     if message_id:
         return f"msg:{message_id}"
@@ -162,6 +157,10 @@ def _make_dedup_key(
     raw = f"{prospect_email.lower().strip()}:{reply_text[:200].strip()}"
     return f"hash:{hashlib.sha256(raw.encode()).hexdigest()[:32]}"
 
+
+# ---------------------------------------------------------------------------
+# Reply text fetch — multi-endpoint with full debug
+# ---------------------------------------------------------------------------
 
 @retry_api
 async def _fetch_emails_raw(
@@ -186,14 +185,7 @@ async def _fetch_emails_for_lead(
     campaign_id: str,
     api_key: str | None = None,
 ) -> tuple[list[dict], dict]:
-    """Try to fetch email thread records for a lead from Instantly.
-
-    Returns (email_records, debug_info).
-
-    debug_info keys:
-      endpoint, params, status, record_count, reply_count,
-      fields_found (first-record key names), error
-    """
+    """Try GET /api/v2/emails. Returns (email_records, debug)."""
     debug: dict[str, Any] = {
         "endpoint": f"{_API_BASE}/emails",
         "params": {"email": prospect_email, "campaign": campaign_id},
@@ -230,8 +222,147 @@ async def _fetch_emails_for_lead(
         return [], debug
 
 
+@retry_api
+async def _get_lead_detail_raw(
+    instantly_lead_id: str,
+    api_key: str | None = None,
+) -> dict:
+    """GET /api/v2/leads/{id} — full lead detail including any reply fields."""
+    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+        resp = await client.get(
+            f"{_API_BASE}/leads/{instantly_lead_id}",
+            headers=_auth_headers(api_key),
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _extract_reply_from_lead_data(lead_data: dict) -> str:
+    """Scan a lead's full API response for any inbound reply body text.
+
+    Checks multiple possible field names that Instantly may use across API versions.
+    Returns the first non-empty string found, or "" if nothing found.
+    Debug: all fields with "reply" in their name are logged by the caller.
+    """
+    # Common direct reply body fields
+    for field in (
+        "last_reply_body", "reply_body", "email_reply_body",
+        "latest_reply", "reply_text", "last_reply",
+        "inbound_reply", "reply_message", "last_message_body",
+        "latest_message", "reply_content",
+    ):
+        val = lead_data.get(field)
+        if val and isinstance(val, str) and val.strip():
+            return val.strip()
+
+    # Nested conversation / message arrays (check most recent item first)
+    for field in ("conversation", "messages", "email_history", "thread", "activities"):
+        items = lead_data.get(field)
+        if not isinstance(items, list) or not items:
+            continue
+        # Try inbound/reply-typed items first
+        for item in reversed(items):
+            if not isinstance(item, dict):
+                continue
+            itype = str(item.get("type") or item.get("direction") or item.get("kind") or "").lower()
+            if itype in ("reply", "inbound", "received", "incoming"):
+                text = _extract_email_text(item)
+                if text:
+                    return text
+        # Fallback: most recent item regardless of type
+        for item in reversed(items):
+            if not isinstance(item, dict):
+                continue
+            text = _extract_email_text(item)
+            if text:
+                return text
+
+    return ""
+
+
+async def _fetch_reply_text_for_lead(
+    instantly_lead_id: str | None,
+    prospect_email: str,
+    campaign_id: str,
+    api_key: str | None = None,
+) -> tuple[str, str, dict]:
+    """Try multiple endpoints to retrieve the inbound reply body for a lead.
+
+    Returns (reply_text, source_label, debug_info).
+
+    source_label values:
+      "emails_api"  — body found via GET /api/v2/emails
+      "lead_api"    — body found via GET /api/v2/leads/{id}
+      "unavailable" — neither endpoint returned reply body
+
+    debug_info includes:
+      - which endpoints were tried
+      - HTTP status for each
+      - all top-level fields returned (for diagnosis)
+      - any reply-related fields found
+    """
+    debug: dict[str, Any] = {
+        "emails_endpoint": None,
+        "lead_endpoint": None,
+        "source_used": "unavailable",
+        "reply_fields_on_lead": [],
+        "all_lead_fields": [],
+    }
+
+    # --- Strategy 1: GET /api/v2/emails ---
+    emails, email_debug = await _fetch_emails_for_lead(prospect_email, campaign_id, api_key)
+    debug["emails_endpoint"] = email_debug
+
+    if emails:
+        def _ts(e: dict) -> float:
+            t = _extract_email_timestamp(e)
+            return t.timestamp() if t else 0.0
+        emails.sort(key=_ts, reverse=True)
+        text = _extract_email_text(emails[0])
+        if text:
+            debug["source_used"] = "emails_api"
+            return text, "emails_api", debug
+
+    # --- Strategy 2: GET /api/v2/leads/{id} ---
+    if instantly_lead_id:
+        lead_debug: dict[str, Any] = {
+            "endpoint": f"{_API_BASE}/leads/{instantly_lead_id}",
+            "status": None,
+            "error": None,
+        }
+        try:
+            lead_data = await _get_lead_detail_raw(instantly_lead_id, api_key)
+            lead_debug["status"] = 200
+            lead_debug["all_fields"] = list(lead_data.keys())[:40]
+            debug["all_lead_fields"] = lead_debug["all_fields"]
+
+            # Surface all reply-related fields for debug visibility
+            reply_fields = {
+                k: (str(v)[:120] if v else None)
+                for k, v in lead_data.items()
+                if any(kw in k.lower() for kw in ("reply", "message", "conversation", "thread", "inbox"))
+            }
+            lead_debug["reply_fields_found"] = reply_fields
+            debug["reply_fields_on_lead"] = list(reply_fields.keys())
+
+            text = _extract_reply_from_lead_data(lead_data)
+            if text:
+                debug["source_used"] = "lead_api"
+                debug["lead_endpoint"] = lead_debug
+                return text, "lead_api", debug
+
+        except httpx.HTTPStatusError as exc:
+            lead_debug["status"] = exc.response.status_code
+            lead_debug["error"] = f"HTTP {exc.response.status_code}: {exc.response.text[:200]}"
+        except Exception as exc:
+            lead_debug["error"] = f"{type(exc).__name__}: {exc}"
+        debug["lead_endpoint"] = lead_debug
+
+    debug["source_used"] = "unavailable"
+    return "", "unavailable", debug
+
+
 def _filter_reply_emails(emails: list[dict]) -> list[dict]:
-    """Return inbound/reply-type emails. Falls back to all when type is absent."""
     typed, untyped = [], []
     for e in emails:
         etype = str(
@@ -241,7 +372,6 @@ def _filter_reply_emails(emails: list[dict]) -> list[dict]:
             typed.append(e)
         elif not etype:
             untyped.append(e)
-    # If any emails have an explicit type, return only those; otherwise all unknown.
     return typed if typed else untyped
 
 
@@ -279,17 +409,102 @@ def _extract_email_timestamp(email: dict) -> datetime | None:
     return None
 
 
-async def sync_reply_queue(workspace_id: int | None = None) -> dict:
-    """Sync positive/opportunity replies from Instantly and auto-draft responses.
+# ---------------------------------------------------------------------------
+# Classification → status mapping
+# ---------------------------------------------------------------------------
 
-    Steps:
-      1. Iterate all leads in the workspace campaign.
-      2. Keep only those with a positive status (opportunity/interested).
-      3. For each, try GET /api/v2/emails to fetch reply text.
-      4. Upsert a ReplyThread record (deduplicated).
-      5. Auto-generate a draft for new records with real reply text.
+def _classification_to_status(classification: str, action: str) -> str:
+    """Map reply classification to ReplyThread status.
+
+    Only positive/commercial/meeting classifications produce needs_review.
+    Everything else is skipped (non-actionable) or routed to human.
+    """
+    if classification == INTENT_UNSUBSCRIBE or action == ACTION_STOP:
+        return STATUS_SKIPPED
+    if classification == INTENT_ANGRY or action == ACTION_HUMAN:
+        return STATUS_NEEDS_HUMAN
+    if classification in ("out_of_office", "not_interested", "wrong_person", "referral"):
+        return STATUS_SKIPPED
+    if classification in POSITIVE_CLASSIFICATIONS:
+        return STATUS_NEEDS_REVIEW
+    # Uncertain / unexpected → human review is safer than needs_review
+    return STATUS_NEEDS_HUMAN
+
+
+# ---------------------------------------------------------------------------
+# Local replied leads (secondary source)
+# ---------------------------------------------------------------------------
+
+def _get_local_replied_leads(workspace_id: int | None) -> list[dict]:
+    """Return leads with replied=True in the local Engagement table.
+
+    These are candidates that replied but may not have been explicitly
+    categorized as opportunities in Instantly (status may be 2).
+    Each entry has: instantly_lead_id (delivery_id), email, first_name, last_name, company.
+    """
+    if workspace_id is None:
+        return []
+    results = []
+    with session_scope() as session:
+        rows = session.execute(
+            select(
+                GeneratedContent.delivery_id,
+                Lead.email,
+                Lead.first_name,
+                Lead.last_name,
+                Lead.company,
+            )
+            .join(Engagement, Engagement.content_id == GeneratedContent.id)
+            .join(Lead, Lead.id == GeneratedContent.lead_id)
+            .where(
+                Engagement.replied == True,  # noqa: E712
+                GeneratedContent.workspace_id == workspace_id,
+                GeneratedContent.delivery_id.is_not(None),
+            )
+            .distinct()
+        ).all()
+        for row in rows:
+            delivery_id, email, first_name, last_name, company = row
+            if not email:
+                continue
+            name = " ".join(filter(None, [first_name, last_name])).strip() or None
+            results.append({
+                "instantly_lead_id": str(delivery_id) if delivery_id else None,
+                "email": email,
+                "prospect_name": name,
+                "company": company,
+                "source": "local_replied",
+                "raw_lead": {},
+                "opp_signal": "local_engagement.replied=True",
+            })
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Main sync
+# ---------------------------------------------------------------------------
+
+async def sync_reply_queue(
+    workspace_id: int | None = None,
+    *,
+    auto_reply_positive: bool = False,  # future flag — always False for now
+) -> dict:
+    """Sync opportunity replies from Instantly, classify, and draft responses.
+
+    Two candidate sources:
+      1. Instantly campaign leads with _is_opportunity_lead (status >= 3).
+      2. Local Engagement records with replied=True (may overlap with #1).
+
+    For each candidate:
+      - Try to retrieve reply body via /api/v2/emails then /api/v2/leads/{id}.
+      - If no body found → status = missing_reply_text (NOT needs_review).
+      - If body found → classify via reply_agent.
+        - Positive/commercial/meeting → needs_review (draft created).
+        - Angry/sensitive → needs_human_review.
+        - OOO/unsubscribe/negative → skipped.
 
     Returns a summary dict. Never sends anything automatically.
+    auto_reply_positive is reserved for future use and has no effect when False.
     """
     from src.workspace import (
         get_api_key_for_workspace,
@@ -305,30 +520,21 @@ async def sync_reply_queue(workspace_id: int | None = None) -> dict:
     calendar_link = get_calendar_link_for_workspace(workspace_id) or ""
 
     if not campaign_id:
-        raise RuntimeError(
-            "No campaign ID configured for this workspace — cannot sync reply queue."
-        )
+        raise RuntimeError("No campaign ID configured for this workspace — cannot sync reply queue.")
     if not api_key:
-        raise RuntimeError(
-            "No Instantly API key configured — cannot sync reply queue."
-        )
+        raise RuntimeError("No Instantly API key configured — cannot sync reply queue.")
 
     _ws_id = workspace_id if workspace_id is not None else get_default_workspace_id()
 
+    # --- Phase 1: Instantly opportunity leads (status >= 3) ---
     total_leads_scanned = 0
-    opportunity_leads_found = 0
     ignored_not_opportunity = 0
-    new_count = 0
-    updated_count = 0
-    skipped_no_text = 0
-    error_count = 0
-    debug_emails: list[dict] = []
-    # Sample of raw signals seen on skipped leads (up to 20) for debug output.
+    candidates: dict[str, dict] = {}  # keyed by email (lowercase) for dedup
+
     debug_skipped_signals: list[dict] = []
 
     async for raw_lead in _iter_campaign_leads(campaign_id, api_key):
         total_leads_scanned += 1
-
         opp_signal = _is_opportunity_lead(raw_lead)
         if opp_signal is None:
             ignored_not_opportunity += 1
@@ -341,60 +547,52 @@ async def sync_reply_queue(workspace_id: int | None = None) -> dict:
                 })
             continue
 
-        opportunity_leads_found += 1
-        instantly_lead_id = str(raw_lead.get("id") or raw_lead.get("lead_id") or "").strip()
-        prospect_email = str(raw_lead.get("email") or "").strip()
-        if not prospect_email:
-            error_count += 1
+        email_key = str(raw_lead.get("email") or "").lower().strip()
+        if not email_key:
             continue
-
-        prospect_name = " ".join(
-            filter(None, [raw_lead.get("first_name"), raw_lead.get("last_name")])
-        ).strip() or None
+        instantly_id = str(raw_lead.get("id") or raw_lead.get("lead_id") or "").strip()
+        name = " ".join(filter(None, [raw_lead.get("first_name"), raw_lead.get("last_name")])).strip() or None
         company = str(raw_lead.get("company_name") or raw_lead.get("company") or "").strip() or None
+        candidates[email_key] = {
+            "instantly_lead_id": instantly_id or None,
+            "email": email_key,
+            "prospect_name": name,
+            "company": company,
+            "source": "instantly_opportunity",
+            "raw_lead": raw_lead,
+            "opp_signal": opp_signal,
+        }
 
-        # Fetch reply text from emails endpoint
-        reply_emails, email_debug = await _fetch_emails_for_lead(
-            prospect_email, campaign_id, api_key
-        )
-        email_debug["prospect_email"] = prospect_email
-        email_debug["opp_signal"] = opp_signal
-        debug_emails.append(email_debug)
+    # --- Phase 2: Local replied leads (supplement Instantly opportunities) ---
+    local_replied = _get_local_replied_leads(_ws_id)
+    local_added = 0
+    for lr in local_replied:
+        key = lr["email"].lower().strip()
+        if key not in candidates:
+            candidates[key] = lr
+            local_added += 1
 
-        # Pick most-recent reply email
-        reply_text = ""
-        msg_id: str | None = None
-        thread_id_remote: str | None = None
-        reply_ts: datetime | None = None
+    # --- Process each candidate ---
+    new_count = 0
+    updated_count = 0
+    missing_text_count = 0
+    needs_review_count = 0
+    needs_human_count = 0
+    skipped_count = 0
+    error_count = 0
+    debug_text_sources: list[dict] = []
 
-        if reply_emails:
-            def _ts_key(e: dict) -> float:
-                t = _extract_email_timestamp(e)
-                return t.timestamp() if t else 0.0
-            reply_emails.sort(key=_ts_key, reverse=True)
-            best = reply_emails[0]
-            reply_text = _extract_email_text(best)
-            msg_id = str(best.get("id") or best.get("message_id") or "").strip() or None
-            thread_id_remote = str(
-                best.get("thread_id") or best.get("conversation_id") or ""
-            ).strip() or None
-            reply_ts = _extract_email_timestamp(best)
+    for email_key, cand in candidates.items():
+        instantly_id = cand.get("instantly_lead_id")
+        prospect_email = cand["email"]
+        prospect_name = cand.get("prospect_name")
+        company = cand.get("company")
+        raw_lead = cand.get("raw_lead") or {}
+        opp_signal = cand.get("opp_signal", "unknown")
 
-        has_real_text = bool(reply_text.strip())
-        if not has_real_text:
-            reply_text = (
-                f"[Reply text not available from Instantly API — "
-                f"opportunity signal: {opp_signal}. "
-                f"Check Instantly dashboard for the actual reply, "
-                f"then use the Manual Draft Tester below.]"
-            )
-            skipped_no_text += 1
+        # Dedup check
+        dedup_key = _make_dedup_key(None, instantly_id, prospect_email)
 
-        dedup_key = _make_dedup_key(
-            msg_id, instantly_lead_id or None, prospect_email, reply_text
-        )
-
-        # Check for existing record
         with session_scope() as session:
             existing = session.execute(
                 select(ReplyThread).where(
@@ -405,33 +603,38 @@ async def sync_reply_queue(workspace_id: int | None = None) -> dict:
             ).scalar_one_or_none()
 
             if existing is not None:
-                # Refresh raw payload; upgrade placeholder to real text if now available
-                if has_real_text and existing.inbound_reply_text.startswith(_PLACEHOLDER_PREFIX):
-                    existing.inbound_reply_text = reply_text
-                    existing.reply_received_at = reply_ts
-                    existing.message_id = msg_id
-                    existing.thread_id = thread_id_remote
-                existing.raw_payload = raw_lead
+                existing.raw_payload = raw_lead or existing.raw_payload
                 updated_count += 1
-                continue  # don't fall through to create
+                continue
 
-        # Create new record
+        # Fetch reply body
+        reply_text, text_source, text_debug = await _fetch_reply_text_for_lead(
+            instantly_id, prospect_email, campaign_id, api_key
+        )
+        text_debug["prospect_email"] = prospect_email
+        text_debug["opp_signal"] = opp_signal
+        text_debug["source"] = cand.get("source")
+        debug_text_sources.append(text_debug)
+
+        has_real_text = bool(reply_text.strip())
+
+        # Create the record
         new_row_id: int | None = None
         try:
             with session_scope() as session:
                 th = ReplyThread(
                     workspace_id=_ws_id,
                     campaign_id=campaign_id,
-                    instantly_lead_id=instantly_lead_id or None,
+                    instantly_lead_id=instantly_id or None,
                     prospect_email=prospect_email,
                     prospect_name=prospect_name,
                     company_name=company,
-                    thread_id=thread_id_remote,
-                    message_id=msg_id,
-                    inbound_reply_text=reply_text,
-                    reply_received_at=reply_ts,
-                    status=STATUS_NEEDS_REVIEW,
-                    raw_payload=raw_lead,
+                    inbound_reply_text=(
+                        reply_text if has_real_text
+                        else f"[Reply text not available — {opp_signal}. Check Instantly dashboard.]"
+                    ),
+                    status=(STATUS_MISSING_TEXT if not has_real_text else STATUS_NEEDS_REVIEW),
+                    raw_payload=raw_lead or None,
                     dedup_key=dedup_key,
                 )
                 session.add(th)
@@ -441,49 +644,54 @@ async def sync_reply_queue(workspace_id: int | None = None) -> dict:
             updated_count += 1
             continue
         except Exception as exc:
-            log.warning(
-                "reply_thread_create_failed",
-                extra={"email": prospect_email, "error": str(exc)},
-            )
+            log.warning("reply_thread_create_failed", extra={"email": prospect_email, "error": str(exc)})
             error_count += 1
             continue
 
-        # Auto-draft
-        if has_real_text and new_row_id is not None:
-            try:
-                agent_result = await classify_and_draft_reply(
-                    inbound_reply=reply_text,
-                    calendar_link=calendar_link,
-                    workspace_id=_ws_id,
-                )
-                auto_status = STATUS_NEEDS_REVIEW
-                if agent_result.classification == INTENT_UNSUBSCRIBE:
-                    auto_status = STATUS_NEEDS_HUMAN
-                elif agent_result.recommended_action in (ACTION_STOP, ACTION_HUMAN):
-                    auto_status = STATUS_NEEDS_HUMAN
-
-                with session_scope() as session:
-                    row = session.get(ReplyThread, new_row_id)
-                    if row:
-                        row.classification = agent_result.classification
-                        row.recommended_action = agent_result.recommended_action
-                        row.draft_body = agent_result.draft_body
-                        row.human_review_notes = agent_result.human_review_notes
-                        row.status = auto_status
-            except Exception as exc:
-                log.warning(
-                    "reply_auto_draft_failed",
-                    extra={"thread_id": new_row_id, "error": str(exc)},
-                )
-        elif not has_real_text and new_row_id is not None:
+        if not has_real_text:
+            missing_text_count += 1
             with session_scope() as session:
                 row = session.get(ReplyThread, new_row_id)
                 if row:
-                    row.status = STATUS_NEEDS_HUMAN
                     row.human_review_notes = (
-                        "No reply text retrieved from Instantly API. "
-                        "Check the Instantly dashboard and paste the reply into the Manual Draft Tester."
+                        f"Reply body not available from Instantly API "
+                        f"(tried /api/v2/emails and /api/v2/leads/{{id}}). "
+                        f"Opportunity signal: {opp_signal}. "
+                        f"Check Instantly dashboard for the actual reply, "
+                        f"then use the Manual Draft Tester."
                     )
+            new_count += 1
+            continue
+
+        # Classify reply
+        try:
+            agent_result = await classify_and_draft_reply(
+                inbound_reply=reply_text,
+                calendar_link=calendar_link,
+                workspace_id=_ws_id,
+            )
+            auto_status = _classification_to_status(
+                agent_result.classification, agent_result.recommended_action
+            )
+
+            with session_scope() as session:
+                row = session.get(ReplyThread, new_row_id)
+                if row:
+                    row.classification = agent_result.classification
+                    row.recommended_action = agent_result.recommended_action
+                    row.draft_body = agent_result.draft_body
+                    row.human_review_notes = agent_result.human_review_notes
+                    row.status = auto_status
+
+            if auto_status == STATUS_NEEDS_REVIEW:
+                needs_review_count += 1
+            elif auto_status == STATUS_NEEDS_HUMAN:
+                needs_human_count += 1
+            else:
+                skipped_count += 1
+
+        except Exception as exc:
+            log.warning("reply_auto_draft_failed", extra={"thread_id": new_row_id, "error": str(exc)})
 
         new_count += 1
 
@@ -492,25 +700,96 @@ async def sync_reply_queue(workspace_id: int | None = None) -> dict:
         extra={
             "workspace_id": _ws_id,
             "total_scanned": total_leads_scanned,
-            "opportunity_leads": opportunity_leads_found,
+            "opportunity_leads": len(candidates) - local_added,
+            "local_added": local_added,
             "ignored_not_opportunity": ignored_not_opportunity,
             "new": new_count,
             "updated": updated_count,
-            "errors": error_count,
+            "needs_review": needs_review_count,
+            "missing_text": missing_text_count,
         },
     )
     return {
         "total_leads_scanned": total_leads_scanned,
-        "opportunity_leads_found": opportunity_leads_found,
+        "opportunity_leads_found": len(candidates) - local_added,
+        "local_replied_added": local_added,
         "ignored_not_opportunity": ignored_not_opportunity,
-        "synced": opportunity_leads_found,   # kept for backward compat with UI
+        "synced": len(candidates),
         "new": new_count,
         "updated": updated_count,
-        "skipped_no_text": skipped_no_text,
+        "needs_review": needs_review_count,
+        "needs_human": needs_human_count,
+        "missing_text": missing_text_count,
+        "skipped": skipped_count,
         "errors": error_count,
         "api_key_source": api_key_source,
-        "debug_emails_endpoint": debug_emails,
+        "debug_text_sources": debug_text_sources,
         "debug_skipped_signals": debug_skipped_signals,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cleanup
+# ---------------------------------------------------------------------------
+
+def archive_placeholder_threads(
+    workspace_id: int | None = None,
+    *,
+    dry_run: bool = False,
+) -> dict:
+    """Archive ReplyThread records where reply body was a placeholder.
+
+    Archives records where:
+      - inbound_reply_text starts with '[Reply text not available'
+      - OR status is already missing_reply_text
+
+    Sent records are always preserved.
+
+    Returns {archived, preserved_real, sent_preserved, dry_run}.
+    """
+    from src.workspace import get_default_workspace_id
+    _ws_id = workspace_id if workspace_id is not None else get_default_workspace_id()
+
+    archived = 0
+    preserved_real = 0
+    sent_preserved = 0
+
+    with session_scope() as session:
+        rows = session.execute(
+            select(ReplyThread).where(ReplyThread.workspace_id == _ws_id)
+        ).scalars().all()
+
+        for row in rows:
+            if row.status == STATUS_SENT:
+                sent_preserved += 1
+                continue
+            is_placeholder = (
+                (row.inbound_reply_text or "").startswith(_PLACEHOLDER_PREFIX)
+                or row.status == STATUS_MISSING_TEXT
+            )
+            if is_placeholder:
+                archived += 1
+                if not dry_run:
+                    row.status = STATUS_SKIPPED
+                    note = "Archived: placeholder — reply body was not available when this record was created."
+                    row.human_review_notes = (note + " " + (row.human_review_notes or "")).strip()
+            else:
+                preserved_real += 1
+
+    log.info(
+        "placeholder_cleanup_complete",
+        extra={
+            "workspace_id": _ws_id,
+            "archived": archived,
+            "preserved": preserved_real,
+            "dry_run": dry_run,
+        },
+    )
+    return {
+        "archived": archived,
+        "preserved_real": preserved_real,
+        "sent_preserved": sent_preserved,
+        "dry_run": dry_run,
     }
 
 
@@ -521,25 +800,8 @@ def archive_non_opportunity_threads(
 ) -> dict:
     """Archive ReplyThread records that lack a confirmed opportunity signal.
 
-    Used to clean up records incorrectly imported when the sync used the
-    broad _classify_positive_lead (status >= 2) filter instead of the
-    strict _is_opportunity_lead (status >= 3) filter.
-
-    A record is archived (status → 'skipped') if:
-      - Its raw_payload has NO opportunity signal (_is_opportunity_lead returns None)
-      - AND its status is NOT 'sent' (already acted on — always preserved)
-
-    Records whose raw_payload PASSES _is_opportunity_lead are preserved unchanged.
-    Records with no raw_payload at all are skipped (cannot verify — left unchanged).
-
-    dry_run=True: reports counts without writing anything.
-
-    Returns:
-      archived: int  — records updated to status='skipped'
-      preserved: int — records kept because they have a true opportunity signal
-      no_payload: int — records unchanged because raw_payload was absent
-      sent_preserved: int — records kept because they were already sent
-      dry_run: bool
+    Checks raw_payload against _is_opportunity_lead. Records with status=sent
+    are always preserved.
     """
     from src.workspace import get_default_workspace_id
     _ws_id = workspace_id if workspace_id is not None else get_default_workspace_id()
@@ -555,15 +817,12 @@ def archive_non_opportunity_threads(
         ).scalars().all()
 
         for row in rows:
-            # Always preserve sent records
             if row.status == STATUS_SENT:
                 sent_preserved += 1
                 continue
-
             if not row.raw_payload:
                 no_payload += 1
                 continue
-
             signal = _is_opportunity_lead(row.raw_payload)
             if signal is not None:
                 preserved += 1
@@ -571,21 +830,9 @@ def archive_non_opportunity_threads(
                 archived += 1
                 if not dry_run:
                     row.status = STATUS_SKIPPED
-                    existing_notes = row.human_review_notes or ""
                     note = "Archived: not_actual_opportunity — imported when sync filter was too broad."
-                    row.human_review_notes = (note + " " + existing_notes).strip()
+                    row.human_review_notes = (note + " " + (row.human_review_notes or "")).strip()
 
-    log.info(
-        "non_opportunity_cleanup_complete",
-        extra={
-            "workspace_id": _ws_id,
-            "archived": archived,
-            "preserved": preserved,
-            "no_payload": no_payload,
-            "sent_preserved": sent_preserved,
-            "dry_run": dry_run,
-        },
-    )
     return {
         "archived": archived,
         "preserved": preserved,
@@ -595,15 +842,27 @@ def archive_non_opportunity_threads(
     }
 
 
-def get_reply_queue(workspace_id: int | None = None) -> list[dict]:
-    """Return all ReplyThreads for the workspace, newest first."""
+# ---------------------------------------------------------------------------
+# Queue read
+# ---------------------------------------------------------------------------
+
+def get_reply_queue(
+    workspace_id: int | None = None,
+    *,
+    status_filter: list[str] | None = None,
+) -> list[dict]:
+    """Return ReplyThreads for the workspace, newest first.
+
+    status_filter: if provided, only return records with matching status.
+    """
     from src.workspace import get_default_workspace_id
     _ws_id = workspace_id if workspace_id is not None else get_default_workspace_id()
     with session_scope() as session:
+        q = select(ReplyThread).where(ReplyThread.workspace_id == _ws_id)
+        if status_filter:
+            q = q.where(ReplyThread.status.in_(status_filter))
         rows = session.execute(
-            select(ReplyThread)
-            .where(ReplyThread.workspace_id == _ws_id)
-            .order_by(
+            q.order_by(
                 ReplyThread.reply_received_at.desc().nullslast(),
                 ReplyThread.created_at.desc(),
             )
@@ -639,7 +898,6 @@ def _thread_to_dict(row: ReplyThread) -> dict:
 
 
 def get_send_blocked_reason(thread: dict) -> str | None:
-    """Return a human-readable reason this thread can't be sent, or None if OK."""
     cls = thread.get("classification") or ""
     action = thread.get("recommended_action") or ""
     if cls in _SEND_BLOCKED_CLASSIFICATIONS:
@@ -653,25 +911,20 @@ def get_send_blocked_reason(thread: dict) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Send
+# ---------------------------------------------------------------------------
+
 async def try_send_reply(
     thread_id: int,
     *,
     workspace_id: int | None = None,
     draft_override: str | None = None,
 ) -> dict:
-    """Attempt to send an approved reply via Instantly's /emails/reply endpoint.
+    """Attempt to send an approved reply via Instantly /emails/reply.
 
-    Returns:
-      {"status": "sent" | "failed" | "manual_send_required", "detail": str, "debug": dict}
-
-    If the Instantly reply endpoint returns 404/405/422, status = manual_send_required
-    and no row is marked sent. The caller should show the copy-paste prompt to the operator.
-
-    Hard guards before any HTTP call:
-      - classification must not be unsubscribe or angry_or_complaint
-      - recommended_action must not be route_to_human or stop_sequence
-      - draft_body must be non-empty
-      - campaign_id and api_key must be available
+    Returns {status, detail, debug}.
+    404/405/422 → manual_send_required. Never marks as sent on failure.
     """
     from src.workspace import get_api_key_for_workspace, get_campaign_id_for_workspace
 
@@ -681,14 +934,9 @@ async def try_send_reply(
             return {"status": "failed", "detail": f"Thread {thread_id} not found.", "debug": None}
         thread = _thread_to_dict(row)
 
-    # Workspace isolation
     _ws_id = workspace_id if workspace_id is not None else thread["workspace_id"]
     if thread["workspace_id"] is not None and _ws_id != thread["workspace_id"]:
-        return {
-            "status": "failed",
-            "detail": "Workspace mismatch — cannot send from a different workspace.",
-            "debug": None,
-        }
+        return {"status": "failed", "detail": "Workspace mismatch.", "debug": None}
 
     blocked = get_send_blocked_reason(thread)
     if blocked:
@@ -698,21 +946,13 @@ async def try_send_reply(
     campaign_id = get_campaign_id_for_workspace(_ws_id) or thread["campaign_id"]
 
     if not api_key:
-        return {
-            "status": "failed",
-            "detail": "No Instantly API key configured for this workspace.",
-            "debug": None,
-        }
+        return {"status": "failed", "detail": "No Instantly API key configured.", "debug": None}
 
     draft_body = (draft_override or thread["draft_body"]).strip()
     if not draft_body:
-        return {"status": "failed", "detail": "Draft body is empty — nothing to send.", "debug": None}
+        return {"status": "failed", "detail": "Draft body is empty.", "debug": None}
 
-    payload: dict = {
-        "campaign": campaign_id,
-        "email": thread["prospect_email"],
-        "body": draft_body,
-    }
+    payload: dict = {"campaign": campaign_id, "email": thread["prospect_email"], "body": draft_body}
     if thread.get("message_id"):
         payload["reply_to_email_id"] = thread["message_id"]
     if thread.get("thread_id"):
@@ -746,15 +986,13 @@ async def try_send_reply(
             return {
                 "status": STATUS_MANUAL_SEND,
                 "detail": (
-                    f"Instantly threaded reply send is not available with the current API path "
-                    f"(HTTP {resp.status_code}). Copy this draft and reply manually "
-                    "through Instantly or your email client."
+                    f"Instantly threaded reply send is not available (HTTP {resp.status_code}). "
+                    "Copy this draft and reply manually through Instantly or your email client."
                 ),
                 "debug": debug,
             }
 
         resp.raise_for_status()
-
         _mark_thread(thread_id, STATUS_SENT, sent_at=datetime.utcnow(), send_error=None)
         return {"status": STATUS_SENT, "detail": "Reply sent successfully via Instantly.", "debug": debug}
 
@@ -797,7 +1035,6 @@ def update_reply_thread(
     recommended_action: str | None = None,
     human_review_notes: str | None = None,
 ) -> bool:
-    """Update mutable fields on a ReplyThread. Returns True if found."""
     with session_scope() as session:
         row = session.get(ReplyThread, thread_id)
         if row is None:

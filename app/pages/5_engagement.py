@@ -58,13 +58,16 @@ from src.feedback.reply_agent import (
     save_reply_draft,
 )
 from src.feedback.reply_sync import (
+    POSITIVE_CLASSIFICATIONS,
     STATUS_APPROVED,
     STATUS_MANUAL_SEND,
+    STATUS_MISSING_TEXT,
     STATUS_NEEDS_HUMAN,
     STATUS_NEEDS_REVIEW,
     STATUS_SENT,
     STATUS_SKIPPED,
     archive_non_opportunity_threads,
+    archive_placeholder_threads,
     ensure_reply_agent_schema,
     get_reply_queue,
     get_send_blocked_reason,
@@ -575,303 +578,304 @@ with _tab_queue:
                 _rq_sync_result = None
 
         if _rq_sync_result is not None:
-            _rq_total   = _rq_sync_result.get("total_leads_scanned", 0)
-            _rq_opp     = _rq_sync_result.get("opportunity_leads_found", 0)
-            _rq_ignored = _rq_sync_result.get("ignored_not_opportunity", 0)
-            _rq_new     = _rq_sync_result.get("new", 0)
-            _rq_upd     = _rq_sync_result.get("updated", 0)
-            _rq_skip    = _rq_sync_result.get("skipped_no_text", 0)
+            _rq_total    = _rq_sync_result.get("total_leads_scanned", 0)
+            _rq_opp      = _rq_sync_result.get("opportunity_leads_found", 0)
+            _rq_local    = _rq_sync_result.get("local_replied_added", 0)
+            _rq_ignored  = _rq_sync_result.get("ignored_not_opportunity", 0)
+            _rq_new      = _rq_sync_result.get("new", 0)
+            _rq_upd      = _rq_sync_result.get("updated", 0)
+            _rq_nr       = _rq_sync_result.get("needs_review", 0)
+            _rq_nh       = _rq_sync_result.get("needs_human", 0)
+            _rq_miss     = _rq_sync_result.get("missing_text", 0)
+            _rq_skip_new = _rq_sync_result.get("skipped", 0)
 
             st.success(
                 f"Sync complete — "
-                f"**{_rq_opp} opportunity reply lead(s)** found from {_rq_total} total. "
-                f"{_rq_new} new draft(s) · {_rq_upd} refreshed. "
-                f"API key: {_rq_sync_result.get('api_key_source', '?')}."
+                f"**{_rq_opp} Instantly opportunity lead(s)** + {_rq_local} local replied. "
+                f"{_rq_ignored} generic-replied leads ignored (status=2, not opportunities). "
+                f"{_rq_new} new · {_rq_upd} refreshed."
             )
-            if _rq_ignored:
-                st.info(
-                    f"{_rq_ignored} lead(s) had a generic reply signal (e.g. status=2) "
-                    "but were **not** confirmed opportunities — they were ignored. "
-                    "This is expected behavior and aligns the queue with the KPI Opportunities card."
+            if _rq_nr:
+                st.success(f"**{_rq_nr} positive reply draft(s) ready for review.**")
+            if _rq_miss:
+                st.warning(
+                    f"{_rq_miss} opportunity/replied lead(s) had **no reply body** available "
+                    "from Instantly API (tried /emails and /leads/{id}). "
+                    "These appear in the **Missing reply text** tab — check the Instantly "
+                    "dashboard for actual reply content."
                 )
-            if _rq_skip:
-                st.info(
-                    f"{_rq_skip} opportunity lead(s) had no reply text available from the Instantly "
-                    "emails endpoint — marked needs_human_review. Check Instantly dashboard for "
-                    "actual reply content."
-                )
+            if _rq_skip_new:
+                st.info(f"{_rq_skip_new} reply(ies) classified as OOO/unsubscribe/negative — skipped.")
+            if _rq_nh:
+                st.warning(f"{_rq_nh} reply(ies) routed to **Needs human review** (angry/sensitive).")
 
-            # Debug expanders
-            _rq_debug_emails = _rq_sync_result.get("debug_emails_endpoint") or []
-            _rq_debug_skipped = _rq_sync_result.get("debug_skipped_signals") or []
-            if _rq_debug_emails or _rq_debug_skipped:
-                with st.expander(
-                    f"Sync debug — "
-                    f"{_rq_total} scanned · {_rq_opp} opportunity · "
-                    f"{_rq_ignored} ignored · {_rq_new} imported"
-                ):
-                    st.markdown(f"**Opportunity filter:** `status in {{3,4,5,6}}` or explicit interest/opportunity flags")
-                    st.markdown(
-                        f"**Note:** `status=2` (generic replied — includes OOO/negative/unsubscribe) "
-                        "is intentionally excluded."
-                    )
-                    if _rq_debug_emails:
-                        st.markdown(f"**Emails endpoint probed for {len(_rq_debug_emails)} opportunity lead(s):**")
-                        for _d in _rq_debug_emails:
-                            st.json({k: v for k, v in _d.items() if k != "params"})
-                    if _rq_debug_skipped:
-                        st.markdown(f"**Sample of {len(_rq_debug_skipped)} skipped leads (no opportunity signal):**")
-                        st.dataframe(pd.DataFrame(_rq_debug_skipped), hide_index=True)
+            _rq_debug_src = _rq_sync_result.get("debug_text_sources") or []
+            _rq_debug_skip = _rq_sync_result.get("debug_skipped_signals") or []
+            with st.expander(
+                f"Sync debug — {_rq_total} scanned · {_rq_opp + _rq_local} candidates "
+                f"· {_rq_nr} positive drafts · {_rq_miss} missing text · {_rq_ignored} ignored"
+            ):
+                st.markdown("**Opportunity filter:** `status ∈ {3,4,5,6}` or explicit interest/opportunity flags. `status=2` excluded.")
+                if _rq_debug_src:
+                    st.markdown(f"**Reply body fetch — {len(_rq_debug_src)} candidate(s) probed:**")
+                    for _ds in _rq_debug_src[:10]:
+                        st.json({k: v for k, v in _ds.items()})
+                if _rq_debug_skip:
+                    st.markdown(f"**Sample skipped leads (no opportunity signal, {len(_rq_debug_skip)} shown):**")
+                    st.dataframe(pd.DataFrame(_rq_debug_skip), hide_index=True)
             st.rerun()
 
-    # ── Summary KPIs ────────────────────────────────────────────────────
+    # ── Summary KPIs + Cleanup ───────────────────────────────────────────
     try:
         _rq_threads = get_reply_queue(workspace_id=_ws_id)
     except Exception as _rq_load_exc:
         _rq_err_str = str(_rq_load_exc)
         if "undefined" in _rq_err_str.lower() or "does not exist" in _rq_err_str.lower():
             st.warning(
-                "Reply Agent tables are initializing — the `reply_threads` table "
-                "was not yet created in this database. "
-                "Reboot or refresh the app in a few seconds to continue."
+                "Reply Agent tables are initializing. "
+                "Reboot or refresh the page in a few seconds to continue."
             )
         else:
             st.error(f"Could not load reply queue: {_rq_load_exc}")
         _rq_threads = []
 
-    if _rq_threads:
-        from collections import Counter as _Counter
-        _rq_status_counts = _Counter(t["status"] for t in _rq_threads)
-        _k1, _k2, _k3, _k4 = st.columns(4)
-        with _k1:
-            kpi_card("Needs review", str(_rq_status_counts.get(STATUS_NEEDS_REVIEW, 0) + _rq_status_counts.get(STATUS_NEEDS_HUMAN, 0)))
-        with _k2:
-            kpi_card("Ready drafts", str(_rq_status_counts.get(STATUS_NEEDS_REVIEW, 0)))
-        with _k3:
-            kpi_card("Sent", str(_rq_status_counts.get(STATUS_SENT, 0)))
-        with _k4:
-            kpi_card(
-                "Manual / Failed",
-                str(_rq_status_counts.get(STATUS_MANUAL_SEND, 0) + _rq_status_counts.get("failed", 0)),
-            )
-
-    # ── Cleanup button (for bad imports from previous broad filter) ──────
-    _rq_active_count = sum(
+    from collections import Counter as _Counter
+    _rq_status_counts = _Counter(t["status"] for t in _rq_threads)
+    _rq_placeholder_count = sum(
         1 for t in _rq_threads
-        if t.get("status") not in (STATUS_SKIPPED, STATUS_SENT, "archived")
+        if (t.get("inbound_reply_text") or "").startswith("[Reply text not available")
+        or t.get("status") == STATUS_MISSING_TEXT
     )
-    if len(_rq_threads) > 5 and _rq_active_count > 5:
-        with st.expander("Clean non-opportunity drafts (use after upgrading from old sync)"):
+
+    _k1, _k2, _k3, _k4, _k5 = st.columns(5)
+    with _k1:
+        kpi_card("Positive drafts", str(_rq_status_counts.get(STATUS_NEEDS_REVIEW, 0)))
+    with _k2:
+        kpi_card("Needs human", str(_rq_status_counts.get(STATUS_NEEDS_HUMAN, 0)))
+    with _k3:
+        kpi_card("Missing reply text", str(_rq_status_counts.get(STATUS_MISSING_TEXT, 0)))
+    with _k4:
+        kpi_card("Sent", str(_rq_status_counts.get(STATUS_SENT, 0)))
+    with _k5:
+        kpi_card(
+            "Manual / Failed",
+            str(_rq_status_counts.get(STATUS_MANUAL_SEND, 0) + _rq_status_counts.get("failed", 0)),
+        )
+
+    # Cleanup buttons
+    _rq_has_placeholders = _rq_placeholder_count > 0
+    _rq_has_non_opp = any(
+        t.get("status") not in (STATUS_SENT, STATUS_SKIPPED, "archived")
+        and not (t.get("raw_payload") or {}).get("status", 0) >= 3
+        for t in _rq_threads
+    )
+    if _rq_has_placeholders or len(_rq_threads) > 10:
+        with st.expander("Clean up bad import records"):
             st.caption(
-                "If a previous sync imported too many records (e.g. 309 instead of 2), "
-                "click below to archive records that have no confirmed opportunity signal "
-                "in their stored Instantly payload. Sent records are always preserved."
+                "Use these buttons to clean up records imported by earlier (over-broad) sync runs."
             )
-            _rq_dry_col, _rq_clean_col = st.columns(2)
-            with _rq_dry_col:
-                if st.button("Preview cleanup (dry run)", key="rq_cleanup_dry"):
-                    _preview = archive_non_opportunity_threads(_ws_id, dry_run=True)
+            _cc1, _cc2, _cc3 = st.columns(3)
+            with _cc1:
+                if st.button("Preview cleanup (dry run)", key="rq_preview_cleanup"):
+                    _p1 = archive_placeholder_threads(_ws_id, dry_run=True)
+                    _p2 = archive_non_opportunity_threads(_ws_id, dry_run=True)
                     st.info(
-                        f"Dry run — would archive {_preview['archived']} record(s), "
-                        f"preserve {_preview['preserved']} (true opportunities), "
-                        f"skip {_preview['no_payload']} (no payload to check), "
-                        f"keep {_preview['sent_preserved']} sent."
+                        f"**Placeholder records** (no reply body): {_p1['archived']} would be archived.\n\n"
+                        f"**Non-opportunity records** (status=2 payload): {_p2['archived']} would be archived.\n\n"
+                        f"Real opportunity records preserved: {_p2['preserved']}."
                     )
-            with _rq_clean_col:
+            with _cc2:
                 if st.button(
-                    "Archive non-opportunity records",
-                    key="rq_cleanup_run",
+                    "Clean placeholder records",
+                    key="rq_clean_placeholders",
                     type="secondary",
-                    help="Sets status=skipped for records without an opportunity signal in their Instantly payload.",
+                    help="Archives records where no reply body was available when imported.",
                 ):
-                    _cleanup = archive_non_opportunity_threads(_ws_id, dry_run=False)
-                    st.success(
-                        f"Cleanup done — archived {_cleanup['archived']}, "
-                        f"preserved {_cleanup['preserved']} real opportunity records."
-                    )
+                    _cr = archive_placeholder_threads(_ws_id, dry_run=False)
+                    st.success(f"Archived {_cr['archived']} placeholder records.")
+                    st.cache_data.clear()
+                    st.rerun()
+            with _cc3:
+                if st.button(
+                    "Clean non-opportunity records",
+                    key="rq_clean_nonopp",
+                    type="secondary",
+                    help="Archives records whose Instantly payload has no opportunity signal (status=2 etc).",
+                ):
+                    _cr2 = archive_non_opportunity_threads(_ws_id, dry_run=False)
+                    st.success(f"Archived {_cr2['archived']} non-opportunity records.")
                     st.cache_data.clear()
                     st.rerun()
 
-    # ── Reply list table ─────────────────────────────────────────────────
-    _rq_display_threads = [
-        t for t in _rq_threads
-        if t.get("status") != STATUS_SKIPPED or t.get("status") == STATUS_SENT
-    ]
-    if not _rq_display_threads:
-        st.info(
-            "No opportunity replies in the queue yet for this workspace. "
-            "Click **Sync opportunity replies from Instantly** above."
-        )
-        if len(_rq_threads) != len(_rq_display_threads):
-            st.caption(
-                f"{len(_rq_threads) - len(_rq_display_threads)} skipped/archived record(s) hidden. "
-            )
-    else:
-        st.caption(
-            f"Showing opportunity replies only · {len(_rq_display_threads)} record(s)"
-        )
-        _rq_rows = []
-        for _t in _rq_display_threads:
+    # ── Reply list — tabbed by bucket ────────────────────────────────────
+    _rq_positive   = [t for t in _rq_threads if t.get("status") == STATUS_NEEDS_REVIEW]
+    _rq_human      = [t for t in _rq_threads if t.get("status") == STATUS_NEEDS_HUMAN]
+    _rq_missing    = [t for t in _rq_threads if t.get("status") == STATUS_MISSING_TEXT]
+    _rq_sent_list  = [t for t in _rq_threads if t.get("status") == STATUS_SENT]
+
+    _bt_pos = f"Positive drafts ({len(_rq_positive)})"
+    _bt_hum = f"Needs human ({len(_rq_human)})"
+    _bt_mis = f"Missing reply text ({len(_rq_missing)})"
+    _bt_snt = f"Sent ({len(_rq_sent_list)})"
+    _rq_bucket_tab, _rq_human_tab, _rq_miss_tab, _rq_sent_tab = st.tabs([_bt_pos, _bt_hum, _bt_mis, _bt_snt])
+
+    def _render_reply_detail(thread: dict, key_prefix: str) -> None:
+        """Render the detail panel for a selected reply thread."""
+        tid = thread["id"]
+        with st.container(border=True):
+            _h1, _h2, _h3 = st.columns(3)
+            with _h1:
+                st.markdown(f"**Prospect:** {thread.get('prospect_name') or '—'} `{thread.get('prospect_email')}`")
+            with _h2:
+                st.markdown(f"**Company:** {thread.get('company_name') or '—'}")
+            with _h3:
+                st.markdown(f"**Status:** {_RA_STATUS_ICONS.get(thread['status'], thread['status'])}")
+
+            is_placeholder = (thread.get("inbound_reply_text") or "").startswith("[Reply text not available")
+            if is_placeholder:
+                st.warning(
+                    "Instantly reports this lead as replied/opportunity, but the reply body "
+                    "was not available from the current API endpoint. "
+                    "Use the **Manual Draft Tester** tab to paste the reply and generate a draft."
+                )
+            else:
+                st.markdown("**Inbound reply:**")
+                st.text_area(
+                    "Inbound reply", value=thread["inbound_reply_text"],
+                    height=100, disabled=True,
+                    key=f"{key_prefix}_inbound_{tid}", label_visibility="collapsed",
+                )
+
+            if thread.get("original_outbound_email"):
+                with st.expander("Original outbound email"):
+                    st.text(thread["original_outbound_email"])
+
+            if thread.get("human_review_notes"):
+                st.warning(f"**Review notes:** {thread['human_review_notes']}")
+
+            _il, _ir = st.columns(2)
+            with _il:
+                st.caption(f"Intent: `{thread.get('classification') or '—'}`")
+            with _ir:
+                st.caption(f"Recommended: {_RA_ACTION_LABELS.get(thread.get('recommended_action') or '', thread.get('recommended_action') or '—')}")
+
+            if not is_placeholder:
+                st.markdown("**Reply draft** — edit before approving:")
+                draft_key = f"{key_prefix}_draft_{tid}"
+                edited_draft = st.text_area(
+                    "Draft",
+                    value=st.session_state.get(draft_key, thread["draft_body"]),
+                    height=150, key=draft_key, label_visibility="collapsed",
+                    help="Edit the draft before approving.",
+                )
+
+                send_blocked = get_send_blocked_reason(thread)
+                is_terminal = thread["status"] in (STATUS_SENT, STATUS_SKIPPED)
+
+                _ba, _bb, _bc = st.columns(3)
+                with _ba:
+                    approve = st.button(
+                        "Approve and send", type="primary",
+                        key=f"{key_prefix}_approve_{tid}",
+                        disabled=bool(send_blocked or is_terminal),
+                        help=send_blocked or ("Already terminal." if is_terminal else None),
+                    )
+                with _bb:
+                    skip_btn = st.button("Skip", type="secondary", key=f"{key_prefix}_skip_{tid}", disabled=is_terminal)
+                with _bc:
+                    regen_btn = st.button("Regenerate draft", type="secondary", key=f"{key_prefix}_regen_{tid}", disabled=is_terminal)
+
+                if approve and not send_blocked:
+                    with st.spinner("Sending via Instantly…"):
+                        sr = run_async(try_send_reply(int(tid), workspace_id=_ws_id, draft_override=edited_draft or None))
+                    if sr["status"] == STATUS_SENT:
+                        st.success("Reply sent.")
+                    elif sr["status"] == STATUS_MANUAL_SEND:
+                        st.warning(sr["detail"])
+                        if sr.get("debug"):
+                            with st.expander("Send debug"):
+                                st.json(sr["debug"])
+                    else:
+                        st.error(f"Send failed: {sr['detail']}")
+                    st.cache_data.clear()
+                    st.rerun()
+
+                if skip_btn:
+                    update_reply_thread(int(tid), status=STATUS_SKIPPED)
+                    st.cache_data.clear()
+                    st.rerun()
+
+                if regen_btn:
+                    with st.spinner("Regenerating draft…"):
+                        try:
+                            rr = run_async(classify_and_draft_reply(
+                                inbound_reply=thread["inbound_reply_text"],
+                                original_outbound_email=thread.get("original_outbound_email") or "",
+                                calendar_link=_ws_calendar_link,
+                                workspace_id=_ws_id,
+                            ))
+                            update_reply_thread(
+                                int(tid),
+                                classification=rr.classification,
+                                recommended_action=rr.recommended_action,
+                                draft_body=rr.draft_body,
+                                human_review_notes=rr.human_review_notes,
+                            )
+                            st.session_state.pop(draft_key, None)
+                            st.cache_data.clear()
+                            st.rerun()
+                        except Exception as _re:
+                            st.error(f"Regenerate failed: {_re}")
+
+    def _render_bucket_tab(bucket_threads: list[dict], tbl_key: str) -> None:
+        if not bucket_threads:
+            st.info("Nothing here yet.")
+            return
+        st.caption(f"{len(bucket_threads)} record(s) · opportunity replies only")
+        rows = []
+        for _t in bucket_threads:
             _recv = _t.get("reply_received_at")
-            _recv_str = _recv.strftime("%Y-%m-%d %H:%M") if _recv else "—"
-            _snippet = (_t.get("inbound_reply_text") or "")[:60].replace("\n", " ").strip()
-            _rq_rows.append({
+            rows.append({
                 "id": _t["id"],
                 "Prospect": _t.get("prospect_name") or _t.get("prospect_email") or "—",
                 "Company": _t.get("company_name") or "—",
-                "Received": _recv_str,
+                "Received": _recv.strftime("%Y-%m-%d %H:%M") if _recv else "—",
                 "Classification": _t.get("classification") or "—",
-                "Action": _RA_ACTION_LABELS.get(_t.get("recommended_action") or "", _t.get("recommended_action") or "—"),
                 "Status": _RA_STATUS_ICONS.get(_t.get("status") or "", _t.get("status") or "—"),
-                "Snippet": _snippet + ("…" if len(_t.get("inbound_reply_text", "")) > 60 else ""),
+                "Snippet": (_t.get("inbound_reply_text") or "")[:60].replace("\n", " ").strip() + "…",
             })
-        _rq_df = pd.DataFrame.from_records(
-            _rq_rows,
-            columns=["id", "Prospect", "Company", "Received", "Classification", "Action", "Status", "Snippet"],
-        )
-        _rq_selection = st.dataframe(
-            _rq_df,
-            hide_index=True,
-            use_container_width=True,
-            selection_mode="single-row",
-            on_select="rerun",
-            key="rq_table",
-        )
-        _rq_selected_rows = (
-            _rq_selection.selection.rows if _rq_selection and _rq_selection.selection else []
-        )
-
-        if not _rq_selected_rows:
-            st.caption("Select a row above to review and act on the reply.")
+        df = pd.DataFrame.from_records(rows, columns=["id", "Prospect", "Company", "Received", "Classification", "Status", "Snippet"])
+        sel = st.dataframe(df, hide_index=True, use_container_width=True, selection_mode="single-row", on_select="rerun", key=tbl_key)
+        sel_rows = sel.selection.rows if sel and sel.selection else []
+        if not sel_rows:
+            st.caption("Select a row to review.")
         else:
-            _rq_row_idx = _rq_selected_rows[0]
-            _rq_thread_id = _rq_df.iloc[_rq_row_idx]["id"]
-            _rq_thread = next((t for t in _rq_display_threads if t["id"] == _rq_thread_id), None)
+            chosen = next((t for t in bucket_threads if t["id"] == df.iloc[sel_rows[0]]["id"]), None)
+            if chosen:
+                _render_reply_detail(chosen, tbl_key)
 
-            if _rq_thread:
-                with st.container(border=True):
-                    _rq_h1, _rq_h2, _rq_h3 = st.columns(3)
-                    with _rq_h1:
-                        st.markdown(f"**Prospect:** {_rq_thread.get('prospect_name') or '—'} `{_rq_thread.get('prospect_email')}`")
-                    with _rq_h2:
-                        st.markdown(f"**Company:** {_rq_thread.get('company_name') or '—'}")
-                    with _rq_h3:
-                        _rq_status_label = _RA_STATUS_ICONS.get(_rq_thread["status"], _rq_thread["status"])
-                        st.markdown(f"**Status:** {_rq_status_label}")
-
-                    st.markdown("**Inbound reply:**")
-                    st.text_area(
-                        "Inbound reply",
-                        value=_rq_thread["inbound_reply_text"],
-                        height=100,
-                        disabled=True,
-                        key=f"rq_inbound_{_rq_thread_id}",
-                        label_visibility="collapsed",
-                    )
-
-                    if _rq_thread.get("original_outbound_email"):
-                        with st.expander("Original outbound email"):
-                            st.text(_rq_thread["original_outbound_email"])
-
-                    if _rq_thread.get("human_review_notes"):
-                        st.warning(f"**Review notes:** {_rq_thread['human_review_notes']}")
-
-                    _rq_action_label = _RA_ACTION_LABELS.get(
-                        _rq_thread.get("recommended_action") or "", _rq_thread.get("recommended_action") or "—"
-                    )
-                    _rq_info_left, _rq_info_right = st.columns(2)
-                    with _rq_info_left:
-                        st.caption(f"Intent: `{_rq_thread.get('classification') or '—'}`")
-                    with _rq_info_right:
-                        st.caption(f"Recommended: {_rq_action_label}")
-
-                    st.markdown("**Reply draft** — edit before approving:")
-                    _rq_draft_key = f"rq_draft_edit_{_rq_thread_id}"
-                    _rq_edited_draft = st.text_area(
-                        "Draft",
-                        value=st.session_state.get(_rq_draft_key, _rq_thread["draft_body"]),
-                        height=150,
-                        key=_rq_draft_key,
-                        label_visibility="collapsed",
-                        help="Edit the draft before approving. This does not save automatically.",
-                    )
-
-                    # Action buttons
-                    _rq_send_blocked = get_send_blocked_reason(_rq_thread)
-                    _rq_is_terminal = _rq_thread["status"] in (STATUS_SENT, STATUS_SKIPPED)
-
-                    _btn_a, _btn_b, _btn_c = st.columns(3)
-                    with _btn_a:
-                        _rq_approve_clicked = st.button(
-                            "Approve and send",
-                            type="primary",
-                            key=f"rq_approve_{_rq_thread_id}",
-                            disabled=bool(_rq_send_blocked or _rq_is_terminal),
-                            help=_rq_send_blocked or ("Already in terminal state." if _rq_is_terminal else None),
-                        )
-                    with _btn_b:
-                        _rq_skip_clicked = st.button(
-                            "Skip",
-                            type="secondary",
-                            key=f"rq_skip_{_rq_thread_id}",
-                            disabled=_rq_is_terminal,
-                        )
-                    with _btn_c:
-                        _rq_regen_clicked = st.button(
-                            "Regenerate draft",
-                            type="secondary",
-                            key=f"rq_regen_{_rq_thread_id}",
-                            disabled=_rq_is_terminal,
-                        )
-
-                    if _rq_approve_clicked and not _rq_send_blocked:
-                        with st.spinner("Sending reply via Instantly…"):
-                            _rq_send_result = run_async(try_send_reply(
-                                int(_rq_thread_id),
-                                workspace_id=_ws_id,
-                                draft_override=_rq_edited_draft or None,
-                            ))
-                        if _rq_send_result["status"] == STATUS_SENT:
-                            st.success("Reply sent successfully.")
-                            st.cache_data.clear()
-                            st.rerun()
-                        elif _rq_send_result["status"] == STATUS_MANUAL_SEND:
-                            st.warning(_rq_send_result["detail"])
-                            if _rq_send_result.get("debug"):
-                                with st.expander("Send debug"):
-                                    st.json(_rq_send_result["debug"])
-                            st.cache_data.clear()
-                            st.rerun()
-                        else:
-                            st.error(f"Send failed: {_rq_send_result['detail']}")
-
-                    if _rq_skip_clicked:
-                        update_reply_thread(int(_rq_thread_id), status=STATUS_SKIPPED)
-                        st.cache_data.clear()
-                        st.rerun()
-
-                    if _rq_regen_clicked:
-                        with st.spinner("Regenerating draft…"):
-                            try:
-                                _rq_regen_result = run_async(classify_and_draft_reply(
-                                    inbound_reply=_rq_thread["inbound_reply_text"],
-                                    original_outbound_email=_rq_thread.get("original_outbound_email") or "",
-                                    calendar_link=_ws_calendar_link,
-                                    workspace_id=_ws_id,
-                                ))
-                                update_reply_thread(
-                                    int(_rq_thread_id),
-                                    classification=_rq_regen_result.classification,
-                                    recommended_action=_rq_regen_result.recommended_action,
-                                    draft_body=_rq_regen_result.draft_body,
-                                    human_review_notes=_rq_regen_result.human_review_notes,
-                                )
-                                # Clear the edited draft key so it shows the new draft
-                                st.session_state.pop(_rq_draft_key, None)
-                                st.cache_data.clear()
-                                st.rerun()
-                            except Exception as _rq_regen_exc:
-                                st.error(f"Regenerate failed: {_rq_regen_exc}")
+    with _rq_bucket_tab:
+        _render_bucket_tab(_rq_positive, "rq_pos")
+    with _rq_human_tab:
+        _render_bucket_tab(_rq_human, "rq_hum")
+    with _rq_miss_tab:
+        if not _rq_missing:
+            st.info("No missing-text records. Good.")
+        else:
+            st.info(
+                f"{len(_rq_missing)} lead(s) were identified as replied/opportunity but "
+                "the reply body could not be retrieved from Instantly's API. "
+                "To generate a draft for these: find the actual reply in the Instantly dashboard, "
+                "copy it, and paste it into the **Manual Draft Tester** tab."
+            )
+            for _mt in _rq_missing:
+                st.caption(
+                    f"**{_mt.get('prospect_name') or _mt.get('prospect_email')}** "
+                    f"· {_mt.get('company_name') or '—'} "
+                    f"· Opportunity signal: {(_mt.get('dedup_key') or '?').replace('lead:', '')}"
+                )
+    with _rq_sent_tab:
+        _render_bucket_tab(_rq_sent_list, "rq_snt")
 
 # ── Tab 2: Manual Draft Tester ────────────────────────────────────────────
 with _tab_manual:

@@ -12,9 +12,14 @@ from sqlalchemy import select
 import src.feedback.reply_sync as reply_sync_mod
 from src.db import session_scope
 from src.feedback.reply_sync import (
+    POSITIVE_CLASSIFICATIONS,
+    STATUS_MISSING_TEXT,
+    STATUS_NEEDS_HUMAN,
+    STATUS_NEEDS_REVIEW,
     STATUS_SKIPPED,
     _is_opportunity_lead,
     archive_non_opportunity_threads,
+    archive_placeholder_threads,
 )
 from src.feedback.reply_agent import (
     ACTION_BOOK_MEETING,
@@ -149,9 +154,14 @@ def _patch_sync(
 def _run_sync_with_overrides(
     ws_id, campaign_id, api_key, osp_id,
     monkeypatch, leads, emails, draft,
+    reply_text: str = "I'm interested in learning more.",
 ):
-    """Helper: calls the REAL sync_reply_queue but with workspace resolvers patched."""
-    # Undo the lambda override so the real function runs
+    """Helper: calls the REAL sync_reply_queue but with all external calls patched.
+
+    `reply_text`: the text returned by the mock reply-text fetch. Defaults to a
+    positive reply body so drafts are created by default. Pass "" to simulate
+    missing reply text (→ STATUS_MISSING_TEXT).
+    """
     monkeypatch.setattr(reply_sync_mod, "sync_reply_queue", sync_reply_queue)
 
     from src import workspace as ws_mod
@@ -162,11 +172,16 @@ def _run_sync_with_overrides(
     monkeypatch.setattr(ws_mod, "get_default_workspace_id", lambda: osp_id)
 
     monkeypatch.setattr(reply_sync_mod, "_iter_campaign_leads", _fake_positive_iter(*leads))
+    # Patch _get_local_replied_leads to return nothing (avoid DB query in tests)
+    monkeypatch.setattr(reply_sync_mod, "_get_local_replied_leads", lambda ws_id: [])
 
-    async def fake_fetch(email, camp, key=None):
-        return emails
+    # Patch the multi-endpoint reply text fetch
+    async def fake_fetch_reply_text(instantly_id, email, camp, key=None):
+        if reply_text:
+            return reply_text, "test", {"source_used": "test"}
+        return "", "unavailable", {"source_used": "unavailable"}
 
-    monkeypatch.setattr(reply_sync_mod, "_fetch_emails_for_lead", fake_fetch)
+    monkeypatch.setattr(reply_sync_mod, "_fetch_reply_text_for_lead", fake_fetch_reply_text)
 
     async def fake_classify(**kwargs):
         return draft
@@ -1008,3 +1023,261 @@ def test_is_opportunity_lead_accepts_bool_flag():
 
 def test_is_opportunity_lead_accepts_opportunity_category():
     assert _is_opportunity_lead({"categories": ["opportunity"]}) is not None
+
+
+# ===========================================================================
+# No-placeholder + classification gate tests
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 1. Placeholder "reply text not available" does NOT create needs_review
+# ---------------------------------------------------------------------------
+
+def test_placeholder_text_creates_missing_text_not_needs_review(monkeypatch):
+    osp_id = _seed_osp()
+    # Pass reply_text="" so the mock returns no reply body
+    _run_sync_with_overrides(
+        osp_id, "camp-1", "key-1", osp_id,
+        monkeypatch,
+        [_make_positive_lead()],
+        _no_emails(),
+        _fake_draft(),
+        reply_text="",  # simulates no reply body available
+    )
+    with session_scope() as session:
+        threads = session.execute(select(ReplyThread)).scalars().all()
+        assert len(threads) == 1
+        t = threads[0]
+        assert t.status == STATUS_MISSING_TEXT, (
+            f"Expected {STATUS_MISSING_TEXT}, got {t.status}. "
+            "Records with no reply body must not be needs_review."
+        )
+
+
+# ---------------------------------------------------------------------------
+# 2. Placeholder records appear in missing_reply_text bucket
+# ---------------------------------------------------------------------------
+
+def test_placeholder_records_in_missing_text_bucket(monkeypatch):
+    osp_id = _seed_osp()
+    _run_sync_with_overrides(
+        osp_id, "camp-1", "key-1", osp_id,
+        monkeypatch, [_make_positive_lead()], _no_emails(), _fake_draft(),
+        reply_text="",
+    )
+    from src.feedback.reply_sync import get_reply_queue, STATUS_MISSING_TEXT as _MT
+    all_threads = get_reply_queue(workspace_id=osp_id)
+    missing = [t for t in all_threads if t["status"] == _MT]
+    review = [t for t in all_threads if t["status"] == STATUS_NEEDS_REVIEW]
+    assert len(missing) == 1
+    assert len(review) == 0, "Missing-text records must not appear in needs_review bucket"
+
+
+# ---------------------------------------------------------------------------
+# 3. status=replied alone does NOT create a positive draft
+# ---------------------------------------------------------------------------
+
+def test_generic_replied_status_alone_does_not_create_positive_draft(monkeypatch):
+    osp_id = _seed_osp()
+    # status=2 is excluded by _is_opportunity_lead → no record created at all
+    _run_sync_with_overrides(
+        osp_id, "camp-1", "key-1", osp_id,
+        monkeypatch,
+        [_make_generic_replied_lead("gen@example.com", "il-gen2")],
+        _fake_emails(), _fake_draft(),
+    )
+    with session_scope() as session:
+        count = len(session.execute(select(ReplyThread)).scalars().all())
+    assert count == 0, "status=2 must not produce any record"
+
+
+# ---------------------------------------------------------------------------
+# 4. Replied lead WITH positive body creates positive draft
+# ---------------------------------------------------------------------------
+
+def test_replied_lead_with_positive_body_creates_positive_draft(monkeypatch):
+    osp_id = _seed_osp()
+    _run_sync_with_overrides(
+        osp_id, "camp-1", "key-1", osp_id,
+        monkeypatch,
+        [_make_positive_lead(email="pos@example.com", lead_id="il-pos-body")],
+        _fake_emails(reply_text="I'd really like to know more about your offering."),
+        _fake_draft(classification=INTENT_POSITIVE_INTEREST, action=ACTION_BOOK_MEETING,
+                    draft="Let's set up a call.", notes=""),
+        reply_text="I'd really like to know more about your offering.",
+    )
+    with session_scope() as session:
+        t = session.execute(select(ReplyThread)).scalars().first()
+        assert t is not None
+        assert t.status == STATUS_NEEDS_REVIEW
+        assert t.draft_body.strip() != ""
+
+
+# ---------------------------------------------------------------------------
+# 5. Bounty/revshare body → book_meeting draft, does NOT accept terms
+# ---------------------------------------------------------------------------
+
+def test_revshare_body_creates_book_meeting_draft_no_terms(monkeypatch):
+    osp_id = _seed_osp()
+    BOUNTY_REPLY = "I'm happy to pay you 25% bounty on every one that buys."
+    _run_sync_with_overrides(
+        osp_id, "camp-1", "key-1", osp_id,
+        monkeypatch,
+        [_make_positive_lead(email="bounty@example.com", lead_id="il-bounty")],
+        _fake_emails(reply_text=BOUNTY_REPLY),
+        _fake_draft(
+            classification=INTENT_REVSHARE,
+            action=ACTION_BOOK_MEETING,
+            draft="Can we set up a time to discuss? We don't normally do revshare.",
+            notes="Commercial terms discussed — do not accept in writing without approval.",
+        ),
+        reply_text=BOUNTY_REPLY,
+    )
+    with session_scope() as session:
+        t = session.execute(select(ReplyThread)).scalars().first()
+        assert t is not None
+        assert t.status == STATUS_NEEDS_REVIEW
+        assert "that works" not in t.draft_body.lower()
+        assert "accept the" not in t.draft_body.lower()
+        assert "do not accept" in t.human_review_notes.lower() or "commercial terms" in t.human_review_notes.lower()
+
+
+# ---------------------------------------------------------------------------
+# 6. Unsubscribe body → status = skipped
+# ---------------------------------------------------------------------------
+
+def test_unsubscribe_body_is_skipped(monkeypatch):
+    osp_id = _seed_osp()
+    _run_sync_with_overrides(
+        osp_id, "camp-1", "key-1", osp_id,
+        monkeypatch,
+        [_make_positive_lead(email="unsub2@example.com", lead_id="il-unsub2")],
+        _fake_emails(reply_text="Please unsubscribe me from your list."),
+        _fake_draft(classification=INTENT_UNSUBSCRIBE, action=ACTION_STOP,
+                    draft="Got it — removed.", notes="Opt-out."),
+        reply_text="Please unsubscribe me from your list.",
+    )
+    with session_scope() as session:
+        t = session.execute(select(ReplyThread)).scalars().first()
+        assert t is not None
+        assert t.status == STATUS_SKIPPED, f"Expected skipped, got {t.status}"
+
+
+# ---------------------------------------------------------------------------
+# 7. Angry complaint body → status = needs_human_review
+# ---------------------------------------------------------------------------
+
+def test_angry_body_routes_to_human_review(monkeypatch):
+    osp_id = _seed_osp()
+    _run_sync_with_overrides(
+        osp_id, "camp-1", "key-1", osp_id,
+        monkeypatch,
+        [_make_positive_lead(email="angry2@example.com", lead_id="il-angry2")],
+        _fake_emails(reply_text="Stop spamming me or I will report you!"),
+        _fake_draft(classification=INTENT_ANGRY, action=ACTION_HUMAN,
+                    draft="(Routed to human.)", notes="Angry reply."),
+        reply_text="Stop spamming me or I will report you!",
+    )
+    with session_scope() as session:
+        t = session.execute(select(ReplyThread)).scalars().first()
+        assert t is not None
+        assert t.status == STATUS_NEEDS_HUMAN
+
+
+# ---------------------------------------------------------------------------
+# 8. Cleanup removes placeholder records from main queue
+# ---------------------------------------------------------------------------
+
+def test_cleanup_removes_placeholder_records():
+    osp_id = _seed_osp()
+    # Create placeholder record directly
+    with session_scope() as session:
+        row = ReplyThread(
+            workspace_id=osp_id,
+            campaign_id="camp-1",
+            prospect_email="pholder@example.com",
+            inbound_reply_text="[Reply text not available — status=3. Check dashboard.]",
+            status=STATUS_MISSING_TEXT,
+            dedup_key="lead:il-pholder",
+        )
+        session.add(row)
+        session.flush()
+        ph_id = row.id
+
+    result = archive_placeholder_threads(osp_id, dry_run=False)
+    assert result["archived"] >= 1
+
+    with session_scope() as session:
+        row = session.get(ReplyThread, ph_id)
+        assert row.status == STATUS_SKIPPED
+
+    # Should no longer appear in positive drafts or missing text buckets
+    from src.feedback.reply_sync import get_reply_queue
+    active = [t for t in get_reply_queue(osp_id) if t["status"] not in (STATUS_SKIPPED, "archived")]
+    assert not any(t["id"] == ph_id for t in active)
+
+
+# ---------------------------------------------------------------------------
+# 9. Queue counts separate positive drafts from missing reply text
+# ---------------------------------------------------------------------------
+
+def test_queue_counts_separate_positive_from_missing(monkeypatch):
+    osp_id = _seed_osp()
+
+    # Lead 1: positive reply body → needs_review
+    lead1 = _make_positive_lead(email="lead1@example.com", lead_id="il-l1")
+    # Lead 2: no reply body → missing_reply_text
+    lead2 = _make_positive_lead(email="lead2@example.com", lead_id="il-l2")
+
+    from src import workspace as ws_mod
+    monkeypatch.setattr(ws_mod, "get_campaign_id_for_workspace", lambda wid=None: "camp-1")
+    monkeypatch.setattr(ws_mod, "get_api_key_for_workspace", lambda wid=None: "key-1")
+    monkeypatch.setattr(ws_mod, "get_api_key_source", lambda wid=None: "test")
+    monkeypatch.setattr(ws_mod, "get_calendar_link_for_workspace", lambda wid=None: "")
+    monkeypatch.setattr(ws_mod, "get_default_workspace_id", lambda: osp_id)
+    monkeypatch.setattr(reply_sync_mod, "_iter_campaign_leads", _fake_positive_iter(lead1, lead2))
+    monkeypatch.setattr(reply_sync_mod, "_get_local_replied_leads", lambda ws_id: [])
+
+    call_count = {"n": 0}
+
+    async def variable_fetch(instantly_id, email, camp, key=None):
+        call_count["n"] += 1
+        if email == "lead1@example.com":
+            return "I'd love to learn more.", "test", {}
+        return "", "unavailable", {}
+
+    monkeypatch.setattr(reply_sync_mod, "_fetch_reply_text_for_lead", variable_fetch)
+
+    async def fake_classify(**kwargs):
+        return _fake_draft(INTENT_POSITIVE_INTEREST, ACTION_BOOK_MEETING)
+
+    monkeypatch.setattr(reply_sync_mod, "classify_and_draft_reply", fake_classify)
+
+    asyncio.run(sync_reply_queue(osp_id))
+
+    all_threads = get_reply_queue(workspace_id=osp_id)
+    positive = [t for t in all_threads if t["status"] == STATUS_NEEDS_REVIEW]
+    missing = [t for t in all_threads if t["status"] == STATUS_MISSING_TEXT]
+
+    assert len(positive) == 1, f"Expected 1 positive draft, got {len(positive)}"
+    assert len(missing) == 1, f"Expected 1 missing-text record, got {len(missing)}"
+
+
+# ---------------------------------------------------------------------------
+# 10. Workspace scoping still applies
+# ---------------------------------------------------------------------------
+
+def test_queue_workspace_scoped_with_new_logic(monkeypatch):
+    osp_id = _seed_osp()
+    other_ws = create_workspace(name="WS10", slug="ws-10", instantly_campaign_id="camp-ws10")
+    other_id = other_ws["id"]
+
+    _run_sync_with_overrides(
+        osp_id, "camp-osp", "key-osp", osp_id,
+        monkeypatch,
+        [_make_positive_lead(email="ws10@example.com", lead_id="il-ws10")],
+        _fake_emails(), _fake_draft(),
+    )
+
+    assert len(get_reply_queue(workspace_id=other_id)) == 0
+    assert len(get_reply_queue(workspace_id=osp_id)) == 1
