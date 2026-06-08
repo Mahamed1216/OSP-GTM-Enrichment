@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     # Instantly
     instantly_api_key: str = ""
     instantly_campaign_id: str = ""
+    instantly_webhook_secret: str = ""
 
     # Email verification
     email_verifier: Literal["instantly", "neverbounce", "millionverifier"] = "instantly"

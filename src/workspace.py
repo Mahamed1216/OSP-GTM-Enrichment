@@ -319,6 +319,34 @@ def get_workspace_by_id(workspace_id: int) -> dict[str, Any] | None:
         return _row_to_dict(row)
 
 
+def get_workspace_by_slug(slug: str) -> dict[str, Any] | None:
+    """Return a workspace dict by slug (case-insensitive), or None if not found."""
+    ensure_workspace_schema()
+    slug_clean = slug.strip().lower()
+    with session_scope() as session:
+        row = session.execute(
+            select(Workspace).where(Workspace.slug == slug_clean).limit(1)
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        return _row_to_dict(row)
+
+
+def get_workspace_by_campaign_id(campaign_id: str) -> dict[str, Any] | None:
+    """Return the first workspace whose instantly_campaign_id matches, or None."""
+    ensure_workspace_schema()
+    cid = campaign_id.strip()
+    with session_scope() as session:
+        row = session.execute(
+            select(Workspace)
+            .where(Workspace.instantly_campaign_id == cid)
+            .limit(1)
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        return _row_to_dict(row)
+
+
 def get_active_workspaces() -> list[dict[str, Any]]:
     """Return all active workspaces ordered by id ascending."""
     ensure_workspace_schema()
