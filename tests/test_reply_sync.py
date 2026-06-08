@@ -1547,3 +1547,346 @@ def test_sync_returns_reconciliation_debug_data(monkeypatch):
     # Counts must be numeric (or None)
     assert isinstance(result["active_queue_count"], int)
     assert isinstance(result["stale_archived"], int)
+
+
+# ===========================================================================
+# New Phase 7 fix tests
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 1. opportunity_count=2 but 0 leads from API → opportunity_gap_detected=True
+# ---------------------------------------------------------------------------
+
+def test_opportunity_count_2_zero_leads_shows_diagnostic(monkeypatch):
+    """When analytics says 2 opportunities but API returns no leads with status ≥ 3,
+    sync must set opportunity_gap_detected=True instead of silently returning 0."""
+    osp_id = _seed_osp()
+
+    from src import workspace as ws_mod
+    monkeypatch.setattr(ws_mod, "get_campaign_id_for_workspace", lambda wid=None: "camp-gap")
+    monkeypatch.setattr(ws_mod, "get_api_key_for_workspace", lambda wid=None: "key-gap")
+    monkeypatch.setattr(ws_mod, "get_api_key_source", lambda wid=None: "test")
+    monkeypatch.setattr(ws_mod, "get_calendar_link_for_workspace", lambda wid=None: "")
+    monkeypatch.setattr(ws_mod, "get_default_workspace_id", lambda: osp_id)
+
+    # Instantly returns no leads at all
+    monkeypatch.setattr(reply_sync_mod, "_iter_campaign_leads", _fake_positive_iter())
+    monkeypatch.setattr(reply_sync_mod, "_get_local_replied_leads", lambda ws_id: [])
+
+    async def fake_fetch_reply(instantly_id, email, camp, key=None):
+        return "", "unavailable", {}
+
+    monkeypatch.setattr(reply_sync_mod, "_fetch_reply_text_for_lead", fake_fetch_reply)
+
+    async def fake_classify(**kwargs):
+        return _fake_draft()
+
+    monkeypatch.setattr(reply_sync_mod, "classify_and_draft_reply", fake_classify)
+
+    # Inject analytics snapshot with opportunity_count=2
+    from src.models import InstantlyAnalyticsSnapshot
+    with session_scope() as session:
+        snap = InstantlyAnalyticsSnapshot(
+            workspace_id=osp_id,
+            campaign_id="camp-gap",
+            reply_count=10,
+            opportunity_count=2,
+            raw={},
+        )
+        session.add(snap)
+
+    result = asyncio.run(sync_reply_queue(osp_id))
+
+    assert result["opportunity_gap_detected"] is True, (
+        "opportunity_gap_detected must be True when Instantly reports opportunities "
+        "but API returns no leads with status ≥ 3"
+    )
+    assert result["opportunity_leads_found"] == 0
+    assert result.get("instantly_opportunity_count") == 2
+
+
+# ---------------------------------------------------------------------------
+# 2. Opportunity lead found but reply body missing → missing_reply_text record
+# ---------------------------------------------------------------------------
+
+def test_opportunity_lead_no_body_creates_missing_text_record(monkeypatch):
+    """An opportunity lead (status=3) with no reply body gets a missing_reply_text record,
+    not needs_review and not needs_human."""
+    osp_id = _seed_osp()
+
+    result = _run_sync_with_overrides(
+        osp_id, "camp-mb", "key-mb", osp_id,
+        monkeypatch,
+        [_make_positive_lead(email="nobdy@example.com", lead_id="il-nobdy")],
+        _no_emails(),
+        _fake_draft(),
+        reply_text="",
+    )
+
+    with session_scope() as session:
+        threads = session.execute(select(ReplyThread)).scalars().all()
+        assert len(threads) == 1
+        t = threads[0]
+        assert t.status == STATUS_MISSING_TEXT, f"Expected missing_reply_text, got {t.status}"
+        assert t.status != STATUS_NEEDS_HUMAN
+        assert t.status != STATUS_NEEDS_REVIEW
+
+
+# ---------------------------------------------------------------------------
+# 3. missing_reply_text records are NOT counted in needs_human bucket
+# ---------------------------------------------------------------------------
+
+def test_missing_text_records_not_counted_as_needs_human():
+    """Records with status=missing_reply_text must not appear in the needs_human bucket."""
+    osp_id = _seed_osp()
+    with session_scope() as session:
+        row = ReplyThread(
+            workspace_id=osp_id,
+            campaign_id="camp-1",
+            prospect_email="missingtxt@example.com",
+            inbound_reply_text="[Reply text not available — status=3. Check Instantly dashboard.]",
+            status=STATUS_MISSING_TEXT,
+            dedup_key="lead:il-missingtxt",
+        )
+        session.add(row)
+
+    all_threads = get_reply_queue(workspace_id=osp_id)
+    needs_human = [t for t in all_threads if t["status"] == STATUS_NEEDS_HUMAN]
+    missing_text = [t for t in all_threads if t["status"] == STATUS_MISSING_TEXT]
+
+    assert len(needs_human) == 0, "missing_reply_text records must not count as needs_human"
+    assert len(missing_text) == 1
+
+
+# ---------------------------------------------------------------------------
+# 4. Local replied leads used as candidates but NOT treated as positive
+# ---------------------------------------------------------------------------
+
+def test_local_replied_leads_are_candidates_not_auto_positive(monkeypatch):
+    """Local replied leads (Engagement.replied=True) are used as candidates
+    but must not produce positive drafts without an actual reply body."""
+    osp_id = _seed_osp()
+
+    from src import workspace as ws_mod
+    monkeypatch.setattr(ws_mod, "get_campaign_id_for_workspace", lambda wid=None: "camp-local")
+    monkeypatch.setattr(ws_mod, "get_api_key_for_workspace", lambda wid=None: "key-local")
+    monkeypatch.setattr(ws_mod, "get_api_key_source", lambda wid=None: "test")
+    monkeypatch.setattr(ws_mod, "get_calendar_link_for_workspace", lambda wid=None: "")
+    monkeypatch.setattr(ws_mod, "get_default_workspace_id", lambda: osp_id)
+
+    # No Instantly leads; local replied leads supplied via mock
+    monkeypatch.setattr(reply_sync_mod, "_iter_campaign_leads", _fake_positive_iter())
+    monkeypatch.setattr(reply_sync_mod, "_get_local_replied_leads", lambda ws_id: [
+        {
+            "instantly_lead_id": "il-local-1",
+            "email": "localreply@example.com",
+            "prospect_name": "Local Reply",
+            "company": "Local Co",
+            "lead_db_id": 99,
+            "source": "local_replied",
+            "raw_lead": {},
+            "opp_signal": "local_engagement.replied=True",
+        }
+    ])
+
+    async def fake_fetch_reply(instantly_id, email, camp, key=None):
+        return "", "unavailable", {}  # no reply body
+
+    monkeypatch.setattr(reply_sync_mod, "_fetch_reply_text_for_lead", fake_fetch_reply)
+
+    async def fake_classify(**kwargs):
+        return _fake_draft(INTENT_POSITIVE_INTEREST, ACTION_BOOK_MEETING)
+
+    monkeypatch.setattr(reply_sync_mod, "classify_and_draft_reply", fake_classify)
+
+    asyncio.run(sync_reply_queue(osp_id))
+
+    all_threads = get_reply_queue(workspace_id=osp_id)
+    positive = [t for t in all_threads if t["status"] == STATUS_NEEDS_REVIEW]
+    missing = [t for t in all_threads if t["status"] == STATUS_MISSING_TEXT]
+
+    assert len(positive) == 0, "Local replied leads without reply body must not be positive drafts"
+    assert len(missing) == 1, "Local replied lead without reply body must create missing_reply_text"
+
+
+# ---------------------------------------------------------------------------
+# 5. create_draft_from_replied_lead stores workspace_id and lead_id
+# ---------------------------------------------------------------------------
+
+def test_create_draft_from_replied_lead_stores_workspace_and_lead_id(monkeypatch):
+    """Manual create draft from replied lead ties the thread to workspace_id and lead_id."""
+    osp_id = _seed_osp()
+
+    from src import workspace as ws_mod
+    monkeypatch.setattr(ws_mod, "get_campaign_id_for_workspace", lambda wid=None: "camp-cdf")
+    monkeypatch.setattr(ws_mod, "get_calendar_link_for_workspace", lambda wid=None: "https://cal.example.com")
+    monkeypatch.setattr(ws_mod, "get_default_workspace_id", lambda: osp_id)
+
+    async def fake_classify(**kwargs):
+        return _fake_draft(INTENT_POSITIVE_INTEREST, ACTION_BOOK_MEETING, "Let's connect.")
+
+    monkeypatch.setattr(reply_sync_mod, "classify_and_draft_reply", fake_classify)
+
+    from src.feedback.reply_sync import create_draft_from_replied_lead
+
+    thread_id, result = asyncio.run(create_draft_from_replied_lead(
+        prospect_email="laz@example.com",
+        reply_text="I'm happy to pay you 25% bounty.",
+        workspace_id=osp_id,
+        lead_id=42,
+        prospect_name="Laz Fuentes",
+        company_name="Laz Co",
+        campaign_id="camp-cdf",
+    ))
+
+    assert thread_id is not None
+    with session_scope() as session:
+        t = session.get(ReplyThread, thread_id)
+        assert t is not None
+        assert t.workspace_id == osp_id
+        assert t.lead_id == 42
+        assert t.prospect_email == "laz@example.com"
+        assert t.inbound_reply_text == "I'm happy to pay you 25% bounty."
+        assert not t.inbound_reply_text.startswith("[Reply text not available")
+
+
+# ---------------------------------------------------------------------------
+# 6. Bounty/revshare reply from Laz → meeting draft, bounty NOT accepted
+# ---------------------------------------------------------------------------
+
+def test_create_draft_from_bounty_reply_is_meeting_draft_no_bounty(monkeypatch):
+    """Laz bounty reply produces a meeting draft and does not accept bounty terms."""
+    osp_id = _seed_osp()
+
+    from src import workspace as ws_mod
+    monkeypatch.setattr(ws_mod, "get_campaign_id_for_workspace", lambda wid=None: "camp-laz")
+    monkeypatch.setattr(ws_mod, "get_calendar_link_for_workspace", lambda wid=None: "https://cal.example.com/book")
+    monkeypatch.setattr(ws_mod, "get_default_workspace_id", lambda: osp_id)
+
+    async def fake_classify(**kwargs):
+        from src.feedback.reply_agent import ReplyAgentResult
+        return ReplyAgentResult(
+            classification=INTENT_REVSHARE,
+            recommended_action=ACTION_BOOK_MEETING,
+            draft_body=(
+                "Can we set up a time to discuss? We don't normally do revshare "
+                "but would like to learn more about the product and your ICP, "
+                "and it might be something we consider.\n\n"
+                "Here's our calendar link: https://cal.example.com/book"
+            ),
+            human_review_notes=(
+                "Commercial terms discussed — do not accept in writing without approval."
+            ),
+        )
+
+    monkeypatch.setattr(reply_sync_mod, "classify_and_draft_reply", fake_classify)
+
+    from src.feedback.reply_sync import create_draft_from_replied_lead
+
+    BOUNTY_REPLY = (
+        "I'm happy to pay you 25% bounty on every one that buys. "
+        "Our cycle is measured in weeks, not months or quarters."
+    )
+    thread_id, result = asyncio.run(create_draft_from_replied_lead(
+        prospect_email="laz@example.com",
+        reply_text=BOUNTY_REPLY,
+        workspace_id=osp_id,
+        prospect_name="Laz Fuentes",
+        campaign_id="camp-laz",
+        calendar_link="https://cal.example.com/book",
+    ))
+
+    with session_scope() as session:
+        t = session.get(ReplyThread, thread_id)
+        assert t is not None
+        draft_lower = t.draft_body.lower()
+        # Must not accept the bounty
+        assert "that works" not in draft_lower
+        assert "accept the 25" not in draft_lower
+        # Must redirect to meeting/call
+        assert any(w in draft_lower for w in ("time", "call", "meeting", "discuss", "calendar"))
+        # Commercial terms warning must be in review notes
+        assert "commercial terms" in t.human_review_notes.lower() or "do not accept" in t.human_review_notes.lower()
+        # Must be needs_review (positive/commercial classification), not auto-sent
+        assert t.status == STATUS_NEEDS_REVIEW
+        assert t.sent_at is None
+
+
+# ---------------------------------------------------------------------------
+# 7. create_draft_from_replied_lead is workspace-scoped
+# ---------------------------------------------------------------------------
+
+def test_create_draft_workspace_scoping(monkeypatch):
+    """A draft created in workspace A must not be visible in workspace B."""
+    osp_id = _seed_osp()
+    other_ws = create_workspace(name="WS Scope CDF", slug="ws-scope-cdf", instantly_campaign_id="camp-b")
+    other_id = other_ws["id"]
+
+    from src import workspace as ws_mod
+    monkeypatch.setattr(ws_mod, "get_campaign_id_for_workspace", lambda wid=None: "camp-a")
+    monkeypatch.setattr(ws_mod, "get_calendar_link_for_workspace", lambda wid=None: "")
+    monkeypatch.setattr(ws_mod, "get_default_workspace_id", lambda: osp_id)
+
+    async def fake_classify(**kwargs):
+        return _fake_draft()
+
+    monkeypatch.setattr(reply_sync_mod, "classify_and_draft_reply", fake_classify)
+
+    from src.feedback.reply_sync import create_draft_from_replied_lead
+
+    asyncio.run(create_draft_from_replied_lead(
+        prospect_email="scope@example.com",
+        reply_text="Interested in learning more.",
+        workspace_id=osp_id,
+        campaign_id="camp-a",
+    ))
+
+    osp_queue = get_reply_queue(workspace_id=osp_id)
+    other_queue = get_reply_queue(workspace_id=other_id)
+
+    assert len(osp_queue) == 1, "Draft must appear in the creating workspace"
+    assert len(other_queue) == 0, "Draft must not appear in other workspace"
+
+
+# ---------------------------------------------------------------------------
+# 8. create_draft_from_replied_lead does NOT auto-send
+# ---------------------------------------------------------------------------
+
+def test_create_draft_no_auto_send(monkeypatch):
+    """create_draft_from_replied_lead must never call try_send_reply."""
+    osp_id = _seed_osp()
+
+    send_calls: list = []
+
+    async def fake_try_send(*args, **kwargs):
+        send_calls.append((args, kwargs))
+        return {"status": "sent", "detail": "sent", "debug": None}
+
+    monkeypatch.setattr(reply_sync_mod, "try_send_reply", fake_try_send, raising=False)
+
+    from src import workspace as ws_mod
+    monkeypatch.setattr(ws_mod, "get_campaign_id_for_workspace", lambda wid=None: "camp-nosend")
+    monkeypatch.setattr(ws_mod, "get_calendar_link_for_workspace", lambda wid=None: "")
+    monkeypatch.setattr(ws_mod, "get_default_workspace_id", lambda: osp_id)
+
+    async def fake_classify(**kwargs):
+        return _fake_draft(INTENT_POSITIVE_INTEREST, ACTION_BOOK_MEETING, "Let's talk.")
+
+    monkeypatch.setattr(reply_sync_mod, "classify_and_draft_reply", fake_classify)
+
+    from src.feedback.reply_sync import create_draft_from_replied_lead
+
+    asyncio.run(create_draft_from_replied_lead(
+        prospect_email="nosend@example.com",
+        reply_text="I want to buy.",
+        workspace_id=osp_id,
+        campaign_id="camp-nosend",
+    ))
+
+    assert send_calls == [], "create_draft_from_replied_lead must never call try_send_reply"
+
+    # The record must exist but not be sent
+    queue = get_reply_queue(workspace_id=osp_id)
+    assert len(queue) == 1
+    assert queue[0]["status"] != STATUS_SENT
+    assert queue[0]["sent_at"] is None

@@ -453,7 +453,8 @@ def _get_local_replied_leads(workspace_id: int | None) -> list[dict]:
 
     These are candidates that replied but may not have been explicitly
     categorized as opportunities in Instantly (status may be 2).
-    Each entry has: instantly_lead_id (delivery_id), email, first_name, last_name, company.
+    Each entry has: instantly_lead_id (delivery_id), email, prospect_name,
+    company, lead_db_id (Lead.id primary key for linking).
     """
     if workspace_id is None:
         return []
@@ -466,6 +467,7 @@ def _get_local_replied_leads(workspace_id: int | None) -> list[dict]:
                 Lead.first_name,
                 Lead.last_name,
                 Lead.company,
+                Lead.id,
             )
             .join(Engagement, Engagement.content_id == GeneratedContent.id)
             .join(Lead, Lead.id == GeneratedContent.lead_id)
@@ -477,7 +479,7 @@ def _get_local_replied_leads(workspace_id: int | None) -> list[dict]:
             .distinct()
         ).all()
         for row in rows:
-            delivery_id, email, first_name, last_name, company = row
+            delivery_id, email, first_name, last_name, company, lead_db_id = row
             if not email:
                 continue
             name = " ".join(filter(None, [first_name, last_name])).strip() or None
@@ -486,11 +488,24 @@ def _get_local_replied_leads(workspace_id: int | None) -> list[dict]:
                 "email": email,
                 "prospect_name": name,
                 "company": company,
+                "lead_db_id": lead_db_id,
                 "source": "local_replied",
                 "raw_lead": {},
                 "opp_signal": "local_engagement.replied=True",
             })
     return results
+
+
+def get_local_replied_leads(workspace_id: int | None = None) -> list[dict]:
+    """Return local leads with replied=True for the workspace.
+
+    Public API for the UI. Each entry includes email, prospect_name,
+    company, lead_db_id (Lead PK), and instantly_lead_id (delivery_id).
+    These are candidates for the "Create Draft from Replied Lead" feature.
+    """
+    from src.workspace import get_default_workspace_id
+    _ws_id = workspace_id if workspace_id is not None else get_default_workspace_id()
+    return _get_local_replied_leads(_ws_id)
 
 
 # ---------------------------------------------------------------------------
@@ -643,24 +658,36 @@ async def sync_reply_queue(
         raw_lead = cand.get("raw_lead") or {}
         opp_signal = cand.get("opp_signal", "unknown")
 
-        # Dedup check
+        # ── Dedup check ──────────────────────────────────────────────────────
+        # Match any existing record including archived ones so we can decide
+        # whether to skip (active) or re-activate (archived).
         dedup_key = _make_dedup_key(None, instantly_id, prospect_email)
 
+        _any_existing_id: int | None = None
+        _was_archived = False
         with session_scope() as session:
-            existing = session.execute(
+            _any_existing = session.execute(
                 select(ReplyThread).where(
                     ReplyThread.workspace_id == _ws_id,
                     ReplyThread.campaign_id == campaign_id,
                     ReplyThread.dedup_key == dedup_key,
                 )
             ).scalar_one_or_none()
+            if _any_existing is not None:
+                _any_existing_id = _any_existing.id
+                _was_archived = _any_existing.status == STATUS_ARCHIVED
 
-            if existing is not None:
-                existing.raw_payload = raw_lead or existing.raw_payload
-                updated_count += 1
-                continue
+        if _any_existing_id is not None and not _was_archived:
+            # Active/non-archived record exists: refresh raw payload and skip.
+            with session_scope() as session:
+                row = session.get(ReplyThread, _any_existing_id)
+                if row:
+                    row.raw_payload = raw_lead or row.raw_payload
+            updated_count += 1
+            continue
+        # _was_archived == True: fall through to re-activate the record.
 
-        # Fetch reply body
+        # ── Fetch reply body ─────────────────────────────────────────────────
         reply_text, text_source, text_debug = await _fetch_reply_text_for_lead(
             instantly_id, prospect_email, campaign_id, api_key
         )
@@ -670,36 +697,64 @@ async def sync_reply_queue(
         debug_text_sources.append(text_debug)
 
         has_real_text = bool(reply_text.strip())
+        _inbound_text = (
+            reply_text if has_real_text
+            else f"[Reply text not available — {opp_signal}. Check Instantly dashboard.]"
+        )
+        _initial_status = STATUS_MISSING_TEXT if not has_real_text else STATUS_NEEDS_REVIEW
 
-        # Create the record
+        # ── Create or re-activate record ─────────────────────────────────────
         new_row_id: int | None = None
-        try:
-            with session_scope() as session:
-                th = ReplyThread(
-                    workspace_id=_ws_id,
-                    campaign_id=campaign_id,
-                    instantly_lead_id=instantly_id or None,
-                    prospect_email=prospect_email,
-                    prospect_name=prospect_name,
-                    company_name=company,
-                    inbound_reply_text=(
-                        reply_text if has_real_text
-                        else f"[Reply text not available — {opp_signal}. Check Instantly dashboard.]"
-                    ),
-                    status=(STATUS_MISSING_TEXT if not has_real_text else STATUS_NEEDS_REVIEW),
-                    raw_payload=raw_lead or None,
-                    dedup_key=dedup_key,
+        if _was_archived and _any_existing_id is not None:
+            # Re-activate archived record in-place (avoids unique constraint violation).
+            try:
+                with session_scope() as session:
+                    row = session.get(ReplyThread, _any_existing_id)
+                    if row is None:
+                        error_count += 1
+                        continue
+                    row.status = _initial_status
+                    row.inbound_reply_text = _inbound_text
+                    row.raw_payload = raw_lead or row.raw_payload
+                    row.prospect_name = prospect_name or row.prospect_name
+                    row.company_name = company or row.company_name
+                    row.human_review_notes = ""
+                new_row_id = _any_existing_id
+            except Exception as exc:
+                log.warning(
+                    "reply_thread_reactivate_failed",
+                    extra={"id": _any_existing_id, "error": str(exc)},
                 )
-                session.add(th)
-                session.flush()
-                new_row_id = th.id
-        except IntegrityError:
-            updated_count += 1
-            continue
-        except Exception as exc:
-            log.warning("reply_thread_create_failed", extra={"email": prospect_email, "error": str(exc)})
-            error_count += 1
-            continue
+                error_count += 1
+                continue
+        else:
+            try:
+                with session_scope() as session:
+                    th = ReplyThread(
+                        workspace_id=_ws_id,
+                        campaign_id=campaign_id,
+                        instantly_lead_id=instantly_id or None,
+                        prospect_email=prospect_email,
+                        prospect_name=prospect_name,
+                        company_name=company,
+                        inbound_reply_text=_inbound_text,
+                        status=_initial_status,
+                        raw_payload=raw_lead or None,
+                        dedup_key=dedup_key,
+                    )
+                    session.add(th)
+                    session.flush()
+                    new_row_id = th.id
+            except IntegrityError:
+                updated_count += 1
+                continue
+            except Exception as exc:
+                log.warning(
+                    "reply_thread_create_failed",
+                    extra={"email": prospect_email, "error": str(exc)},
+                )
+                error_count += 1
+                continue
 
         if not has_real_text:
             missing_text_count += 1
@@ -711,12 +766,12 @@ async def sync_reply_queue(
                         f"(tried /api/v2/emails and /api/v2/leads/{{id}}). "
                         f"Opportunity signal: {opp_signal}. "
                         f"Check Instantly dashboard for the actual reply, "
-                        f"then use the Manual Draft Tester."
+                        f"then use 'Create Draft from Replied Lead'."
                     )
             new_count += 1
             continue
 
-        # Classify reply
+        # ── Classify reply ───────────────────────────────────────────────────
         try:
             agent_result = await classify_and_draft_reply(
                 inbound_reply=reply_text,
@@ -748,18 +803,33 @@ async def sync_reply_queue(
 
         new_count += 1
 
+    _instantly_opportunity_leads_found = len(candidates) - local_added
+    opportunity_gap_detected = (
+        (instantly_opportunity_count or 0) > 0
+        and _instantly_opportunity_leads_found == 0
+    )
+    local_replied_leads_detail = [
+        {
+            "email": lr["email"],
+            "prospect_name": lr.get("prospect_name"),
+            "company": lr.get("company"),
+        }
+        for lr in local_replied
+    ]
+
     log.info(
         "reply_queue_sync_complete",
         extra={
             "workspace_id": _ws_id,
             "total_scanned": total_leads_scanned,
-            "opportunity_leads": len(candidates) - local_added,
+            "opportunity_leads": _instantly_opportunity_leads_found,
             "local_added": local_added,
             "ignored_not_opportunity": ignored_not_opportunity,
             "new": new_count,
             "updated": updated_count,
             "needs_review": needs_review_count,
             "missing_text": missing_text_count,
+            "opportunity_gap_detected": opportunity_gap_detected,
         },
     )
     # --- Final active count for reconciliation ---
@@ -784,7 +854,7 @@ async def sync_reply_queue(
 
     return {
         "total_leads_scanned": total_leads_scanned,
-        "opportunity_leads_found": len(candidates) - local_added,
+        "opportunity_leads_found": _instantly_opportunity_leads_found,
         "local_replied_added": local_added,
         "ignored_not_opportunity": ignored_not_opportunity,
         "synced": len(candidates),
@@ -804,6 +874,9 @@ async def sync_reply_queue(
         "instantly_opportunity_count": instantly_opportunity_count,
         "active_queue_count": active_queue_count,
         "reconciliation_warning": reconciliation_warning,
+        # Opportunity gap diagnostic
+        "opportunity_gap_detected": opportunity_gap_detected,
+        "local_replied_leads_detail": local_replied_leads_detail,
     }
 
 
@@ -1260,3 +1333,101 @@ def update_reply_thread(
         if human_review_notes is not None:
             row.human_review_notes = human_review_notes
         return True
+
+
+# ---------------------------------------------------------------------------
+# Manual draft creation from replied lead
+# ---------------------------------------------------------------------------
+
+async def create_draft_from_replied_lead(
+    prospect_email: str,
+    reply_text: str,
+    *,
+    workspace_id: int | None = None,
+    lead_id: int | None = None,
+    prospect_name: str | None = None,
+    company_name: str | None = None,
+    calendar_link: str = "",
+    campaign_id: str | None = None,
+) -> tuple[int, dict]:
+    """Create a ReplyThread draft from a manually-provided reply body.
+
+    For use when Instantly does not expose the reply body through the API
+    but the operator has the actual reply text from the Instantly dashboard.
+
+    The draft is tied to the lead (lead_id) and workspace. Does not auto-send.
+    Returns (thread_id, summary_dict).
+
+    summary_dict keys: classification, recommended_action, draft_body,
+    human_review_notes, status, thread_id.
+    """
+    from src.workspace import (
+        get_calendar_link_for_workspace,
+        get_campaign_id_for_workspace,
+        get_default_workspace_id,
+    )
+
+    if not reply_text.strip():
+        raise ValueError("reply_text cannot be empty")
+
+    _ws_id = workspace_id if workspace_id is not None else get_default_workspace_id()
+    _campaign_id = campaign_id or get_campaign_id_for_workspace(_ws_id) or "manual"
+    _calendar = calendar_link or get_calendar_link_for_workspace(_ws_id) or ""
+
+    agent_result = await classify_and_draft_reply(
+        inbound_reply=reply_text,
+        calendar_link=_calendar,
+        workspace_id=_ws_id,
+    )
+    auto_status = _classification_to_status(
+        agent_result.classification, agent_result.recommended_action
+    )
+
+    # Dedup key uses email + reply text hash (manual submissions have no Instantly ID)
+    dedup_key = _make_dedup_key(None, None, prospect_email, reply_text)
+
+    thread_id: int | None = None
+    try:
+        with session_scope() as session:
+            th = ReplyThread(
+                workspace_id=_ws_id,
+                lead_id=lead_id,
+                campaign_id=_campaign_id,
+                prospect_email=prospect_email.lower().strip(),
+                prospect_name=prospect_name,
+                company_name=company_name,
+                inbound_reply_text=reply_text,
+                classification=agent_result.classification,
+                recommended_action=agent_result.recommended_action,
+                draft_body=agent_result.draft_body,
+                human_review_notes=agent_result.human_review_notes,
+                status=auto_status,
+                dedup_key=dedup_key,
+            )
+            session.add(th)
+            session.flush()
+            thread_id = th.id
+    except IntegrityError:
+        # Duplicate: return the existing thread
+        with session_scope() as session:
+            existing = session.execute(
+                select(ReplyThread).where(
+                    ReplyThread.workspace_id == _ws_id,
+                    ReplyThread.campaign_id == _campaign_id,
+                    ReplyThread.dedup_key == dedup_key,
+                )
+            ).scalar_one_or_none()
+            if existing:
+                thread_id = existing.id
+
+    if thread_id is None:
+        raise RuntimeError("Failed to create or find ReplyThread for manual draft")
+
+    return thread_id, {
+        "classification": agent_result.classification,
+        "recommended_action": agent_result.recommended_action,
+        "draft_body": agent_result.draft_body,
+        "human_review_notes": agent_result.human_review_notes,
+        "status": auto_status,
+        "thread_id": thread_id,
+    }

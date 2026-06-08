@@ -71,7 +71,9 @@ from src.feedback.reply_sync import (
     archive_non_opportunity_threads,
     archive_placeholder_threads,
     archive_stale_threads,
+    create_draft_from_replied_lead,
     ensure_reply_agent_schema,
+    get_local_replied_leads,
     get_reply_queue,
     get_send_blocked_reason,
     sync_reply_queue,
@@ -548,7 +550,7 @@ try:
 except Exception:
     _ws_calendar_link = ""
 
-_tab_queue, _tab_manual = st.tabs(["Reply Queue", "Manual Draft Tester"])
+_tab_queue, _tab_manual, _tab_create = st.tabs(["Reply Queue", "Manual Draft Tester", "Create Draft from Replied Lead"])
 
 # ── Tab 1: Reply Queue ────────────────────────────────────────────────────
 with _tab_queue:
@@ -607,8 +609,45 @@ with _tab_queue:
             if _rq_stale:
                 st.info(f"Auto-cleanup: {_rq_stale} stale record(s) archived before sync.")
 
+            _opportunity_gap = _rq_sync_result.get("opportunity_gap_detected", False)
+            _local_detail = _rq_sync_result.get("local_replied_leads_detail") or []
+
             if _rq_nr:
                 st.success(f"**{_rq_nr} positive reply draft(s) ready for review.**")
+
+            if _opportunity_gap:
+                _inst_opp_count = _rq_sync_result.get("instantly_opportunity_count") or 0
+                _inst_rep_count = _rq_sync_result.get("instantly_replied_count")
+                st.warning(
+                    f"**Opportunity gap detected.** "
+                    f"Instantly reports {_inst_opp_count} opportunit{'y' if _inst_opp_count == 1 else 'ies'}, "
+                    f"but no leads with opportunity status (≥ 3) were found via the Instantly leads API. "
+                    f"The API does not appear to expose the opportunity lead IDs."
+                )
+                st.info(
+                    "**Diagnostic summary:**\n"
+                    f"- Instantly opportunity count (from analytics): **{_inst_opp_count}**\n"
+                    f"- Opportunity leads found via API (status ≥ 3): **{_rq_opp}**\n"
+                    f"- Local replied leads found: **{len(_local_detail)}**\n"
+                    f"- Instantly replied count: **{_inst_rep_count if _inst_rep_count is not None else 'unknown'}**\n"
+                    f"- Reply bodies found: **0**\n\n"
+                    "Use **Create Draft from Replied Lead** (tab below) to paste the actual "
+                    "reply body from the Instantly dashboard and generate a draft."
+                )
+                if _local_detail:
+                    st.markdown("**Candidate replied leads found locally:**")
+                    st.dataframe(
+                        pd.DataFrame([
+                            {
+                                "Name": lr.get("prospect_name") or "—",
+                                "Email": lr["email"],
+                                "Company": lr.get("company") or "—",
+                            }
+                            for lr in _local_detail
+                        ]),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
             elif _rq_opp > 0 and _rq_miss > 0:
                 _inst_opp = _rq_sync_result.get("instantly_opportunity_count")
                 _opp_label = f"{_inst_opp}" if _inst_opp is not None else "unknown number of"
@@ -617,7 +656,7 @@ with _tab_queue:
                     "available from the current API endpoint (tried /api/v2/emails and "
                     "/api/v2/leads/{{id}}). "
                     f"{_rq_miss} record(s) placed in **Missing reply text** tab. "
-                    "Find the actual reply in Instantly and use the **Manual Draft Tester**."
+                    "Find the actual reply in Instantly and use **Create Draft from Replied Lead**."
                 )
             if _rq_skip_new:
                 st.info(f"{_rq_skip_new} reply(ies) classified as OOO/unsubscribe/negative — skipped.")
@@ -626,6 +665,7 @@ with _tab_queue:
 
             _rq_debug_src = _rq_sync_result.get("debug_text_sources") or []
             _rq_debug_skip = _rq_sync_result.get("debug_skipped_signals") or []
+            _rq_local_detail_debug = _rq_sync_result.get("local_replied_leads_detail") or []
             with st.expander(
                 f"Sync debug — {_rq_total} scanned · {_rq_opp + _rq_local} candidates "
                 f"· {_rq_nr} positive drafts · {_rq_miss} missing text · {_rq_ignored} ignored"
@@ -634,20 +674,37 @@ with _tab_queue:
                 _inst_r = _rq_sync_result.get("instantly_replied_count")
                 _inst_o = _rq_sync_result.get("instantly_opportunity_count")
                 _aq = _rq_sync_result.get("active_queue_count", "?")
+                _gap = _rq_sync_result.get("opportunity_gap_detected", False)
                 st.dataframe(pd.DataFrame([
                     {"Metric": "Instantly replied count (from latest snapshot)", "Value": _inst_r if _inst_r is not None else "unknown"},
                     {"Metric": "Instantly opportunity count", "Value": _inst_o if _inst_o is not None else "unknown"},
+                    {"Metric": "Opportunity gap detected", "Value": "YES — Instantly reports opportunities but API returned 0 leads with status ≥ 3" if _gap else "No"},
                     {"Metric": "Leads scanned from Instantly", "Value": _rq_total},
                     {"Metric": "Opportunity leads found (status ≥ 3)", "Value": _rq_opp},
-                    {"Metric": "Local replied leads added", "Value": _rq_local},
+                    {"Metric": "Opportunity lead IDs found", "Value": _rq_opp},
+                    {"Metric": "Reply bodies found", "Value": _rq_nr + _rq_nh},
+                    {"Metric": "Local replied leads added as candidates", "Value": _rq_local},
                     {"Metric": "Generic replied leads ignored (status=2)", "Value": _rq_ignored},
-                    {"Metric": "Actual reply bodies found", "Value": _rq_nr + _rq_nh},
                     {"Metric": "Positive drafts created", "Value": _rq_nr},
                     {"Metric": "Missing reply text records", "Value": _rq_miss},
+                    {"Metric": "Needs human", "Value": _rq_nh},
                     {"Metric": "Stale records auto-archived", "Value": _rq_stale},
                     {"Metric": "Active queue count after sync", "Value": _aq},
                 ]), hide_index=True)
                 st.markdown("**Opportunity filter:** `status ∈ {3,4,5,6}` or explicit interest/opportunity flags. `status=2` excluded.")
+                if _rq_local_detail_debug:
+                    st.markdown(f"**Local replied leads ({len(_rq_local_detail_debug)}) used as candidates:**")
+                    st.dataframe(
+                        pd.DataFrame([
+                            {
+                                "Name": lr.get("prospect_name") or "—",
+                                "Email": lr["email"],
+                                "Company": lr.get("company") or "—",
+                            }
+                            for lr in _rq_local_detail_debug
+                        ]),
+                        hide_index=True,
+                    )
                 if _rq_debug_src:
                     st.markdown(f"**Reply body fetch — {len(_rq_debug_src)} candidate(s) probed:**")
                     for _ds in _rq_debug_src[:10]:
@@ -1024,6 +1081,121 @@ with _tab_manual:
                         f"· {_ra_h['inbound_snippet']}…"
                     )
                     st.text(_r.draft_body[:300])
+
+# ── Tab 3: Create Draft from Replied Lead ────────────────────────────────
+with _tab_create:
+    st.caption(
+        "Select a replied lead from this workspace, paste the actual reply text "
+        "from the Instantly dashboard, and generate a draft tied to that lead. "
+        "Does not auto-send. The draft is saved to the Reply Queue for review."
+    )
+
+    _cdf_local_replied = get_local_replied_leads(workspace_id=_ws_id)
+
+    if not _cdf_local_replied:
+        st.info(
+            "No local replied leads found for this workspace. "
+            "Replied leads appear here after syncing engagement from Instantly. "
+            "You can also use the **Manual Draft Tester** tab to generate a draft "
+            "without selecting a lead."
+        )
+    else:
+        _cdf_lead_options: dict[str, str] = {
+            lr["email"]: (
+                f"{lr.get('prospect_name') or lr['email']} "
+                f"· {lr.get('company') or '—'} "
+                f"· {lr['email']}"
+            )
+            for lr in _cdf_local_replied
+        }
+
+        with st.form("create_draft_from_replied_lead_form", clear_on_submit=False):
+            _cdf_email = st.selectbox(
+                "Select replied lead",
+                options=list(_cdf_lead_options.keys()),
+                format_func=lambda e: _cdf_lead_options[e],
+                key="cdf_lead_select",
+                index=None,
+                placeholder="Choose a replied lead…",
+            )
+            _cdf_reply = st.text_area(
+                "Paste reply body from Instantly dashboard",
+                placeholder=(
+                    "I'm happy to pay you 25% bounty on every one that buys. "
+                    "Our cycle is measured in weeks, not months or quarters."
+                ),
+                height=120,
+                key="cdf_reply",
+            )
+            _cdf_calendar = st.text_input(
+                "Calendar link",
+                value=_ws_calendar_link,
+                key="cdf_calendar",
+            )
+            _cdf_submit = st.form_submit_button("Generate draft", type="primary")
+
+        if _cdf_submit:
+            if not _cdf_email:
+                st.warning("Select a replied lead to continue.")
+            elif not _cdf_reply.strip():
+                st.warning("Paste the reply text to continue.")
+            else:
+                _cdf_selected_lr = next(
+                    (lr for lr in _cdf_local_replied if lr["email"] == _cdf_email), None
+                )
+                with st.spinner("Classifying and drafting reply…"):
+                    try:
+                        _cdf_thread_id, _cdf_result = run_async(create_draft_from_replied_lead(
+                            prospect_email=_cdf_email,
+                            reply_text=_cdf_reply,
+                            workspace_id=_ws_id,
+                            lead_id=_cdf_selected_lr.get("lead_db_id") if _cdf_selected_lr else None,
+                            prospect_name=_cdf_selected_lr.get("prospect_name") if _cdf_selected_lr else None,
+                            company_name=_cdf_selected_lr.get("company") if _cdf_selected_lr else None,
+                            calendar_link=_cdf_calendar or _ws_calendar_link,
+                        ))
+                        st.session_state["cdf_last_result"] = {
+                            "result": _cdf_result,
+                            "thread_id": _cdf_thread_id,
+                            "email": _cdf_email,
+                            "lead_name": (
+                                _cdf_selected_lr.get("prospect_name") if _cdf_selected_lr else _cdf_email
+                            ),
+                        }
+                        st.cache_data.clear()
+                        st.success(f"Draft created and saved to Reply Queue (thread #{_cdf_thread_id}).")
+                    except Exception as _cdf_exc:
+                        st.error(f"Create draft failed: {_cdf_exc}")
+
+        if "cdf_last_result" in st.session_state:
+            _cdf_entry = st.session_state["cdf_last_result"]
+            _cdf_r = _cdf_entry["result"]
+            with st.container(border=True):
+                st.markdown(
+                    f"**Lead:** {_cdf_entry['lead_name']} (`{_cdf_entry['email']}`)"
+                )
+                _cdf_action_label = _RA_ACTION_LABELS.get(
+                    _cdf_r.get("recommended_action", ""), _cdf_r.get("recommended_action", "—")
+                )
+                _cdf_left, _cdf_right = st.columns(2)
+                with _cdf_left:
+                    st.markdown(f"**Intent:** `{_cdf_r.get('classification', '—')}`")
+                with _cdf_right:
+                    st.markdown(f"**Recommended action:** {_cdf_action_label}")
+                if _cdf_r.get("human_review_notes"):
+                    st.info(f"**Review notes:** {_cdf_r['human_review_notes']}")
+                st.markdown("**Suggested reply draft** — saved to queue for your review:")
+                st.text_area(
+                    "Draft",
+                    value=_cdf_r.get("draft_body", ""),
+                    height=150,
+                    key="cdf_draft_output",
+                    label_visibility="collapsed",
+                )
+                st.caption(
+                    f"Saved as Reply Queue thread #{_cdf_entry['thread_id']}. "
+                    "Review and approve it in the **Reply Queue** tab."
+                )
 
 with st.expander("Sync debug — raw Instantly analytics + DB comparison"):
     if _snapshot is None:
