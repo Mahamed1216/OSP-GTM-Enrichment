@@ -12,7 +12,9 @@ from sqlalchemy import select
 import src.feedback.reply_sync as reply_sync_mod
 from src.db import session_scope
 from src.feedback.reply_sync import (
+    ACTIVE_STATUSES,
     POSITIVE_CLASSIFICATIONS,
+    STATUS_ARCHIVED,
     STATUS_MISSING_TEXT,
     STATUS_NEEDS_HUMAN,
     STATUS_NEEDS_REVIEW,
@@ -20,6 +22,7 @@ from src.feedback.reply_sync import (
     _is_opportunity_lead,
     archive_non_opportunity_threads,
     archive_placeholder_threads,
+    archive_stale_threads,
 )
 from src.feedback.reply_agent import (
     ACTION_BOOK_MEETING,
@@ -925,7 +928,7 @@ def test_cleanup_archives_non_opportunity_records():
 
     with session_scope() as session:
         row = session.get(ReplyThread, bad_id)
-        assert row.status == STATUS_SKIPPED
+        assert row.status == STATUS_ARCHIVED
         assert "not_actual_opportunity" in row.human_review_notes.lower()
 
 
@@ -1209,7 +1212,7 @@ def test_cleanup_removes_placeholder_records():
 
     with session_scope() as session:
         row = session.get(ReplyThread, ph_id)
-        assert row.status == STATUS_SKIPPED
+        assert row.status == STATUS_ARCHIVED
 
     # Should no longer appear in positive drafts or missing text buckets
     from src.feedback.reply_sync import get_reply_queue
@@ -1281,3 +1284,266 @@ def test_queue_workspace_scoped_with_new_logic(monkeypatch):
 
     assert len(get_reply_queue(workspace_id=other_id)) == 0
     assert len(get_reply_queue(workspace_id=osp_id)) == 1
+
+
+# ===========================================================================
+# Stale-record cleanup + active-status filtering tests
+# ===========================================================================
+
+def _make_stale_thread(workspace_id: int, email: str, lead_id: str, status: str) -> int:
+    """Create a stale ReplyThread (placeholder text, given status)."""
+    with session_scope() as session:
+        row = ReplyThread(
+            workspace_id=workspace_id,
+            campaign_id="camp-1",
+            prospect_email=email,
+            inbound_reply_text=(
+                f"[Reply text not available — positive signal: status=3. "
+                "Check Instantly dashboard.]"
+            ),
+            status=status,
+            dedup_key=f"lead:{lead_id}",
+            raw_payload={"status": 2, "email": email},  # generic replied payload
+        )
+        session.add(row)
+        session.flush()
+        return row.id
+
+
+def _make_real_thread(workspace_id: int, email: str, lead_id: str, status: str) -> int:
+    """Create a ReplyThread with real reply text."""
+    with session_scope() as session:
+        row = ReplyThread(
+            workspace_id=workspace_id,
+            campaign_id="camp-1",
+            prospect_email=email,
+            inbound_reply_text="I'm interested in your offering.",
+            classification=INTENT_POSITIVE_INTEREST,
+            recommended_action=ACTION_BOOK_MEETING,
+            draft_body="Let's set up a call.",
+            status=status,
+            dedup_key=f"lead:{lead_id}",
+            raw_payload={"status": 3, "email": email},
+        )
+        session.add(row)
+        session.flush()
+        return row.id
+
+
+# ---------------------------------------------------------------------------
+# 1. 404 old placeholder records are excluded from active queue after cleanup
+# ---------------------------------------------------------------------------
+
+def test_old_placeholder_records_excluded_after_cleanup():
+    osp_id = _seed_osp()
+    # Simulate 404 old needs_human records with placeholder text
+    for i in range(5):
+        _make_stale_thread(osp_id, f"stale{i}@example.com", f"il-stale-{i}", STATUS_NEEDS_HUMAN)
+
+    # Before cleanup: 5 records in active queue
+    before = get_reply_queue(workspace_id=osp_id)
+    assert len(before) == 5
+
+    # Run comprehensive cleanup
+    result = archive_stale_threads(osp_id, dry_run=False)
+    assert result["archived"] == 5
+
+    # After cleanup: 0 active records
+    after = get_reply_queue(workspace_id=osp_id)
+    assert len(after) == 0, "Placeholder records must be excluded from active queue after cleanup"
+
+
+# ---------------------------------------------------------------------------
+# 2. Placeholder records are archived, not counted as needs_human
+# ---------------------------------------------------------------------------
+
+def test_placeholder_records_archived_not_counted_as_needs_human():
+    osp_id = _seed_osp()
+    ph_id = _make_stale_thread(osp_id, "ph@example.com", "il-ph", STATUS_NEEDS_HUMAN)
+
+    archive_stale_threads(osp_id, dry_run=False)
+
+    with session_scope() as session:
+        row = session.get(ReplyThread, ph_id)
+        assert row.status == STATUS_ARCHIVED, (
+            f"Placeholder needs_human record must be archived, got {row.status}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 3. Missing reply text records are counted in missing_text, not needs_human
+# ---------------------------------------------------------------------------
+
+def test_missing_text_status_not_needs_human(monkeypatch):
+    osp_id = _seed_osp()
+    # Sync with no reply body → should create missing_reply_text, NOT needs_human
+    _run_sync_with_overrides(
+        osp_id, "camp-1", "key-1", osp_id,
+        monkeypatch, [_make_positive_lead()], _no_emails(), _fake_draft(),
+        reply_text="",
+    )
+    with session_scope() as session:
+        threads = session.execute(select(ReplyThread)).scalars().all()
+        assert len(threads) == 1
+        assert threads[0].status == STATUS_MISSING_TEXT
+        assert threads[0].status != STATUS_NEEDS_HUMAN
+
+
+# ---------------------------------------------------------------------------
+# 4. Needs human requires real inbound reply text
+# ---------------------------------------------------------------------------
+
+def test_needs_human_requires_real_reply_text(monkeypatch):
+    osp_id = _seed_osp()
+    # Angry classification with real reply text → needs_human
+    _run_sync_with_overrides(
+        osp_id, "camp-1", "key-1", osp_id,
+        monkeypatch, [_make_positive_lead()], _fake_emails(),
+        _fake_draft(classification=INTENT_ANGRY, action=ACTION_HUMAN,
+                    draft="(Routed to human.)", notes="Angry."),
+        reply_text="Stop emailing me or I'll report you!",
+    )
+    with session_scope() as session:
+        t = session.execute(select(ReplyThread)).scalars().first()
+        assert t is not None
+        assert t.status == STATUS_NEEDS_HUMAN
+        # Text must be real, not a placeholder
+        assert not t.inbound_reply_text.startswith("[Reply text not available")
+
+
+# ---------------------------------------------------------------------------
+# 5. Opportunity-only queue does not include all replied leads
+# ---------------------------------------------------------------------------
+
+def test_opportunity_queue_not_flooded_by_replied_leads(monkeypatch):
+    osp_id = _seed_osp()
+    # 100 status=2 (generic replied) leads → all should be ignored
+    generic_leads = [
+        _make_generic_replied_lead(f"g{i}@example.com", f"il-g{i}")
+        for i in range(100)
+    ]
+    # 1 opportunity lead (status=3)
+    opportunity = _make_positive_lead(email="opp@example.com", lead_id="il-opp-only")
+
+    _run_sync_with_overrides(
+        osp_id, "camp-1", "key-1", osp_id,
+        monkeypatch, generic_leads + [opportunity], _fake_emails(), _fake_draft(),
+    )
+    # Only 1 record should exist (the opportunity)
+    queue = get_reply_queue(workspace_id=osp_id)
+    assert len(queue) <= 1, f"Opportunity-only queue must not show replied leads: {len(queue)}"
+
+
+# ---------------------------------------------------------------------------
+# 6. If Instantly reports 10 replies and 2 opportunities, queue ≤ 2
+# ---------------------------------------------------------------------------
+
+def test_queue_aligned_with_instantly_counts(monkeypatch):
+    osp_id = _seed_osp()
+    # 10 total leads: 8 status=2 (generic replied), 2 status=3 (opportunity)
+    generic_leads = [
+        _make_generic_replied_lead(f"r{i}@example.com", f"il-r{i}")
+        for i in range(8)
+    ]
+    opp_leads = [
+        _make_positive_lead(email=f"opp{i}@example.com", lead_id=f"il-opp{i}")
+        for i in range(2)
+    ]
+    _run_sync_with_overrides(
+        osp_id, "camp-1", "key-1", osp_id,
+        monkeypatch, generic_leads + opp_leads, _fake_emails(), _fake_draft(),
+    )
+    queue = get_reply_queue(workspace_id=osp_id)
+    assert len(queue) <= 2, f"With 2 opportunities, queue must have ≤ 2 records, got {len(queue)}"
+
+
+# ---------------------------------------------------------------------------
+# 7. Cleanup is workspace-scoped
+# ---------------------------------------------------------------------------
+
+def test_stale_cleanup_is_workspace_scoped():
+    osp_id = _seed_osp()
+    other_ws = create_workspace(name="Other WS", slug="other-ws-stale", instantly_campaign_id="camp-o")
+    other_id = other_ws["id"]
+
+    # Create stale record in OSP
+    osp_stale_id = _make_stale_thread(osp_id, "osp_stale@example.com", "il-osp-s", STATUS_NEEDS_HUMAN)
+    # Create stale record in other workspace
+    other_stale_id = _make_stale_thread(other_id, "other_stale@example.com", "il-other-s", STATUS_NEEDS_HUMAN)
+
+    # Run cleanup only for OSP
+    archive_stale_threads(osp_id, dry_run=False)
+
+    with session_scope() as session:
+        osp_row = session.get(ReplyThread, osp_stale_id)
+        other_row = session.get(ReplyThread, other_stale_id)
+        assert osp_row.status == STATUS_ARCHIVED, "OSP stale record must be archived"
+        assert other_row.status == STATUS_NEEDS_HUMAN, "Other workspace record must be untouched"
+
+
+# ---------------------------------------------------------------------------
+# 8. Cleanup is campaign-scoped (wrong-campaign records are archived)
+# ---------------------------------------------------------------------------
+
+def test_stale_cleanup_archives_wrong_campaign_records():
+    osp_id = _seed_osp()
+    # Create a record with a different campaign_id
+    with session_scope() as session:
+        row = ReplyThread(
+            workspace_id=osp_id,
+            campaign_id="OLD_CAMPAIGN_ID",  # different from "camp-current"
+            prospect_email="wrong_camp@example.com",
+            inbound_reply_text="Some reply text.",  # has real text
+            status=STATUS_NEEDS_REVIEW,
+            dedup_key="lead:il-wc",
+        )
+        session.add(row)
+        session.flush()
+        wrong_id = row.id
+
+    # Cleanup specifying the correct campaign
+    archive_stale_threads(osp_id, campaign_id="camp-current", dry_run=False)
+
+    with session_scope() as session:
+        row = session.get(ReplyThread, wrong_id)
+        assert row.status == STATUS_ARCHIVED, "Wrong-campaign records must be archived"
+
+
+# ---------------------------------------------------------------------------
+# 9. Sync does not create placeholder needs_human_review records
+# ---------------------------------------------------------------------------
+
+def test_sync_does_not_create_placeholder_needs_human(monkeypatch):
+    osp_id = _seed_osp()
+    # No reply text → should be missing_reply_text, never needs_human
+    _run_sync_with_overrides(
+        osp_id, "camp-1", "key-1", osp_id,
+        monkeypatch, [_make_positive_lead()], _no_emails(), _fake_draft(),
+        reply_text="",
+    )
+    with session_scope() as session:
+        threads = session.execute(select(ReplyThread)).scalars().all()
+        for t in threads:
+            assert t.status != STATUS_NEEDS_HUMAN, (
+                f"Placeholder record must not have status needs_human, got {t.status}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# 10. Debug summary returns Instantly counts and reconciliation data
+# ---------------------------------------------------------------------------
+
+def test_sync_returns_reconciliation_debug_data(monkeypatch):
+    osp_id = _seed_osp()
+    result = _run_sync_with_overrides(
+        osp_id, "camp-1", "key-1", osp_id,
+        monkeypatch, [_make_positive_lead()], _fake_emails(), _fake_draft(),
+    )
+    # Must have reconciliation fields in return dict
+    assert "instantly_replied_count" in result
+    assert "instantly_opportunity_count" in result
+    assert "active_queue_count" in result
+    assert "stale_archived" in result
+    # Counts must be numeric (or None)
+    assert isinstance(result["active_queue_count"], int)
+    assert isinstance(result["stale_archived"], int)

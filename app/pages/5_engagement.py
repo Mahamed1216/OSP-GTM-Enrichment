@@ -58,8 +58,10 @@ from src.feedback.reply_agent import (
     save_reply_draft,
 )
 from src.feedback.reply_sync import (
+    ACTIVE_STATUSES,
     POSITIVE_CLASSIFICATIONS,
     STATUS_APPROVED,
+    STATUS_ARCHIVED,
     STATUS_MANUAL_SEND,
     STATUS_MISSING_TEXT,
     STATUS_NEEDS_HUMAN,
@@ -68,6 +70,7 @@ from src.feedback.reply_sync import (
     STATUS_SKIPPED,
     archive_non_opportunity_threads,
     archive_placeholder_threads,
+    archive_stale_threads,
     ensure_reply_agent_schema,
     get_reply_queue,
     get_send_blocked_reason,
@@ -595,14 +598,26 @@ with _tab_queue:
                 f"{_rq_ignored} generic-replied leads ignored (status=2, not opportunities). "
                 f"{_rq_new} new · {_rq_upd} refreshed."
             )
+            # Reconciliation warning
+            _rq_warn = _rq_sync_result.get("reconciliation_warning")
+            if _rq_warn:
+                st.warning(_rq_warn)
+
+            _rq_stale = _rq_sync_result.get("stale_archived", 0)
+            if _rq_stale:
+                st.info(f"Auto-cleanup: {_rq_stale} stale record(s) archived before sync.")
+
             if _rq_nr:
                 st.success(f"**{_rq_nr} positive reply draft(s) ready for review.**")
-            if _rq_miss:
-                st.warning(
-                    f"{_rq_miss} opportunity/replied lead(s) had **no reply body** available "
-                    "from Instantly API (tried /emails and /leads/{id}). "
-                    "These appear in the **Missing reply text** tab — check the Instantly "
-                    "dashboard for actual reply content."
+            elif _rq_opp > 0 and _rq_miss > 0:
+                _inst_opp = _rq_sync_result.get("instantly_opportunity_count")
+                _opp_label = f"{_inst_opp}" if _inst_opp is not None else "unknown number of"
+                st.info(
+                    f"Instantly reports {_opp_label} opportunity/ies, but reply body was not "
+                    "available from the current API endpoint (tried /api/v2/emails and "
+                    "/api/v2/leads/{{id}}). "
+                    f"{_rq_miss} record(s) placed in **Missing reply text** tab. "
+                    "Find the actual reply in Instantly and use the **Manual Draft Tester**."
                 )
             if _rq_skip_new:
                 st.info(f"{_rq_skip_new} reply(ies) classified as OOO/unsubscribe/negative — skipped.")
@@ -615,6 +630,23 @@ with _tab_queue:
                 f"Sync debug — {_rq_total} scanned · {_rq_opp + _rq_local} candidates "
                 f"· {_rq_nr} positive drafts · {_rq_miss} missing text · {_rq_ignored} ignored"
             ):
+                # Debug summary
+                _inst_r = _rq_sync_result.get("instantly_replied_count")
+                _inst_o = _rq_sync_result.get("instantly_opportunity_count")
+                _aq = _rq_sync_result.get("active_queue_count", "?")
+                st.dataframe(pd.DataFrame([
+                    {"Metric": "Instantly replied count (from latest snapshot)", "Value": _inst_r if _inst_r is not None else "unknown"},
+                    {"Metric": "Instantly opportunity count", "Value": _inst_o if _inst_o is not None else "unknown"},
+                    {"Metric": "Leads scanned from Instantly", "Value": _rq_total},
+                    {"Metric": "Opportunity leads found (status ≥ 3)", "Value": _rq_opp},
+                    {"Metric": "Local replied leads added", "Value": _rq_local},
+                    {"Metric": "Generic replied leads ignored (status=2)", "Value": _rq_ignored},
+                    {"Metric": "Actual reply bodies found", "Value": _rq_nr + _rq_nh},
+                    {"Metric": "Positive drafts created", "Value": _rq_nr},
+                    {"Metric": "Missing reply text records", "Value": _rq_miss},
+                    {"Metric": "Stale records auto-archived", "Value": _rq_stale},
+                    {"Metric": "Active queue count after sync", "Value": _aq},
+                ]), hide_index=True)
                 st.markdown("**Opportunity filter:** `status ∈ {3,4,5,6}` or explicit interest/opportunity flags. `status=2` excluded.")
                 if _rq_debug_src:
                     st.markdown(f"**Reply body fetch — {len(_rq_debug_src)} candidate(s) probed:**")
@@ -639,13 +671,12 @@ with _tab_queue:
             st.error(f"Could not load reply queue: {_rq_load_exc}")
         _rq_threads = []
 
+    # KPI cards count only ACTIVE records (excludes archived and skipped)
     from collections import Counter as _Counter
     _rq_status_counts = _Counter(t["status"] for t in _rq_threads)
-    _rq_placeholder_count = sum(
-        1 for t in _rq_threads
-        if (t.get("inbound_reply_text") or "").startswith("[Reply text not available")
-        or t.get("status") == STATUS_MISSING_TEXT
-    )
+
+    # Total records in DB (including archived) for cleanup button visibility
+    _rq_total_all = len(_rq_threads)
 
     _k1, _k2, _k3, _k4, _k5 = st.columns(5)
     with _k1:
@@ -662,50 +693,62 @@ with _tab_queue:
             str(_rq_status_counts.get(STATUS_MANUAL_SEND, 0) + _rq_status_counts.get("failed", 0)),
         )
 
-    # Cleanup buttons
-    _rq_has_placeholders = _rq_placeholder_count > 0
-    _rq_has_non_opp = any(
-        t.get("status") not in (STATUS_SENT, STATUS_SKIPPED, "archived")
-        and not (t.get("raw_payload") or {}).get("status", 0) >= 3
-        for t in _rq_threads
-    )
-    if _rq_has_placeholders or len(_rq_threads) > 10:
-        with st.expander("Clean up bad import records"):
-            st.caption(
-                "Use these buttons to clean up records imported by earlier (over-broad) sync runs."
-            )
-            _cc1, _cc2, _cc3 = st.columns(3)
-            with _cc1:
-                if st.button("Preview cleanup (dry run)", key="rq_preview_cleanup"):
-                    _p1 = archive_placeholder_threads(_ws_id, dry_run=True)
-                    _p2 = archive_non_opportunity_threads(_ws_id, dry_run=True)
-                    st.info(
-                        f"**Placeholder records** (no reply body): {_p1['archived']} would be archived.\n\n"
-                        f"**Non-opportunity records** (status=2 payload): {_p2['archived']} would be archived.\n\n"
-                        f"Real opportunity records preserved: {_p2['preserved']}."
-                    )
-            with _cc2:
-                if st.button(
-                    "Clean placeholder records",
-                    key="rq_clean_placeholders",
-                    type="secondary",
-                    help="Archives records where no reply body was available when imported.",
-                ):
-                    _cr = archive_placeholder_threads(_ws_id, dry_run=False)
-                    st.success(f"Archived {_cr['archived']} placeholder records.")
-                    st.cache_data.clear()
-                    st.rerun()
-            with _cc3:
-                if st.button(
-                    "Clean non-opportunity records",
-                    key="rq_clean_nonopp",
-                    type="secondary",
-                    help="Archives records whose Instantly payload has no opportunity signal (status=2 etc).",
-                ):
-                    _cr2 = archive_non_opportunity_threads(_ws_id, dry_run=False)
-                    st.success(f"Archived {_cr2['archived']} non-opportunity records.")
-                    st.cache_data.clear()
-                    st.rerun()
+    # Cleanup expander — always visible, not gated on record count
+    with st.expander("Cleanup stale Reply Agent records"):
+        st.caption(
+            "Use these to clean up records from earlier broken sync runs. "
+            "`Archive all stale records` is the recommended first step — "
+            "it removes all placeholder/wrong-campaign records in one click."
+        )
+        _cc0, _cc1, _cc2, _cc3 = st.columns(4)
+        with _cc0:
+            if st.button("Preview (dry run)", key="rq_preview_cleanup"):
+                _ps = archive_stale_threads(_ws_id, campaign_id=None, dry_run=True)
+                _p1 = archive_placeholder_threads(_ws_id, dry_run=True)
+                _p2 = archive_non_opportunity_threads(_ws_id, dry_run=True)
+                st.info(
+                    f"**Archive all stale** would archive: {_ps['archived']} of {_ps['total_before']} total\n\n"
+                    f"**Placeholder only**: {_p1['archived']}\n\n"
+                    f"**Non-opportunity only**: {_p2['archived']}\n\n"
+                    f"Real records preserved: {_ps['preserved']}"
+                )
+        with _cc1:
+            if st.button(
+                "Archive all stale records",
+                key="rq_archive_all_stale",
+                type="primary",
+                help="Archives all placeholder, wrong-campaign, and no-body records. Recommended cleanup.",
+            ):
+                _cr_stale = archive_stale_threads(_ws_id, campaign_id=None, dry_run=False)
+                st.success(
+                    f"Archived {_cr_stale['archived']} stale records. "
+                    f"{_cr_stale['preserved']} real records preserved. "
+                    f"Active queue: {_cr_stale['active_after']}."
+                )
+                st.cache_data.clear()
+                st.rerun()
+        with _cc2:
+            if st.button(
+                "Archive placeholders",
+                key="rq_clean_placeholders",
+                type="secondary",
+                help="Archives records with no reply body (placeholder text).",
+            ):
+                _cr = archive_placeholder_threads(_ws_id, dry_run=False)
+                st.success(f"Archived {_cr['archived']} placeholder records.")
+                st.cache_data.clear()
+                st.rerun()
+        with _cc3:
+            if st.button(
+                "Archive non-opportunity",
+                key="rq_clean_nonopp",
+                type="secondary",
+                help="Archives records whose Instantly payload has no opportunity signal.",
+            ):
+                _cr2 = archive_non_opportunity_threads(_ws_id, dry_run=False)
+                st.success(f"Archived {_cr2['archived']} non-opportunity records.")
+                st.cache_data.clear()
+                st.rerun()
 
     # ── Reply list — tabbed by bucket ────────────────────────────────────
     _rq_positive   = [t for t in _rq_threads if t.get("status") == STATUS_NEEDS_REVIEW]

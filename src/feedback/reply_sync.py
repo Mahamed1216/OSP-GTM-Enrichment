@@ -47,11 +47,24 @@ _TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 STATUS_NEEDS_REVIEW = "needs_review"
 STATUS_APPROVED = "approved"
 STATUS_SENT = "sent"
-STATUS_SKIPPED = "skipped"
+STATUS_SKIPPED = "skipped"     # classified non-positive (OOO/unsubscribe) — dismissed
+STATUS_ARCHIVED = "archived"   # stale/bad import — excluded from all active counts
 STATUS_FAILED = "failed"
-STATUS_NEEDS_HUMAN = "needs_human_review"
+STATUS_NEEDS_HUMAN = "needs_human_review"   # REAL risky reply with actual reply text
 STATUS_MANUAL_SEND = "manual_send_required"
-STATUS_MISSING_TEXT = "missing_reply_text"   # opportunity/replied lead, body unavailable
+STATUS_MISSING_TEXT = "missing_reply_text"  # opportunity lead, API returned no body
+
+# Statuses that represent active, operator-visible records.
+# Archived and skipped records are excluded from KPI counts and queue tables.
+ACTIVE_STATUSES: frozenset[str] = frozenset({
+    STATUS_NEEDS_REVIEW,
+    STATUS_NEEDS_HUMAN,
+    STATUS_MISSING_TEXT,
+    STATUS_SENT,
+    STATUS_FAILED,
+    STATUS_MANUAL_SEND,
+    STATUS_APPROVED,
+})
 
 _SEND_BLOCKED_CLASSIFICATIONS = frozenset({INTENT_UNSUBSCRIBE, INTENT_ANGRY})
 _SEND_BLOCKED_ACTIONS = frozenset({ACTION_STOP, ACTION_HUMAN})
@@ -487,7 +500,8 @@ def _get_local_replied_leads(workspace_id: int | None) -> list[dict]:
 async def sync_reply_queue(
     workspace_id: int | None = None,
     *,
-    auto_reply_positive: bool = False,  # future flag — always False for now
+    auto_reply_positive: bool = False,   # future flag — always False for now
+    auto_cleanup_stale: bool = True,     # archive stale records before syncing
 ) -> dict:
     """Sync opportunity replies from Instantly, classify, and draft responses.
 
@@ -525,6 +539,45 @@ async def sync_reply_queue(
         raise RuntimeError("No Instantly API key configured — cannot sync reply queue.")
 
     _ws_id = workspace_id if workspace_id is not None else get_default_workspace_id()
+
+    # --- Auto-cleanup: archive stale records before importing new ones ---
+    stale_archived = 0
+    if auto_cleanup_stale:
+        cleanup_result = archive_stale_threads(
+            _ws_id,
+            campaign_id=campaign_id,
+            dry_run=False,
+        )
+        stale_archived = cleanup_result.get("archived", 0)
+        log.info(
+            "reply_queue_auto_cleanup",
+            extra={
+                "workspace_id": _ws_id,
+                "stale_archived": stale_archived,
+                "preserved": cleanup_result.get("preserved", 0),
+            },
+        )
+
+    # --- Fetch reconciliation data from latest analytics snapshot ---
+    instantly_replied_count: int | None = None
+    instantly_opportunity_count: int | None = None
+    try:
+        from src.models import InstantlyAnalyticsSnapshot
+        with session_scope() as session:
+            snap = session.execute(
+                select(InstantlyAnalyticsSnapshot)
+                .where(InstantlyAnalyticsSnapshot.workspace_id == _ws_id)
+                .order_by(InstantlyAnalyticsSnapshot.synced_at.desc())
+            ).scalars().first()
+            if snap:
+                instantly_replied_count = snap.reply_count
+                instantly_opportunity_count = (
+                    snap.opportunity_count
+                    if snap.opportunity_count is not None
+                    else snap.positive_reply_count
+                )
+    except Exception as _snap_exc:
+        log.debug("reply_queue_snapshot_lookup_failed", extra={"error": str(_snap_exc)})
 
     # --- Phase 1: Instantly opportunity leads (status >= 3) ---
     total_leads_scanned = 0
@@ -709,6 +762,26 @@ async def sync_reply_queue(
             "missing_text": missing_text_count,
         },
     )
+    # --- Final active count for reconciliation ---
+    active_queue_count = 0
+    try:
+        with session_scope() as session:
+            active_queue_count = len(session.execute(
+                select(ReplyThread).where(
+                    ReplyThread.workspace_id == _ws_id,
+                    ReplyThread.status.in_(ACTIVE_STATUSES),
+                )
+            ).scalars().all())
+    except Exception:
+        pass
+
+    reconciliation_warning = None
+    if instantly_replied_count is not None and active_queue_count > instantly_replied_count + 2:
+        reconciliation_warning = (
+            f"Reply Agent has {active_queue_count} active record(s) but Instantly "
+            f"reports only {instantly_replied_count} total replies. Run cleanup."
+        )
+
     return {
         "total_leads_scanned": total_leads_scanned,
         "opportunity_leads_found": len(candidates) - local_added,
@@ -722,15 +795,146 @@ async def sync_reply_queue(
         "missing_text": missing_text_count,
         "skipped": skipped_count,
         "errors": error_count,
+        "stale_archived": stale_archived,
         "api_key_source": api_key_source,
         "debug_text_sources": debug_text_sources,
         "debug_skipped_signals": debug_skipped_signals,
+        # Reconciliation
+        "instantly_replied_count": instantly_replied_count,
+        "instantly_opportunity_count": instantly_opportunity_count,
+        "active_queue_count": active_queue_count,
+        "reconciliation_warning": reconciliation_warning,
     }
 
 
 # ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
+
+def archive_stale_threads(
+    workspace_id: int | None = None,
+    *,
+    campaign_id: str | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Archive ALL stale/bad Reply Agent records for this workspace.
+
+    This is the comprehensive one-click cleanup. A record is stale if ANY of:
+      1. inbound_reply_text starts with the placeholder prefix
+         "[Reply text not available" — these are records created when the
+         API returned no reply body (any status including needs_human_review).
+      2. status = skipped — normalize to archived for clarity.
+      3. campaign_id is set AND doesn't match the given campaign_id — stale
+         records from a previous campaign configuration.
+      4. status = needs_human_review AND inbound_reply_text is placeholder —
+         the root cause of the 404 needs_human_review accumulation.
+
+    Sent records are ALWAYS preserved.
+    Records with real reply text and a positive classification are preserved.
+
+    Parameters:
+      campaign_id: if provided, also archive records whose campaign_id
+                   doesn't match (wrong-campaign stale records).
+      dry_run:     if True, counts without writing.
+
+    Returns:
+      archived: int       — records updated to status=archived
+      preserved: int      — records with real reply text, kept
+      sent_preserved: int — sent records, always kept
+      total_before: int   — total records before cleanup
+      active_after: int   — active (non-archived/non-skipped) records remaining
+      dry_run: bool
+    """
+    from src.workspace import get_default_workspace_id
+    _ws_id = workspace_id if workspace_id is not None else get_default_workspace_id()
+
+    archived = 0
+    preserved = 0
+    sent_preserved = 0
+
+    with session_scope() as session:
+        rows = session.execute(
+            select(ReplyThread).where(ReplyThread.workspace_id == _ws_id)
+        ).scalars().all()
+        total_before = len(rows)
+
+        for row in rows:
+            # Always preserve sent records
+            if row.status == STATUS_SENT:
+                sent_preserved += 1
+                continue
+
+            # Already archived — count but skip re-writing
+            if row.status == STATUS_ARCHIVED:
+                archived += 1  # already done
+                continue
+
+            text = row.inbound_reply_text or ""
+            is_placeholder = text.startswith(_PLACEHOLDER_PREFIX)
+
+            # Wrong campaign — stale record from old configuration
+            wrong_campaign = (
+                campaign_id is not None
+                and (row.campaign_id or "").strip() != campaign_id.strip()
+            )
+
+            # Needs-human with placeholder text — root cause of the 404 accumulation
+            needs_human_with_placeholder = (
+                row.status == STATUS_NEEDS_HUMAN and is_placeholder
+            )
+
+            # Any placeholder regardless of status
+            # Missing-text records that don't have real body
+            any_placeholder = is_placeholder
+
+            # Skipped — normalize to archived
+            is_skipped = row.status == STATUS_SKIPPED
+
+            should_archive = (
+                any_placeholder
+                or wrong_campaign
+                or needs_human_with_placeholder
+                or is_skipped
+            )
+
+            if should_archive:
+                archived += 1
+                if not dry_run:
+                    row.status = STATUS_ARCHIVED
+                    note = "Archived: stale/bad Reply Agent import — no real reply body or wrong campaign."
+                    row.human_review_notes = (note + " " + (row.human_review_notes or "")).strip()[:500]
+            else:
+                preserved += 1
+
+    active_after = 0
+    if not dry_run:
+        with session_scope() as session:
+            active_after = session.execute(
+                select(ReplyThread).where(
+                    ReplyThread.workspace_id == _ws_id,
+                    ReplyThread.status.in_(ACTIVE_STATUSES),
+                )
+            ).scalars().all().__len__()
+
+    log.info(
+        "stale_threads_archived",
+        extra={
+            "workspace_id": _ws_id,
+            "archived": archived,
+            "preserved": preserved,
+            "total_before": total_before,
+            "dry_run": dry_run,
+        },
+    )
+    return {
+        "archived": archived,
+        "preserved": preserved,
+        "sent_preserved": sent_preserved,
+        "total_before": total_before,
+        "active_after": active_after,
+        "dry_run": dry_run,
+    }
+
 
 def archive_placeholder_threads(
     workspace_id: int | None = None,
@@ -770,9 +974,9 @@ def archive_placeholder_threads(
             if is_placeholder:
                 archived += 1
                 if not dry_run:
-                    row.status = STATUS_SKIPPED
+                    row.status = STATUS_ARCHIVED
                     note = "Archived: placeholder — reply body was not available when this record was created."
-                    row.human_review_notes = (note + " " + (row.human_review_notes or "")).strip()
+                    row.human_review_notes = (note + " " + (row.human_review_notes or "")).strip()[:500]
             else:
                 preserved_real += 1
 
@@ -829,9 +1033,9 @@ def archive_non_opportunity_threads(
             else:
                 archived += 1
                 if not dry_run:
-                    row.status = STATUS_SKIPPED
+                    row.status = STATUS_ARCHIVED
                     note = "Archived: not_actual_opportunity — imported when sync filter was too broad."
-                    row.human_review_notes = (note + " " + (row.human_review_notes or "")).strip()
+                    row.human_review_notes = (note + " " + (row.human_review_notes or "")).strip()[:500]
 
     return {
         "archived": archived,
@@ -850,9 +1054,12 @@ def get_reply_queue(
     workspace_id: int | None = None,
     *,
     status_filter: list[str] | None = None,
+    include_archived: bool = False,
 ) -> list[dict]:
     """Return ReplyThreads for the workspace, newest first.
 
+    By default, archived and skipped records are excluded.
+    Pass include_archived=True to see everything (for audit/debug).
     status_filter: if provided, only return records with matching status.
     """
     from src.workspace import get_default_workspace_id
@@ -861,6 +1068,9 @@ def get_reply_queue(
         q = select(ReplyThread).where(ReplyThread.workspace_id == _ws_id)
         if status_filter:
             q = q.where(ReplyThread.status.in_(status_filter))
+        elif not include_archived:
+            # Default: exclude archived and skipped
+            q = q.where(ReplyThread.status.not_in([STATUS_ARCHIVED, STATUS_SKIPPED]))
         rows = session.execute(
             q.order_by(
                 ReplyThread.reply_received_at.desc().nullslast(),
