@@ -37,7 +37,9 @@
       "Bash(py -m pytest tests/test_workspace_phase4.py -q --tb=short)",
       "Bash(py -m pytest tests/ -q --ignore=tests/test_llm_live.py --ignore=tests/test_ingest_writer.py --tb=short)",
       "Bash(py *)",
-      "Bash(git checkout *)"
+      "Bash(git checkout *)",
+      "Bash(grep -E \"\\\\.py$|^d\")",
+      "WebFetch(domain:leads.osp.tools)"
     ]
   }
 }

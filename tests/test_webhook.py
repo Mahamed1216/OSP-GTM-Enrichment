@@ -36,6 +36,7 @@ from src.feedback.reply_sync import (
     STATUS_SENT,
     STATUS_SKIPPED,
 )
+STATUS_NEEDS_HUMAN_REVIEW = STATUS_NEEDS_HUMAN  # alias used in new tests
 from src.models import ReplyThread
 from src.webhook.server import app
 from src.workspace import create_workspace, seed_default_workspace
@@ -349,6 +350,107 @@ def test_no_auto_send(monkeypatch):
     assert body["ok"] is True
 
     assert send_calls == [], "Webhook handler must never auto-send replies"
+
+    with session_scope() as session:
+        t = session.get(ReplyThread, body["reply_thread_id"])
+        assert t is not None
+        assert t.sent_at is None
+        assert t.status != STATUS_SENT
+
+
+# ---------------------------------------------------------------------------
+# Test 11: AI failure — record is still saved with reply body intact
+# ---------------------------------------------------------------------------
+
+def test_ai_failure_saves_record(monkeypatch):
+    _seed()
+
+    async def _raise(**kwargs):
+        raise RuntimeError("Anthropic API 503")
+
+    monkeypatch.setattr(handler_mod, "classify_and_draft_reply", _raise)
+
+    payload = {**_BASE_PAYLOAD, "thread_id": "thread-ai-fail-1"}
+    resp = client.post("/api/instantly/reply-webhook", json=payload, headers=VALID_HEADERS)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["reply_thread_id"] is not None
+
+    with session_scope() as session:
+        t = session.get(ReplyThread, body["reply_thread_id"])
+        assert t is not None
+        assert t.inbound_reply_text == payload["reply_body"]
+
+
+# ---------------------------------------------------------------------------
+# Test 12: AI failure returns ok=True with ai_failed=True
+# ---------------------------------------------------------------------------
+
+def test_ai_failure_returns_ok_with_ai_failed(monkeypatch):
+    _seed()
+
+    async def _raise(**kwargs):
+        raise ConnectionError("Network timeout")
+
+    monkeypatch.setattr(handler_mod, "classify_and_draft_reply", _raise)
+
+    payload = {**_BASE_PAYLOAD, "thread_id": "thread-ai-fail-2"}
+    resp = client.post("/api/instantly/reply-webhook", json=payload, headers=VALID_HEADERS)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["ai_failed"] is True
+    assert body["reply_thread_id"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Test 13: AI failure sets status to needs_human_review
+# ---------------------------------------------------------------------------
+
+def test_ai_failure_sets_needs_human_review(monkeypatch):
+    _seed()
+
+    async def _raise(**kwargs):
+        raise ValueError("API key invalid")
+
+    monkeypatch.setattr(handler_mod, "classify_and_draft_reply", _raise)
+
+    payload = {**_BASE_PAYLOAD, "thread_id": "thread-ai-fail-3"}
+    resp = client.post("/api/instantly/reply-webhook", json=payload, headers=VALID_HEADERS)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == STATUS_NEEDS_HUMAN
+
+    with session_scope() as session:
+        t = session.get(ReplyThread, body["reply_thread_id"])
+        assert t is not None
+        assert t.status == STATUS_NEEDS_HUMAN
+        assert t.classification == "unclassified"
+        assert not (t.draft_body or "").strip()
+        assert "AI classification failed" in (t.human_review_notes or "")
+
+
+# ---------------------------------------------------------------------------
+# Test 14: AI failure — no auto send
+# ---------------------------------------------------------------------------
+
+def test_ai_failure_no_auto_send(monkeypatch):
+    _seed()
+
+    async def _raise(**kwargs):
+        raise RuntimeError("classification exploded")
+
+    monkeypatch.setattr(handler_mod, "classify_and_draft_reply", _raise)
+
+    payload = {**_BASE_PAYLOAD, "thread_id": "thread-ai-fail-4"}
+    resp = client.post("/api/instantly/reply-webhook", json=payload, headers=VALID_HEADERS)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
 
     with session_scope() as session:
         t = session.get(ReplyThread, body["reply_thread_id"])

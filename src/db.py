@@ -35,6 +35,7 @@ def is_db_initialized() -> bool:
 _RUNTIME_NEW_TABLES: tuple[str, ...] = (
     "reply_drafts",
     "reply_threads",
+    "lead_source_imports",   # Phase 7: external lead source import log
 )
 
 
@@ -137,6 +138,21 @@ _RUNTIME_COLUMN_ADDS: list[tuple[str, str, str]] = [
     ("instantly_analytics_snapshots", "workspace_id", "INTEGER"),
     ("prompt_recommendations", "workspace_id", "INTEGER"),
     ("prompt_configs", "workspace_id", "INTEGER"),
+    # Phase 7: external lead source API integration.
+    # lead_source_config stores the per-workspace settings JSON (base URL,
+    # api_key, client_slug, fetch limit, default filters, last fetch metadata).
+    ("workspaces", "lead_source_config", "JSON"),
+    # Lead-level source provenance columns.
+    ("leads", "external_contact_id", "VARCHAR(256)"),  # primary dedup key (API UUID)
+    ("leads", "external_source", "VARCHAR(64)"),        # "osp_lead_engine"
+    ("leads", "external_client_slug", "VARCHAR(128)"),  # client slug at import time
+    ("leads", "phone", "VARCHAR(64)"),                  # mobile_phone from external API
+    ("leads", "lead_source_raw", "JSON"),               # full ContactOut payload
+    # Import log extended fields.
+    ("lead_source_imports", "base_url", "VARCHAR(512)"),
+    ("lead_source_imports", "icp_filter", "VARCHAR(128)"),
+    ("lead_source_imports", "status_filter", "VARCHAR(64)"),
+    ("lead_source_imports", "include_suppressed", "BOOLEAN DEFAULT FALSE"),
 ]
 
 # Postgres-only column widenings. SQLite ignores VARCHAR length caps so

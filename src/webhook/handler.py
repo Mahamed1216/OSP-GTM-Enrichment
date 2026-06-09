@@ -19,9 +19,10 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from src.db import session_scope
-from src.feedback.reply_agent import classify_and_draft_reply
+from src.feedback.reply_agent import ACTION_HUMAN, ReplyAgentResult, classify_and_draft_reply
 from src.feedback.reply_sync import (
     STATUS_MISSING_TEXT,
+    STATUS_NEEDS_HUMAN,
     STATUS_NEEDS_REVIEW,
     STATUS_SKIPPED,
     _classification_to_status,
@@ -68,6 +69,9 @@ class WebhookResult(BaseModel):
     lead_id: int | None = None
     classification: str | None = None
     detail: str | None = None
+    ai_failed: bool = False
+    anthropic_key_present: bool | None = None
+    anthropic_key_prefix: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +154,19 @@ def _find_or_create_lead(
             extra={"email": email_clean, "workspace_id": workspace_id, "error": str(exc)},
         )
         return None
+
+
+# ---------------------------------------------------------------------------
+# Anthropic API key diagnostic (safe — never logs the actual key value)
+# ---------------------------------------------------------------------------
+
+def _anthropic_key_diagnostic() -> dict:
+    """Return safe presence/prefix info for the Anthropic API key."""
+    import os
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    present = bool(key)
+    prefix = key[:8] if len(key) >= 8 else None
+    return {"anthropic_key_present": present, "anthropic_key_prefix": prefix}
 
 
 # ---------------------------------------------------------------------------
@@ -280,29 +297,33 @@ async def handle_reply_webhook(payload: WebhookPayload) -> WebhookResult:
             lead_id=lead_db_id,
         )
 
-    # 8. Classify
+    # 8. Classify — if AI fails, save record anyway (never drop inbound replies)
+    key_diag = _anthropic_key_diagnostic()
+    ai_failed = False
+    safe_ai_error: str | None = None
     try:
         agent_result = await classify_and_draft_reply(
             inbound_reply=payload.reply_body,
             calendar_link=calendar_link,
             workspace_id=ws_id,
         )
+        auto_status = _classification_to_status(
+            agent_result.classification, agent_result.recommended_action
+        )
     except Exception as exc:
+        ai_failed = True
+        safe_ai_error = f"{type(exc).__name__}: {exc}"
         log.warning(
             "webhook_classify_failed",
-            extra={"email": email, "workspace_id": ws_id, "error": str(exc)},
+            extra={"email": email, "workspace_id": ws_id, "error": safe_ai_error, **key_diag},
         )
-        return WebhookResult(
-            ok=False,
-            status="failed",
-            workspace_id=ws_id,
-            lead_id=lead_db_id,
-            detail=f"Classification failed: {type(exc).__name__}: {exc}",
+        agent_result = ReplyAgentResult(
+            classification="unclassified",
+            recommended_action=ACTION_HUMAN,
+            draft_body="",
+            human_review_notes=f"AI classification failed: {type(exc).__name__}",
         )
-
-    auto_status = _classification_to_status(
-        agent_result.classification, agent_result.recommended_action
-    )
+        auto_status = STATUS_NEEDS_HUMAN
 
     # 9. Store classified thread
     thread_id: int | None = None
@@ -358,6 +379,9 @@ async def handle_reply_webhook(payload: WebhookPayload) -> WebhookResult:
         workspace_id=ws_id,
         lead_id=lead_db_id,
         classification=agent_result.classification,
+        ai_failed=ai_failed,
+        anthropic_key_present=key_diag["anthropic_key_present"],
+        anthropic_key_prefix=key_diag["anthropic_key_prefix"],
     )
 
 

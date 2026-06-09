@@ -77,6 +77,9 @@ class Workspace(Base):
     # backfill_osp_icp_config() which seeds the OSP workspace from the
     # existing data/icp_config.json file so OSP settings are never lost.
     icp_config: Mapped[Optional[dict]] = mapped_column(JSON)
+    # Phase 7: per-workspace external lead source API settings. Stores
+    # LeadSourceConfig as JSON. NULL means not yet configured.
+    lead_source_config: Mapped[Optional[dict]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=now_utc, onupdate=now_utc, nullable=False
@@ -110,6 +113,17 @@ class Lead(Base):
     # Phase 2: workspace scoping. Nullable so existing rows survive migration;
     # backfilled to the default OSP workspace id by init_db().
     workspace_id: Mapped[Optional[int]] = mapped_column(Integer, default=_default_workspace_id)
+    # Phase 7: external lead source fields.
+    # external_contact_id = UUID from the sourcing API (primary dedup key).
+    # external_source    = source system name, e.g. "osp_lead_engine".
+    # external_client_slug = client slug used when the contact was fetched.
+    # phone              = mobile/primary phone from the external record.
+    # lead_source_raw    = full ContactOut JSON for provenance.
+    external_contact_id: Mapped[Optional[str]] = mapped_column(String(256), index=True)
+    external_source: Mapped[Optional[str]] = mapped_column(String(64))
+    external_client_slug: Mapped[Optional[str]] = mapped_column(String(128))
+    phone: Mapped[Optional[str]] = mapped_column(String(64))
+    lead_source_raw: Mapped[Optional[dict]] = mapped_column(JSON)
 
     enrichment: Mapped[Optional["Enrichment"]] = relationship(
         back_populates="lead", uselist=False, cascade="all, delete-orphan"
@@ -412,7 +426,9 @@ class ReplyDraft(Base):
     __tablename__ = "reply_drafts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    workspace_id: Mapped[Optional[int]] = mapped_column(Integer, default=_default_workspace_id)
+    workspace_id: Mapped[Optional[int]] = mapped_column(
+        Integer, default=_default_workspace_id
+    )
     lead_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     inbound_reply: Mapped[str] = mapped_column(Text, nullable=False)
     original_outbound_email: Mapped[Optional[str]] = mapped_column(Text)
@@ -475,3 +491,35 @@ class ReplyThread(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=now_utc, onupdate=now_utc, nullable=False
     )
+
+
+class LeadSourceImport(Base):
+    """Audit record for one pull-based import from the external lead source API.
+
+    One row per operator-initiated fetch. Tracks counts (created / updated /
+    skipped / errors) so operators can audit the pipeline without digging into
+    logs. raw_summary holds the full ImportResult dict including per-reason
+    skip breakdowns.
+    """
+    __tablename__ = "lead_source_imports"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    workspace_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    source_name: Mapped[Optional[str]] = mapped_column(String(64))   # e.g. "osp_lead_engine"
+    base_url: Mapped[Optional[str]] = mapped_column(String(512))
+    client_slug: Mapped[Optional[str]] = mapped_column(String(128))
+    icp_filter: Mapped[Optional[str]] = mapped_column(String(128))
+    status_filter: Mapped[Optional[str]] = mapped_column(String(64))
+    include_suppressed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, nullable=False)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    # running | completed | failed
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    requested_limit: Mapped[Optional[int]] = mapped_column(Integer)
+    fetched_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_count: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[Optional[str]] = mapped_column(Text)
+    raw_summary: Mapped[Optional[dict]] = mapped_column(JSON)
