@@ -153,6 +153,12 @@ _RUNTIME_COLUMN_ADDS: list[tuple[str, str, str]] = [
     ("lead_source_imports", "icp_filter", "VARCHAR(128)"),
     ("lead_source_imports", "status_filter", "VARCHAR(64)"),
     ("lead_source_imports", "include_suppressed", "BOOLEAN DEFAULT FALSE"),
+    # Phase 8: evergreen automation — processing counts on the import log.
+    ("lead_source_imports", "auto_run", "BOOLEAN DEFAULT FALSE"),
+    ("lead_source_imports", "processed_count", "INTEGER DEFAULT 0"),
+    ("lead_source_imports", "scored_count", "INTEGER DEFAULT 0"),
+    ("lead_source_imports", "content_generated_count", "INTEGER DEFAULT 0"),
+    ("lead_source_imports", "enrichment_skipped_count", "INTEGER DEFAULT 0"),
 ]
 
 # Postgres-only column widenings. SQLite ignores VARCHAR length caps so

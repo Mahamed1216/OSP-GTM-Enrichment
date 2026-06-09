@@ -26,11 +26,23 @@ class LeadSourceConfig(BaseModel):
     client_slug: str = ""
     daily_fetch_limit: int = 25
     # Optional per-workspace defaults for contact filtering.
-    # Passed as query params when fetching contacts; empty string = no filter.
     default_icp: str = ""
     default_status_filter: str = ""
     include_suppressed: bool = False
-    # Updated after each import run.
+    # Phase 8: evergreen automation settings.
+    # auto_import_enabled: pull new contacts on each scheduled run.
+    # auto_process_enabled: score + generate content for newly imported leads.
+    # schedule_frequency: hint for the operator — actual scheduling is external
+    #   (Render Cron / GitHub Actions calling the CLI or webhook endpoint).
+    auto_import_enabled: bool = False
+    auto_process_enabled: bool = False
+    schedule_frequency: str = "daily"   # "manual" | "hourly" | "daily"
+    last_auto_run_at: Optional[str] = None
+    last_auto_run_status: Optional[str] = None
+    last_auto_run_created: Optional[int] = None
+    last_auto_run_scored: Optional[int] = None
+    last_auto_run_content: Optional[int] = None
+    # Updated after each manual or auto import run.
     last_fetched_at: Optional[str] = None
     last_fetch_status: Optional[str] = None
     last_fetch_result_count: Optional[int] = None
@@ -91,6 +103,31 @@ def update_fetch_metadata(
     except Exception as exc:
         log.warning(
             "update_fetch_metadata_failed",
+            extra={"workspace_id": workspace_id, "error": str(exc)},
+        )
+
+
+def update_auto_run_metadata(
+    workspace_id: int,
+    *,
+    status: str,
+    created: int = 0,
+    scored: int = 0,
+    content: int = 0,
+    ran_at: Optional[str] = None,
+) -> None:
+    """Persist last_auto_run_* fields after an evergreen scheduler run."""
+    try:
+        cfg = load_lead_source_config(workspace_id)
+        cfg.last_auto_run_at = ran_at or datetime.utcnow().isoformat()
+        cfg.last_auto_run_status = status
+        cfg.last_auto_run_created = created
+        cfg.last_auto_run_scored = scored
+        cfg.last_auto_run_content = content
+        save_lead_source_config(cfg, workspace_id)
+    except Exception as exc:
+        log.warning(
+            "update_auto_run_metadata_failed",
             extra={"workspace_id": workspace_id, "error": str(exc)},
         )
 

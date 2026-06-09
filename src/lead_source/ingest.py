@@ -47,6 +47,7 @@ class ImportResult:
         self.errors: int = 0
         self.skip_reasons: dict[str, int] = {}
         self.created_lead_ids: list[int] = []
+        self.import_log_id: int | None = None   # set by run_import; for log updates
 
     def bump_skip(self, reason: str) -> None:
         self.skipped += 1
@@ -267,6 +268,7 @@ def start_import_log(
     icp_filter: str | None = None,
     status_filter: str | None = None,
     include_suppressed: bool = False,
+    auto_run: bool = False,
 ) -> int:
     """Create a LeadSourceImport row and return its id."""
     from src.models import LeadSourceImport
@@ -279,6 +281,7 @@ def start_import_log(
             icp_filter=icp_filter or None,
             status_filter=status_filter or None,
             include_suppressed=include_suppressed,
+            auto_run=auto_run,
             started_at=datetime.utcnow(),
             status="running",
             requested_limit=requested_limit,
@@ -305,6 +308,30 @@ def _finish_import(import_id: int, result: ImportResult) -> None:
     except Exception as exc:
         log.warning(
             "lead_source_finish_import_failed",
+            extra={"import_id": import_id, "error": str(exc)},
+        )
+
+
+def _update_import_log_processing(
+    import_id: int,
+    *,
+    scored_count: int = 0,
+    content_generated_count: int = 0,
+    enrichment_skipped_count: int = 0,
+) -> None:
+    """Update processing counts on the import log after auto-processing completes."""
+    from src.models import LeadSourceImport
+    try:
+        with session_scope() as session:
+            imp = session.get(LeadSourceImport, import_id)
+            if imp:
+                imp.processed_count = scored_count + content_generated_count
+                imp.scored_count = scored_count
+                imp.content_generated_count = content_generated_count
+                imp.enrichment_skipped_count = enrichment_skipped_count
+    except Exception as exc:
+        log.warning(
+            "lead_source_update_processing_log_failed",
             extra={"import_id": import_id, "error": str(exc)},
         )
 
@@ -338,6 +365,7 @@ def run_import(
     include_suppressed: bool = False,
     created_after: str | None = None,
     created_before: str | None = None,
+    auto_run: bool = False,
 ) -> ImportResult:
     """Full import flow: log → paginated fetch → ingest → update workspace metadata.
 
@@ -354,6 +382,7 @@ def run_import(
         icp_filter=icp,
         status_filter=status_filter,
         include_suppressed=include_suppressed,
+        auto_run=auto_run,
     )
 
     try:
@@ -389,6 +418,7 @@ def run_import(
         client_slug=client_slug,
         import_id=import_id,
     )
+    result.import_log_id = import_id
 
     update_fetch_metadata(
         workspace_id,

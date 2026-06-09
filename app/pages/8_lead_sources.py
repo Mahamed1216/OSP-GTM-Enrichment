@@ -1,20 +1,14 @@
 """Lead Sources — connect each workspace to the OSP Lead Engine API.
 
-Pull-based import from:  GET /api/v1/clients/{slug}/contacts
-Auth:                    Authorization: Bearer <api_key>
-Test connection:         GET /api/v1/health  →  GET /api/v1/clients/{slug}
-Preview:                 fetch without importing (no DB writes)
+Phase 7: Pull-based import + preview.
+Phase 8: Evergreen automation — scheduled import + auto score + content.
 
-Phase 7 scope — explicitly excluded:
-- POST /api/v1/clients/{slug}/runs (sourcing triggers) — not in this phase
-- Auto-pipeline after import
-- Auto-send or Instantly push
-- Overwriting existing lead fields
+Auto-process skips enrichment entirely (OSP Lead Engine pre-enriches contacts).
+No emails auto-sent. No Instantly push. No POST /runs called.
 
-Security:
-- API key stored in workspace row; masked in UI (last 4 chars only)
-- NEVER log the bearer token
-- Recommend rotating key if it was shared over Slack
+Scheduling is external:
+  Option A CLI: python -m src.lead_source.scheduler --workspace-id N
+  Option B HTTP: POST /api/lead-source/run-scheduled  X-Job-Secret: ...
 """
 from __future__ import annotations
 
@@ -33,6 +27,7 @@ from app.styles import inject_styles
 from src.db import ensure_tables
 from src.lead_source.client import LeadSourceClient
 from src.lead_source.ingest import get_recent_imports, preview_contacts, run_import
+from src.lead_source.scheduler import run_import_and_process_sync
 from src.lead_source.settings import (
     LeadSourceConfig,
     load_lead_source_config,
@@ -128,6 +123,15 @@ if save_clicked:
         default_status_filter=default_status,
         include_suppressed=include_suppressed,
         daily_fetch_limit=int(daily_fetch_limit),
+        # preserve automation fields (edited in the section below)
+        auto_import_enabled=cfg.auto_import_enabled,
+        auto_process_enabled=cfg.auto_process_enabled,
+        schedule_frequency=cfg.schedule_frequency,
+        last_auto_run_at=cfg.last_auto_run_at,
+        last_auto_run_status=cfg.last_auto_run_status,
+        last_auto_run_created=cfg.last_auto_run_created,
+        last_auto_run_scored=cfg.last_auto_run_scored,
+        last_auto_run_content=cfg.last_auto_run_content,
         last_fetched_at=cfg.last_fetched_at,
         last_fetch_status=cfg.last_fetch_status,
         last_fetch_result_count=cfg.last_fetch_result_count,
@@ -369,7 +373,162 @@ else:
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Section 7 — Pipeline handoff
+# Section 7 — Evergreen automation (Phase 8)
+# ---------------------------------------------------------------------------
+st.subheader("Evergreen automation")
+st.caption(
+    "When enabled, a scheduled job (Render Cron / GitHub Actions) runs "
+    "`python -m src.lead_source.scheduler` to import + process new contacts. "
+    "Scoring and content generation run; enrichment is skipped (OSP Lead Engine "
+    "pre-enriches contacts). No emails are sent automatically."
+)
+
+with st.form("automation_settings_form"):
+    auto_import = st.checkbox(
+        "Enable scheduled import",
+        value=cfg.auto_import_enabled,
+        help="When checked, the scheduler will fetch new contacts for this workspace.",
+    )
+    auto_process = st.checkbox(
+        "Enable auto score + content generation for newly imported leads",
+        value=cfg.auto_process_enabled,
+        help="After import, run scoring and content generation. Enrichment is skipped.",
+    )
+    freq = st.selectbox(
+        "Schedule frequency (hint — actual scheduling is external)",
+        options=["manual", "daily", "hourly"],
+        index=["manual", "daily", "hourly"].index(
+            cfg.schedule_frequency if cfg.schedule_frequency in ("manual", "daily", "hourly") else "daily"
+        ),
+    )
+    auto_save = st.form_submit_button("Save automation settings")
+
+if auto_save:
+    updated_auto = LeadSourceConfig(
+        **{
+            **cfg.model_dump(),
+            "auto_import_enabled": auto_import,
+            "auto_process_enabled": auto_process,
+            "schedule_frequency": freq,
+        }
+    )
+    try:
+        save_lead_source_config(updated_auto, ws_id)
+        cfg = updated_auto
+        st.success("Automation settings saved.")
+    except Exception as exc:
+        st.error(f"Save failed: {exc}")
+
+# Last auto run summary
+if cfg.last_auto_run_at:
+    ac1, ac2, ac3, ac4 = st.columns(4)
+    ac1.metric("Last auto run", str(cfg.last_auto_run_at)[:16])
+    ac2.metric("Status", cfg.last_auto_run_status or "—")
+    ac3.metric("Created", cfg.last_auto_run_created or 0)
+    ac4.metric("Scored / Content", f"{cfg.last_auto_run_scored or 0} / {cfg.last_auto_run_content or 0}")
+
+st.divider()
+
+# Buttons
+_can_run = bool(cfg.enabled and cfg.api_base_url and cfg.client_slug and cfg.api_key)
+
+bcol1, bcol2, bcol3 = st.columns(3)
+
+with bcol1:
+    if st.button(
+        "Run import now",
+        disabled=not _can_run,
+        key="btn_manual_import",
+        help="Fetch and import new contacts only. No scoring or content generation.",
+    ):
+        with st.spinner("Importing…"):
+            try:
+                r = run_import(
+                    ws_id,
+                    cfg.client_slug,
+                    cfg.api_base_url,
+                    cfg.api_key,
+                    limit=cfg.daily_fetch_limit,
+                    icp=cfg.default_icp or None,
+                    status_filter=cfg.default_status_filter or None,
+                    include_suppressed=cfg.include_suppressed,
+                )
+                st.session_state["lead_source_imported_ids"] = r.created_lead_ids
+                st.success(
+                    f"Import done — fetched {r.fetched}, created {r.created}, "
+                    f"skipped {r.skipped}."
+                )
+                cfg = load_lead_source_config(ws_id)
+            except Exception as exc:
+                st.error(f"Import failed: {exc}")
+
+with bcol2:
+    if st.button(
+        "Run import + process now",
+        disabled=not _can_run,
+        key="btn_manual_import_process",
+        type="primary",
+        help="Import new contacts, then score and generate content. Enrichment skipped.",
+    ):
+        with st.spinner("Importing and processing (may take a few minutes)…"):
+            try:
+                result = run_import_and_process_sync(ws_id)
+                if result.get("skipped"):
+                    st.warning(f"Skipped: {result.get('reason')}")
+                else:
+                    st.session_state["lead_source_imported_ids"] = []
+                    st.success(
+                        f"Done — created {result.get('created',0)}, "
+                        f"scored {result.get('scored_count',0)}, "
+                        f"content {result.get('content_generated_count',0)}, "
+                        f"enrichment skipped {result.get('enrichment_skipped_count',0)}."
+                    )
+                cfg = load_lead_source_config(ws_id)
+            except Exception as exc:
+                st.error(f"Run failed: {exc}")
+
+with bcol3:
+    if st.button(
+        "Preview next batch",
+        disabled=not _can_run,
+        key="btn_preview_next",
+        help="Show what the next scheduled import would fetch (no DB writes).",
+    ):
+        with st.spinner("Fetching preview…"):
+            try:
+                rows = preview_contacts(
+                    ws_id, cfg.client_slug, cfg.api_base_url, cfg.api_key,
+                    limit=cfg.daily_fetch_limit,
+                    icp=cfg.default_icp or None,
+                    status_filter=cfg.default_status_filter or None,
+                    include_suppressed=cfg.include_suppressed,
+                )
+                if rows:
+                    st.dataframe(
+                        pd.DataFrame([{
+                            "ID": c.get("id",""), "Name": f"{c.get('first_name','')} {c.get('last_name','')}".strip(),
+                            "Email": c.get("email",""), "Company": c.get("company_name",""),
+                            "ICP": c.get("icp",""), "Tier": c.get("tier",""),
+                            "Status": c.get("enrichment_status",""),
+                        } for c in rows]),
+                        use_container_width=True,
+                    )
+                    st.caption(f"{len(rows)} contacts in next batch — not imported.")
+                else:
+                    st.info("No contacts matched the current filters.")
+            except Exception as exc:
+                st.error(f"Preview failed: {exc}")
+
+st.caption(
+    "True scheduling requires an external trigger. "
+    "CLI: `python -m src.lead_source.scheduler --workspace-id N`  |  "
+    "HTTP: `POST /api/lead-source/run-scheduled` (webhook server)."
+)
+
+st.divider()
+
+# ---------------------------------------------------------------------------
+# Section 8 — Pipeline handoff
 # ---------------------------------------------------------------------------
 st.subheader("Run pipeline for imported leads")
 

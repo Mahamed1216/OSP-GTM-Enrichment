@@ -523,3 +523,9 @@ class LeadSourceImport(Base):
     error_count: Mapped[int] = mapped_column(Integer, default=0)
     error_message: Mapped[Optional[str]] = mapped_column(Text)
     raw_summary: Mapped[Optional[dict]] = mapped_column(JSON)
+    # Phase 8: evergreen automation fields.
+    auto_run: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    processed_count: Mapped[int] = mapped_column(Integer, default=0)
+    scored_count: Mapped[int] = mapped_column(Integer, default=0)
+    content_generated_count: Mapped[int] = mapped_column(Integer, default=0)
+    enrichment_skipped_count: Mapped[int] = mapped_column(Integer, default=0)
