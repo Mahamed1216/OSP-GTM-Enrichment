@@ -181,12 +181,13 @@ def backfill_osp_icp_config(force: bool = False) -> bool:
             should_backfill = force
 
             if ws.icp_config is None:
+                # First-time deploy or genuinely blank — seed from file.
                 should_backfill = True
-            elif _icp_mod.is_default_icp_config(ws.icp_config):
-                # Stored value is just code defaults — real data lives in the file.
-                should_backfill = True
-                old_name = ws.icp_config.get("company", {}).get("name", "—")
             else:
+                # Any non-NULL value is treated as intentionally saved (by the UI
+                # or a prior backfill). Startup never overwrites it, even if the
+                # stored value happens to equal the code-placeholder defaults.
+                # Use force=True only for an explicit operator restore action.
                 old_name = ws.icp_config.get("company", {}).get("name", "—")
 
             if not should_backfill:

@@ -160,6 +160,12 @@ engagement = st.Page(
     icon="📬",
     url_path="engagement",
 )
+lead_sources_page = st.Page(
+    str(_PAGES_DIR / "8_lead_sources.py"),
+    title="Lead Sources",
+    icon="🌐",
+    url_path="lead-sources",
+)
 prompts_page = st.Page(
     str(_PAGES_DIR / "7_prompts.py"),
     title="Prompts",
@@ -167,5 +173,9 @@ prompts_page = st.Page(
     url_path="prompts",
 )
 
-nav = st.navigation([dashboard, leads, lead_detail, run_pipeline, settings_page, engagement, prompts_page])
+nav = st.navigation([
+    dashboard, leads, lead_detail, run_pipeline,
+    lead_sources_page,
+    engagement, settings_page, prompts_page,
+])
 nav.run()

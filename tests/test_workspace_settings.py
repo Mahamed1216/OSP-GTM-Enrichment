@@ -259,24 +259,31 @@ class TestBackfillOspIcpConfig:
         loaded = load_workspace_icp_config(workspace_id=osp_id)
         assert loaded.company.name == "Real OSP Data"
 
-    def test_backfill_overwrites_defaults_with_file_data(self, tmp_path, monkeypatch):
-        """If DB has only code defaults, treat as not-yet-set and backfill from file."""
+    def test_backfill_preserves_code_defaults_when_explicitly_stored(self, tmp_path, monkeypatch):
+        """Non-NULL icp_config is never overwritten by backfill, even if it equals code defaults.
+
+        The old behaviour (overwrite code-defaults with file data) caused settings
+        to reset on every reboot when the user hadn't changed anything.  The fix:
+        any non-NULL value is treated as intentionally saved and preserved.
+        """
         osp_id = _seed_osp()
-        # Store code defaults in DB (simulates accidental seeding with defaults).
+        # Explicitly store code defaults in DB (simulates a fresh UI save without edits).
         from src.models import Workspace
         with session_scope() as session:
             ws = session.get(Workspace, osp_id)
             ws.icp_config = default_icp_config().model_dump()
 
         config_file = tmp_path / "icp_config.json"
-        _write_fake_cfg(config_file, "Real OSP From File")
+        _write_fake_cfg(config_file, "Should Not Overwrite")
         _patch_config_path(monkeypatch, config_file)
 
         result = backfill_osp_icp_config()
-        assert result is True
+        # Backfill must be skipped — icp_config is not NULL.
+        assert result is False
 
         loaded = load_workspace_icp_config(workspace_id=osp_id)
-        assert loaded.company.name == "Real OSP From File"
+        # The stored value (code defaults) must be preserved, not replaced by the file.
+        assert loaded.company.name == default_icp_config().company.name
 
     def test_backfill_force_overwrites_real_data(self, tmp_path, monkeypatch):
         """force=True always overwrites even when non-default data is present."""
