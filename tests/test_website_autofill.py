@@ -1,0 +1,375 @@
+"""Phase 9 tests: website autofill settings.
+
+11 required tests:
+  1.  Website analysis creates suggested settings but does not save automatically
+  2.  Apply suggested settings saves only after explicit call to save_workspace_icp_config
+  3.  Only checked fields are saved
+  4.  Existing unchecked fields are preserved
+  5.  Suggestions save to selected workspace only
+  6.  OSP settings do not leak to Test Client
+  7.  Test Client settings do not leak to OSP
+  8.  Prompt configs are not modified by analysis or apply
+  9.  init_db/reboot does not trigger website autofill
+  10. Failed website fetch does not overwrite settings
+  11. API keys or secrets are not exposed in apply output
+"""
+from __future__ import annotations
+
+import pathlib
+
+import httpx
+import pytest
+from sqlalchemy import func, select
+
+from src.db import session_scope
+from src.icp_config import (
+    BuyerPersona,
+    CompanyProfile,
+    ICPConfig,
+    ICPDefinition,
+    IntentSignals,
+    default_icp_config,
+    load_workspace_icp_config,
+    save_workspace_icp_config,
+)
+from src.models import PromptConfig
+from src.website_analyzer import (
+    AnalysisResult,
+    WebsiteSuggestions,
+    analyze_website_async,
+    apply_suggestions_to_config,
+)
+from src.workspace import (
+    backfill_osp_icp_config,
+    create_workspace,
+    get_default_workspace_id,
+    seed_default_workspace,
+)
+
+_PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _seed_osp() -> int:
+    seed_default_workspace()
+    ws_id = get_default_workspace_id()
+    assert ws_id is not None
+    return ws_id
+
+
+def _cfg(name: str) -> ICPConfig:
+    c = default_icp_config()
+    c.company = CompanyProfile(name=name, one_liner="original")
+    return c
+
+
+def _suggestions(**overrides) -> WebsiteSuggestions:
+    base = dict(
+        company_name="Acme Inc",
+        one_liner="Helps B2B SaaS teams automate outbound prospecting",
+        value_props=["Lead enrichment", "Personalized messaging"],
+        differentiators=["AI-powered", "Plug-and-play"],
+        target_industries=["B2B SaaS", "Fintech"],
+        target_company_sizes=["50-500 employees"],
+        target_company_stages=["Series A", "Series B"],
+        target_tech_stack_signals=["Salesforce", "HubSpot"],
+        target_geographies=["US", "Canada"],
+        target_titles=["VP of Sales", "CRO"],
+        seniority_levels=["VP", "Director"],
+        departments=["Sales", "RevOps"],
+        top_pain_points=["manual prospecting", "low reply rates"],
+        common_objections=["already have a tool"],
+        positive_signals=["hiring SDRs", "Series B funding"],
+        disqualifiers=["B2C only"],
+        news_search_terms=["outbound sales", "SDR automation"],
+    )
+    base.update(overrides)
+    return WebsiteSuggestions(**base)
+
+
+# ---------------------------------------------------------------------------
+# 1. Analysis does not auto-save
+# ---------------------------------------------------------------------------
+
+async def test_analysis_does_not_auto_save(monkeypatch):
+    ws_id = _seed_osp()
+    save_workspace_icp_config(_cfg("Original Name"), workspace_id=ws_id)
+
+    async def _mock_fetch(url):
+        return "Acme Inc", "Acme helps B2B SaaS teams automate outbound."
+
+    async def _mock_llm(content, url, notes):
+        from src.website_analyzer import _LLMOutput
+        return _LLMOutput(company_name="Should Not Save", one_liner="Test")
+
+    import src.website_analyzer as _wa
+    monkeypatch.setattr(_wa, "_fetch_html", _mock_fetch)
+    monkeypatch.setattr(_wa, "_call_llm", _mock_llm)
+
+    result = await analyze_website_async("https://acme.com")
+
+    assert result.error is None
+    assert result.suggestions.company_name == "Should Not Save"
+
+    loaded = load_workspace_icp_config(workspace_id=ws_id)
+    assert loaded.company.name == "Original Name", (
+        "analyze_website_async must not auto-save to the DB"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. Apply requires explicit save call
+# ---------------------------------------------------------------------------
+
+def test_apply_requires_explicit_save_call():
+    ws_id = _seed_osp()
+    save_workspace_icp_config(_cfg("Pre-Apply Name"), workspace_id=ws_id)
+
+    suggestions = _suggestions(company_name="Post-Apply Name")
+    cfg = load_workspace_icp_config(workspace_id=ws_id)
+
+    # apply_suggestions_to_config returns a new config but does NOT touch the DB
+    updated = apply_suggestions_to_config(cfg, suggestions, {"company_name"})
+
+    # DB unchanged
+    db_val = load_workspace_icp_config(workspace_id=ws_id)
+    assert db_val.company.name == "Pre-Apply Name", (
+        "apply_suggestions_to_config must not write to the DB — caller must save explicitly"
+    )
+
+    # Explicit save applies the change
+    save_workspace_icp_config(updated, workspace_id=ws_id)
+    assert load_workspace_icp_config(workspace_id=ws_id).company.name == "Post-Apply Name"
+
+
+# ---------------------------------------------------------------------------
+# 3. Only checked fields are saved
+# ---------------------------------------------------------------------------
+
+def test_only_checked_fields_are_saved():
+    suggestions = _suggestions(
+        company_name="New Name",
+        one_liner="New one-liner",
+        target_industries=["HealthTech"],
+    )
+    cfg = default_icp_config()
+    cfg.company = CompanyProfile(name="Old Name", one_liner="Old one-liner")
+    cfg.icp = ICPDefinition(target_industries=["B2B SaaS"])
+
+    # Apply only company_name
+    updated = apply_suggestions_to_config(cfg, suggestions, {"company_name"})
+
+    assert updated.company.name == "New Name"
+    assert updated.company.one_liner == "Old one-liner"
+    assert updated.icp.target_industries == ["B2B SaaS"]
+
+
+# ---------------------------------------------------------------------------
+# 4. Unchecked fields are preserved
+# ---------------------------------------------------------------------------
+
+def test_unchecked_fields_are_preserved():
+    existing = default_icp_config()
+    existing.persona = BuyerPersona(
+        target_titles=["Keep This Title"],
+        top_pain_points=["keep this pain"],
+    )
+
+    suggestions = _suggestions(
+        target_titles=["New Title"],
+        top_pain_points=["new pain"],
+    )
+
+    # Check target_titles only
+    updated = apply_suggestions_to_config(existing, suggestions, {"target_titles"})
+
+    assert updated.persona.target_titles == ["New Title"]
+    assert updated.persona.top_pain_points == ["keep this pain"], (
+        "Unchecked fields must be preserved from the original config"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 5. Suggestions save to selected workspace only
+# ---------------------------------------------------------------------------
+
+def test_suggestions_save_to_selected_workspace_only():
+    ws1_id = _seed_osp()
+    save_workspace_icp_config(_cfg("Workspace 1"), workspace_id=ws1_id)
+
+    ws2 = create_workspace(
+        name="Test Client T5", slug="test-client-t5",
+        instantly_campaign_id="camp-t5",
+    )
+    ws2_id = ws2["id"]
+    save_workspace_icp_config(_cfg("Workspace 2"), workspace_id=ws2_id)
+
+    suggestions = _suggestions(company_name="Applied To WS1")
+    cfg1 = load_workspace_icp_config(workspace_id=ws1_id)
+    updated = apply_suggestions_to_config(cfg1, suggestions, {"company_name"})
+    save_workspace_icp_config(updated, workspace_id=ws1_id)
+
+    assert load_workspace_icp_config(workspace_id=ws1_id).company.name == "Applied To WS1"
+    assert load_workspace_icp_config(workspace_id=ws2_id).company.name == "Workspace 2", (
+        "Applying suggestions to workspace 1 must not affect workspace 2"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6. OSP settings do not leak to Test Client
+# ---------------------------------------------------------------------------
+
+def test_osp_settings_do_not_leak_to_test_client():
+    osp_id = _seed_osp()
+    save_workspace_icp_config(_cfg("OSP Settings"), workspace_id=osp_id)
+
+    client_ws = create_workspace(
+        name="Test Client T6", slug="test-client-t6",
+        instantly_campaign_id="camp-t6",
+    )
+    client_id = client_ws["id"]
+    save_workspace_icp_config(_cfg("Client Settings"), workspace_id=client_id)
+
+    suggestions = _suggestions(company_name="Applied To OSP")
+    osp_cfg = load_workspace_icp_config(workspace_id=osp_id)
+    updated = apply_suggestions_to_config(osp_cfg, suggestions, {"company_name"})
+    save_workspace_icp_config(updated, workspace_id=osp_id)
+
+    client_loaded = load_workspace_icp_config(workspace_id=client_id)
+    assert client_loaded.company.name == "Client Settings", (
+        "Applying suggestions to OSP must not change Test Client settings"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. Test Client settings do not leak to OSP
+# ---------------------------------------------------------------------------
+
+def test_client_settings_do_not_leak_to_osp():
+    osp_id = _seed_osp()
+    save_workspace_icp_config(_cfg("OSP Company"), workspace_id=osp_id)
+
+    client_ws = create_workspace(
+        name="Test Client T7", slug="test-client-t7",
+        instantly_campaign_id="camp-t7",
+    )
+    client_id = client_ws["id"]
+    save_workspace_icp_config(_cfg("Client Company"), workspace_id=client_id)
+
+    suggestions = _suggestions(company_name="Applied To Client")
+    client_cfg = load_workspace_icp_config(workspace_id=client_id)
+    updated = apply_suggestions_to_config(client_cfg, suggestions, {"company_name"})
+    save_workspace_icp_config(updated, workspace_id=client_id)
+
+    osp_loaded = load_workspace_icp_config(workspace_id=osp_id)
+    assert osp_loaded.company.name == "OSP Company", (
+        "Applying suggestions to Test Client must not change OSP settings"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 8. Prompt configs are not modified
+# ---------------------------------------------------------------------------
+
+def test_prompt_configs_not_modified():
+    ws_id = _seed_osp()
+
+    with session_scope() as session:
+        before = session.execute(
+            select(func.count()).select_from(PromptConfig)
+        ).scalar()
+
+    suggestions = _suggestions()
+    cfg = load_workspace_icp_config(workspace_id=ws_id)
+    all_fields = set(WebsiteSuggestions.model_fields.keys())
+    updated = apply_suggestions_to_config(cfg, suggestions, all_fields)
+    save_workspace_icp_config(updated, workspace_id=ws_id)
+
+    with session_scope() as session:
+        after = session.execute(
+            select(func.count()).select_from(PromptConfig)
+        ).scalar()
+
+    assert after == before, (
+        "apply_suggestions_to_config and save must not create or modify PromptConfig rows"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 9. init_db/reboot does not trigger website autofill
+# ---------------------------------------------------------------------------
+
+def test_init_db_does_not_trigger_website_autofill():
+    db_path = _PROJECT_ROOT / "src" / "db.py"
+    workspace_path = _PROJECT_ROOT / "src" / "workspace.py"
+
+    db_text = db_path.read_text(encoding="utf-8")
+    workspace_text = workspace_path.read_text(encoding="utf-8")
+
+    assert "website_analyzer" not in db_text, (
+        "src/db.py must not import website_analyzer"
+    )
+    assert "analyze_website" not in workspace_text, (
+        "src/workspace.py seed/backfill must not call analyze_website"
+    )
+
+    # Simulate startup — must not touch website analyzer
+    seed_default_workspace()
+    backfill_osp_icp_config()
+
+
+# ---------------------------------------------------------------------------
+# 10. Failed website fetch does not overwrite settings
+# ---------------------------------------------------------------------------
+
+async def test_failed_fetch_does_not_overwrite_settings(monkeypatch):
+    ws_id = _seed_osp()
+    save_workspace_icp_config(_cfg("Protected Name"), workspace_id=ws_id)
+
+    async def _fail_fetch(url):
+        raise httpx.ConnectError("Connection refused")
+
+    async def _fail_tavily(domain, notes):
+        return [], ""
+
+    import src.website_analyzer as _wa
+    monkeypatch.setattr(_wa, "_fetch_html", _fail_fetch)
+    monkeypatch.setattr(_wa, "_search_tavily", _fail_tavily)
+
+    result = await analyze_website_async("https://unreachable.example.com")
+
+    assert result.error is not None, "Failed fetch must return an error"
+    assert result.suggestions.company_name == "", (
+        "Failed fetch must not produce suggestions"
+    )
+
+    loaded = load_workspace_icp_config(workspace_id=ws_id)
+    assert loaded.company.name == "Protected Name", (
+        "Failed website fetch must not overwrite saved settings"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 11. API keys are not exposed in apply output
+# ---------------------------------------------------------------------------
+
+def test_api_keys_not_exposed_in_apply_output(monkeypatch):
+    from src.config import settings as _settings
+    monkeypatch.setattr(_settings, "anthropic_api_key", "sk-fake-secret-99999")
+    monkeypatch.setattr(_settings, "tavily_api_key", "tvly-fake-secret-99999")
+
+    suggestions = _suggestions(company_name="Safe Company", one_liner="Legitimate")
+    cfg = default_icp_config()
+    all_fields = set(WebsiteSuggestions.model_fields.keys())
+    updated = apply_suggestions_to_config(cfg, suggestions, all_fields)
+
+    cfg_str = str(updated.model_dump())
+    assert "sk-fake-secret-99999" not in cfg_str, (
+        "apply_suggestions_to_config must not include the Anthropic API key in output"
+    )
+    assert "tvly-fake-secret-99999" not in cfg_str, (
+        "apply_suggestions_to_config must not include the Tavily API key in output"
+    )

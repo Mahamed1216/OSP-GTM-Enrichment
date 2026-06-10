@@ -298,6 +298,146 @@ st.info(
     "Switching workspaces loads that workspace's own saved settings."
 )
 
+# ---------- Autofill settings from website ----------
+_af_result_key = f"_autofill_result_{_selected_ws_id}"
+_af_url_key = f"_autofill_url_{_selected_ws_id}"
+
+with st.expander("Autofill settings from website", expanded=False):
+    st.caption(
+        "Paste a company website URL. The app will research the site, draft "
+        "suggested settings, and let you review each field before saving."
+    )
+
+    _af_url = st.text_input(
+        "Website URL",
+        placeholder="https://company.com",
+        key=f"af_url_{_selected_ws_id}",
+    )
+    _af_notes = st.text_area(
+        "Optional notes about the client",
+        height=60,
+        key=f"af_notes_{_selected_ws_id}",
+        placeholder="e.g. B2B SaaS tool, sells to enterprise sales teams in the US",
+    )
+
+    _af_col1, _af_col2 = st.columns([2, 1])
+    with _af_col1:
+        _af_analyze = st.button(
+            "Analyze website",
+            key=f"af_analyze_{_selected_ws_id}",
+            type="primary",
+        )
+    with _af_col2:
+        if st.session_state.get(_af_result_key):
+            if st.button("Clear results", key=f"af_clear_{_selected_ws_id}", type="secondary"):
+                st.session_state.pop(_af_result_key, None)
+                st.session_state.pop(_af_url_key, None)
+                st.rerun()
+
+    if _af_analyze:
+        if not (_af_url or "").strip():
+            st.warning("Please enter a website URL.")
+        else:
+            with st.spinner("Fetching and analyzing website…"):
+                try:
+                    from src.website_analyzer import analyze_website as _analyze_website
+                    _af_res = _analyze_website(_af_url.strip(), notes=_af_notes or "")
+                    st.session_state[_af_result_key] = _af_res
+                    st.session_state[_af_url_key] = _af_url.strip()
+                except Exception as _af_exc:
+                    st.error(f"Analysis failed: {_af_exc}")
+                    st.session_state.pop(_af_result_key, None)
+
+    _af_result = st.session_state.get(_af_result_key)
+
+    if _af_result is not None:
+        if _af_result.error:
+            st.error(_af_result.error)
+        else:
+            _analyzed_url = st.session_state.get(_af_url_key, "")
+            _conf_colors = {"high": ":green", "medium": ":orange", "low": ":red"}
+            _conf_tag = _af_result.confidence or "medium"
+            _conf_display = f"{_conf_colors.get(_conf_tag, ':gray')}[{_conf_tag.title()}]"
+            st.success(f"Website analyzed: {_analyzed_url}")
+            if _af_result.sources_used:
+                st.caption("Sources: " + "  ·  ".join(_af_result.sources_used[:3]))
+            st.caption(f"Confidence: {_conf_display}")
+
+            st.divider()
+            st.markdown("**Review suggested settings** — uncheck any field to keep your current value:")
+            st.warning(
+                f"Applying these settings only updates the current workspace: **{_selected_ws.get('name') if _selected_ws else str(_selected_ws_id)}**"
+            )
+
+            _s = _af_result.suggestions
+
+            def _fmt_val(v) -> str:
+                if isinstance(v, list):
+                    return "\n".join(str(x) for x in v) if v else ""
+                return str(v) if v else ""
+
+            _AF_FIELDS: list[tuple[str, str, str, str]] = [
+                ("company_name",            "Company name",          _fmt_val(cfg.company.name),                     _fmt_val(_s.company_name)),
+                ("one_liner",               "One-liner",             _fmt_val(cfg.company.one_liner),                _fmt_val(_s.one_liner)),
+                ("value_props",             "Value props",           _fmt_val(cfg.company.value_props),              _fmt_val(_s.value_props)),
+                ("differentiators",         "Differentiators",       _fmt_val(cfg.company.differentiators),          _fmt_val(_s.differentiators)),
+                ("target_industries",       "Target industries",     _fmt_val(cfg.icp.target_industries),            _fmt_val(_s.target_industries)),
+                ("target_company_sizes",    "Company sizes",         _fmt_val(cfg.icp.target_company_sizes),         _fmt_val(_s.target_company_sizes)),
+                ("target_company_stages",   "Company stages",        _fmt_val(cfg.icp.target_company_stages),        _fmt_val(_s.target_company_stages)),
+                ("target_tech_stack_signals","Tech stack signals",   _fmt_val(cfg.icp.target_tech_stack_signals),    _fmt_val(_s.target_tech_stack_signals)),
+                ("target_geographies",      "Geographies",           _fmt_val(cfg.icp.target_geographies),           _fmt_val(_s.target_geographies)),
+                ("target_titles",           "Target titles",         _fmt_val(cfg.persona.target_titles),            _fmt_val(_s.target_titles)),
+                ("seniority_levels",        "Seniority levels",      _fmt_val(cfg.persona.seniority_levels),         _fmt_val(_s.seniority_levels)),
+                ("departments",             "Departments",           _fmt_val(cfg.persona.departments),              _fmt_val(_s.departments)),
+                ("top_pain_points",         "Pain points",           _fmt_val(cfg.persona.top_pain_points),          _fmt_val(_s.top_pain_points)),
+                ("common_objections",       "Objections",            _fmt_val(cfg.persona.common_objections),        _fmt_val(_s.common_objections)),
+                ("positive_signals",        "Positive signals",      _fmt_val(cfg.signals.positive_signals),         _fmt_val(_s.positive_signals)),
+                ("disqualifiers",           "Disqualifiers",         _fmt_val(cfg.signals.disqualifiers),            _fmt_val(_s.disqualifiers)),
+                ("news_search_terms",       "News search terms",     _fmt_val(cfg.news_search_terms),                _fmt_val(_s.news_search_terms)),
+            ]
+
+            _af_checked: dict[str, bool] = {}
+            for _fkey, _flabel, _fcurrent, _fsuggested in _AF_FIELDS:
+                if not _fsuggested.strip():
+                    continue
+                _af_checked[_fkey] = st.checkbox(
+                    _flabel,
+                    value=True,
+                    key=f"af_check_{_selected_ws_id}_{_fkey}",
+                )
+                _c1, _c2 = st.columns(2)
+                with _c1:
+                    st.caption(":gray[Current value]")
+                    st.code(_fcurrent or "(empty)", language=None)
+                with _c2:
+                    st.caption(":gray[Suggested value]")
+                    st.code(_fsuggested, language=None)
+                if _af_result.reasoning.get(_fkey):
+                    st.caption(f":gray[{_af_result.reasoning[_fkey]}]")
+
+            st.divider()
+            if st.button(
+                "Apply suggested settings",
+                key=f"af_apply_{_selected_ws_id}",
+                type="primary",
+            ):
+                _to_apply = {k for k, v in _af_checked.items() if v}
+                if not _to_apply:
+                    st.warning("No fields selected — nothing to apply.")
+                else:
+                    from src.website_analyzer import apply_suggestions_to_config as _apply_sugg
+                    _updated_cfg = _apply_sugg(cfg, _s, _to_apply)
+                    try:
+                        save_workspace_icp_config(_updated_cfg, workspace_id=_selected_ws_id)
+                        st.cache_data.clear()
+                        _ws_name = _selected_ws.get("name") if _selected_ws else str(_selected_ws_id)
+                        st.success(f"Saved suggested settings for workspace: **{_ws_name}**")
+                        st.session_state.pop(_af_result_key, None)
+                        st.session_state.pop(_af_url_key, None)
+                        st.rerun()
+                    except Exception as _save_exc:
+                        st.error(f"Failed to save settings: {_save_exc}")
+
 # ---------- Company ----------
 with st.expander("Company", expanded=True):
     with st.form("settings_company_form", clear_on_submit=False):
