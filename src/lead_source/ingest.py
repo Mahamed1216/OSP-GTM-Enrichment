@@ -366,11 +366,15 @@ def run_import(
     created_after: str | None = None,
     created_before: str | None = None,
     auto_run: bool = False,
+    initial_offset: int = 0,
 ) -> ImportResult:
     """Full import flow: log → paginated fetch → ingest → update workspace metadata.
 
     Fetches contacts in pages (API cap 500 per page) until `limit` contacts
-    have been retrieved or the server has no more results.
+    have been retrieved or the server has no more results.  `initial_offset`
+    sets the starting position in the remote contact list; scheduled runs pass
+    the workspace's stored cursor so each run progresses through the list.
+    Manual imports leave initial_offset=0 to always fetch from the front.
     Raises on HTTP errors so the UI can surface a meaningful message.
     """
     from src.lead_source.client import LeadSourceClient
@@ -388,7 +392,7 @@ def run_import(
     try:
         client = LeadSourceClient(api_base_url, api_key)
         all_contacts: list[dict] = []
-        offset = 0
+        offset = initial_offset  # scheduled runs start where the last run left off
 
         while len(all_contacts) < limit:
             page_size = min(500, limit - len(all_contacts))

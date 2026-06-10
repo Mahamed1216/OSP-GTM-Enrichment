@@ -615,3 +615,300 @@ def test_no_external_post_runs_called(monkeypatch):
     _run(run_workspace_auto_import(ws_id))
 
     assert runs_calls == [], "POST /runs must never be called by the scheduler"
+
+
+# ===========================================================================
+# Cursor / pagination tests (Phase 9)
+# ===========================================================================
+
+from src.lead_source.settings import advance_import_cursor, reset_import_cursor
+
+
+def _cfg_with_offset(ws_id: int, offset: int = 0, limit: int = 10) -> None:
+    cfg = LeadSourceConfig(
+        enabled=True,
+        api_base_url="https://leads.osp.tools",
+        api_key="test-key",
+        client_slug="osp",
+        daily_fetch_limit=limit,
+        auto_import_enabled=True,
+        auto_process_enabled=False,
+        next_offset=offset,
+    )
+    save_lead_source_config(cfg, ws_id)
+
+
+def _fake_contacts_get(contacts: list[dict], *, offset_tracker: list | None = None):
+    """Return a fake httpx.get that serves `contacts` from the given offset."""
+
+    def fake_get(url, **kwargs):
+        if "contacts" in url:
+            params = kwargs.get("params", {})
+            req_offset = params.get("offset", 0) if params else 0
+            req_limit = params.get("limit", 10) if params else 10
+            if offset_tracker is not None:
+                offset_tracker.append(req_offset)
+            batch = contacts[req_offset: req_offset + req_limit]
+            return _FakeResp(200, {
+                "contacts": batch,
+                "count": len(contacts),
+                "limit": req_limit,
+                "offset": req_offset,
+            })
+        return _FakeResp(200, {"status": "ok"})
+
+    return fake_get
+
+
+# ---------------------------------------------------------------------------
+# C1. First scheduled run uses offset 0
+# ---------------------------------------------------------------------------
+
+def test_first_scheduled_run_uses_offset_0(monkeypatch):
+    ws_id = _seed_ws()
+    _cfg_with_offset(ws_id, offset=0, limit=5)
+
+    offsets_used: list[int] = []
+    all_contacts = [
+        _make_contact(id=f"c{i}", email=f"c{i}@x.com", first_name=f"C{i}", last_name="T")
+        for i in range(20)
+    ]
+    monkeypatch.setattr(client_mod.httpx, "get",
+                        _fake_contacts_get(all_contacts, offset_tracker=offsets_used))
+
+    _run(run_workspace_auto_import(ws_id))
+
+    assert offsets_used[0] == 0, "First scheduled run must start at offset 0"
+
+
+# ---------------------------------------------------------------------------
+# C2. After fetching limit contacts, next offset = old_offset + fetched_count
+# ---------------------------------------------------------------------------
+
+def test_cursor_advances_after_full_fetch(monkeypatch):
+    ws_id = _seed_ws()
+    _cfg_with_offset(ws_id, offset=0, limit=5)
+
+    all_contacts = [
+        _make_contact(id=f"adv{i}", email=f"adv{i}@x.com", first_name=f"A{i}", last_name="D")
+        for i in range(20)
+    ]
+    monkeypatch.setattr(client_mod.httpx, "get", _fake_contacts_get(all_contacts))
+
+    _run(run_workspace_auto_import(ws_id))
+
+    cfg_after = load_lead_source_config(ws_id)
+    assert cfg_after.next_offset == 5, (
+        "After fetching exactly limit=5 contacts, next_offset must be 0+5=5"
+    )
+
+
+# ---------------------------------------------------------------------------
+# C3. Second scheduled run uses the advanced offset
+# ---------------------------------------------------------------------------
+
+def test_second_run_uses_advanced_offset(monkeypatch):
+    ws_id = _seed_ws()
+    _cfg_with_offset(ws_id, offset=5, limit=5)
+
+    offsets_used: list[int] = []
+    all_contacts = [
+        _make_contact(id=f"sec{i}", email=f"sec{i}@x.com", first_name=f"S{i}", last_name="E")
+        for i in range(20)
+    ]
+    monkeypatch.setattr(client_mod.httpx, "get",
+                        _fake_contacts_get(all_contacts, offset_tracker=offsets_used))
+
+    _run(run_workspace_auto_import(ws_id))
+
+    assert offsets_used[0] == 5, (
+        "Second scheduled run (next_offset=5) must start at offset 5"
+    )
+
+    cfg_after = load_lead_source_config(ws_id)
+    assert cfg_after.next_offset == 10, "After second run, next_offset must advance to 10"
+
+
+# ---------------------------------------------------------------------------
+# C4. When fetched_count < limit, cursor resets to 0 (end of list)
+# ---------------------------------------------------------------------------
+
+def test_cursor_resets_when_end_of_list_reached(monkeypatch):
+    ws_id = _seed_ws()
+    _cfg_with_offset(ws_id, offset=15, limit=10)
+
+    # Only 3 contacts at offset 15 (fewer than limit=10) — end of list
+    all_contacts = [
+        _make_contact(id=f"eol{i}", email=f"eol{i}@x.com", first_name=f"E{i}", last_name="L")
+        for i in range(18)
+    ]
+    monkeypatch.setattr(client_mod.httpx, "get", _fake_contacts_get(all_contacts))
+
+    _run(run_workspace_auto_import(ws_id))
+
+    cfg_after = load_lead_source_config(ws_id)
+    assert cfg_after.next_offset == 0, (
+        "When fetched_count (3) < limit (10), cursor must reset to 0 (end of list reached)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# C5. Manual import (run_import direct call) uses offset 0, does not touch cursor
+# ---------------------------------------------------------------------------
+
+def test_manual_import_uses_offset_0_and_does_not_advance_cursor(monkeypatch):
+    ws_id = _seed_ws()
+    _cfg_with_offset(ws_id, offset=42, limit=5)
+
+    offsets_used: list[int] = []
+    all_contacts = [
+        _make_contact(id=f"man{i}", email=f"man{i}@x.com", first_name=f"M{i}", last_name="N")
+        for i in range(10)
+    ]
+    monkeypatch.setattr(client_mod.httpx, "get",
+                        _fake_contacts_get(all_contacts, offset_tracker=offsets_used))
+
+    # Manual import — no initial_offset arg → defaults to 0
+    import_id = start_import_log(ws_id, "osp", requested_limit=5)
+    run_import(ws_id, "osp", "https://leads.osp.tools", "test-key", limit=5)
+
+    assert offsets_used[0] == 0, "Manual import must always start at offset 0"
+
+    cfg_after = load_lead_source_config(ws_id)
+    assert cfg_after.next_offset == 42, (
+        "Manual run_import must not modify the stored cursor (next_offset stays at 42)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# C6. reset_import_cursor sets next_offset back to 0
+# ---------------------------------------------------------------------------
+
+def test_reset_cursor_sets_offset_to_0():
+    ws_id = _seed_ws()
+    _cfg_with_offset(ws_id, offset=99, limit=5)
+
+    reset_import_cursor(ws_id)
+
+    cfg_after = load_lead_source_config(ws_id)
+    assert cfg_after.next_offset == 0, "reset_import_cursor must set next_offset to 0"
+
+
+# ---------------------------------------------------------------------------
+# C7. Duplicates are skipped and not regenerated (cursor still advances)
+# ---------------------------------------------------------------------------
+
+def test_duplicate_contacts_skipped_and_cursor_still_advances(monkeypatch):
+    ws_id = _seed_ws()
+    # Pre-import the first contact so it will be a duplicate
+    contact = _make_contact(id="dup-c7", email="dup-c7@example.com",
+                            first_name="D7", last_name="Dup")
+    _import_one(contact, ws_id)
+
+    _cfg_with_offset(ws_id, offset=0, limit=5)
+
+    all_contacts = [contact] + [
+        _make_contact(id=f"new-c7-{i}", email=f"new-c7-{i}@x.com",
+                      first_name=f"N{i}", last_name="C7")
+        for i in range(4)
+    ]
+    monkeypatch.setattr(client_mod.httpx, "get", _fake_contacts_get(all_contacts))
+
+    result = _run(run_workspace_auto_import(ws_id))
+
+    assert result["import_skipped"] >= 1, "Duplicate contact must be counted as skipped"
+    # Cursor must still advance (fetched 5 == limit 5)
+    cfg_after = load_lead_source_config(ws_id)
+    assert cfg_after.next_offset == 5, "Cursor must advance even when some contacts are duplicates"
+
+
+# ---------------------------------------------------------------------------
+# C8. Newly created leads are processed when auto_process_enabled
+# ---------------------------------------------------------------------------
+
+def test_newly_created_leads_are_processed_after_cursor_advance(monkeypatch):
+    ws_id = _seed_ws()
+    cfg_obj = LeadSourceConfig(
+        enabled=True, api_base_url="https://leads.osp.tools", api_key="key",
+        client_slug="osp", daily_fetch_limit=5,
+        auto_import_enabled=True, auto_process_enabled=True, next_offset=0,
+    )
+    save_lead_source_config(cfg_obj, ws_id)
+
+    scored: list[int] = []
+
+    async def fake_score(lead_id, *, workspace_id=None):
+        scored.append(lead_id)
+        return _FakeScoreResult()
+
+    monkeypatch.setattr("src.scoring.score_lead", fake_score)
+    monkeypatch.setattr("src.content.email.generate_email", fake_generate_email)
+    monkeypatch.setattr("src.content.call_script.generate_call_script", fake_generate_call_script)
+    monkeypatch.setattr("src.content.linkedin_msg.generate_linkedin_msg", fake_generate_linkedin_msg)
+
+    all_contacts = [
+        _make_contact(id=f"proc{i}", email=f"proc{i}@x.com", first_name=f"P{i}", last_name="R")
+        for i in range(5)
+    ]
+    monkeypatch.setattr(client_mod.httpx, "get", _fake_contacts_get(all_contacts))
+
+    result = _run(run_workspace_auto_import(ws_id))
+
+    assert result["created"] >= 1
+    assert len(scored) == result["created"], "All newly created leads must be scored"
+    assert load_lead_source_config(ws_id).next_offset == 5
+
+
+# ---------------------------------------------------------------------------
+# C9. Workspace A cursor does not affect Workspace B cursor
+# ---------------------------------------------------------------------------
+
+def test_workspace_cursor_isolation():
+    ws_a = _seed_ws()
+    ws_b = _ws("WorkspaceB-C9", "wb-c9")
+
+    _cfg_with_offset(ws_a, offset=10, limit=5)
+    _cfg_with_offset(ws_b, offset=20, limit=5)
+
+    # Advance workspace A cursor directly
+    advance_import_cursor(ws_a, fetched_count=5, limit=5)
+
+    cfg_a = load_lead_source_config(ws_a)
+    cfg_b = load_lead_source_config(ws_b)
+
+    assert cfg_a.next_offset == 15, "Workspace A cursor must be 10+5=15"
+    assert cfg_b.next_offset == 20, "Workspace B cursor must be unchanged at 20"
+
+
+# ---------------------------------------------------------------------------
+# C10. No Instantly push or email send happens during cursor-based scheduled run
+# ---------------------------------------------------------------------------
+
+def test_no_instantly_push_or_email_send_during_cursor_run(monkeypatch):
+    ws_id = _seed_ws()
+    _cfg_with_offset(ws_id, offset=0, limit=5)
+
+    instantly_calls: list[str] = []
+
+    def spy_http(url, **kwargs):
+        if "instantly" in url.lower():
+            instantly_calls.append(url)
+        if "contacts" in url:
+            return _FakeResp(200, {
+                "contacts": [_make_contact(id="no-push", email="no-push@x.com",
+                                           first_name="NP", last_name="NS")],
+                "count": 1, "limit": 5, "offset": 0,
+            })
+        return _FakeResp(200, {"status": "ok"})
+
+    monkeypatch.setattr(client_mod.httpx, "get", spy_http)
+    monkeypatch.setattr("httpx.post", lambda url, **kw: _FakeResp(200, {}))
+
+    monkeypatch.setattr("src.scoring.score_lead", fake_score_lead)
+    monkeypatch.setattr("src.content.email.generate_email", fake_generate_email)
+    monkeypatch.setattr("src.content.call_script.generate_call_script", fake_generate_call_script)
+    monkeypatch.setattr("src.content.linkedin_msg.generate_linkedin_msg", fake_generate_linkedin_msg)
+
+    _run(run_workspace_auto_import(ws_id))
+
+    assert instantly_calls == [], "No Instantly calls must be made during cursor-based scheduled runs"

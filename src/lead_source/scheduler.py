@@ -148,6 +148,7 @@ async def run_workspace_auto_import(
     from src.lead_source.settings import (
         load_lead_source_config,
         update_auto_run_metadata,
+        advance_import_cursor,
     )
     from src.lead_source.ingest import run_import
 
@@ -167,10 +168,16 @@ async def run_workspace_auto_import(
         )
         return {"workspace_id": workspace_id, "skipped": True, "reason": "incomplete_config"}
 
+    # Snapshot the cursor BEFORE the import so we can report it in the summary
+    # and advance it correctly after. Manual imports (initial_offset=0) never
+    # touch this field; only scheduled runs use and update it.
+    current_offset = cfg.next_offset
+
     summary: dict[str, Any] = {
         "workspace_id": workspace_id,
         "skipped": False,
         "dry_run": dry_run,
+        "offset_used": current_offset,
         "fetched": 0,
         "created": 0,
         "updated": 0,
@@ -179,6 +186,7 @@ async def run_workspace_auto_import(
         "scored_count": 0,
         "content_generated_count": 0,
         "enrichment_skipped_count": 0,
+        "next_offset": current_offset,
     }
 
     if dry_run:
@@ -196,12 +204,30 @@ async def run_workspace_auto_import(
             status_filter=cfg.default_status_filter or None,
             include_suppressed=cfg.include_suppressed,
             auto_run=True,
+            initial_offset=current_offset,
         )
         summary["fetched"] = import_result.fetched
         summary["created"] = import_result.created
         summary["updated"] = import_result.updated
         summary["import_skipped"] = import_result.skipped
         summary["errors"] = import_result.errors
+
+        # Advance the cursor for the next scheduled run
+        new_offset = advance_import_cursor(
+            workspace_id,
+            fetched_count=import_result.fetched,
+            limit=cfg.daily_fetch_limit,
+        )
+        summary["next_offset"] = new_offset
+        log.info(
+            "scheduler_cursor_advanced",
+            extra={
+                "workspace_id": workspace_id,
+                "offset_used": current_offset,
+                "fetched": import_result.fetched,
+                "next_offset": new_offset,
+            },
+        )
 
         if cfg.auto_process_enabled and import_result.created_lead_ids:
             process_result = await process_imported_leads(
@@ -226,6 +252,8 @@ async def run_workspace_auto_import(
         created=summary["created"],
         scored=summary.get("scored_count", 0),
         content=summary.get("content_generated_count", 0),
+        fetched=summary["fetched"],
+        skipped=summary["import_skipped"],
     )
     return summary
 

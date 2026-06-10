@@ -42,10 +42,17 @@ class LeadSourceConfig(BaseModel):
     last_auto_run_created: Optional[int] = None
     last_auto_run_scored: Optional[int] = None
     last_auto_run_content: Optional[int] = None
+    last_auto_run_fetched: Optional[int] = None   # total API contacts fetched last run
+    last_auto_run_skipped: Optional[int] = None   # dedup-skipped last run
     # Updated after each manual or auto import run.
     last_fetched_at: Optional[str] = None
     last_fetch_status: Optional[str] = None
     last_fetch_result_count: Optional[int] = None
+    # Evergreen pagination cursor.  Scheduled imports start at this offset and
+    # advance by fetched_count each run.  Resets to 0 when the end of the
+    # remote list is reached (fetched_count < limit) so the next cycle picks
+    # up newly added contacts from the front.  Manual imports always use 0.
+    next_offset: int = 0
 
 
 def load_lead_source_config(workspace_id: int) -> LeadSourceConfig:
@@ -114,6 +121,8 @@ def update_auto_run_metadata(
     created: int = 0,
     scored: int = 0,
     content: int = 0,
+    fetched: int = 0,
+    skipped: int = 0,
     ran_at: Optional[str] = None,
 ) -> None:
     """Persist last_auto_run_* fields after an evergreen scheduler run."""
@@ -124,6 +133,8 @@ def update_auto_run_metadata(
         cfg.last_auto_run_created = created
         cfg.last_auto_run_scored = scored
         cfg.last_auto_run_content = content
+        cfg.last_auto_run_fetched = fetched
+        cfg.last_auto_run_skipped = skipped
         save_lead_source_config(cfg, workspace_id)
     except Exception as exc:
         log.warning(
@@ -138,3 +149,61 @@ def mask_api_key(key: str) -> str:
         return ""
     last4 = key[-4:] if len(key) >= 4 else key
     return f"{'•' * 8} {last4}"
+
+
+def advance_import_cursor(
+    workspace_id: int,
+    *,
+    fetched_count: int,
+    limit: int,
+) -> int:
+    """Advance next_offset after a scheduled run and persist it.
+
+    Strategy: rolling offset with end-of-results wrap-around.
+    - fetched_count == limit  →  more pages remain; advance by fetched_count.
+    - fetched_count < limit   →  reached the end of the remote list; reset to 0
+      so the next cycle starts from the front (where new contacts appear).
+
+    Returns the new next_offset value.
+    """
+    try:
+        cfg = load_lead_source_config(workspace_id)
+        old_offset = cfg.next_offset
+        if fetched_count < limit:
+            new_offset = 0  # end of list reached — wrap around
+        else:
+            new_offset = old_offset + fetched_count
+        cfg.next_offset = new_offset
+        save_lead_source_config(cfg, workspace_id)
+        log.info(
+            "import_cursor_advanced",
+            extra={
+                "workspace_id": workspace_id,
+                "old_offset": old_offset,
+                "new_offset": new_offset,
+                "fetched": fetched_count,
+                "limit": limit,
+                "wrapped": new_offset == 0 and fetched_count < limit,
+            },
+        )
+        return new_offset
+    except Exception as exc:
+        log.warning(
+            "advance_import_cursor_failed",
+            extra={"workspace_id": workspace_id, "error": str(exc)},
+        )
+        return 0
+
+
+def reset_import_cursor(workspace_id: int) -> None:
+    """Reset next_offset to 0 so the next scheduled run starts from the beginning."""
+    try:
+        cfg = load_lead_source_config(workspace_id)
+        cfg.next_offset = 0
+        save_lead_source_config(cfg, workspace_id)
+        log.info("import_cursor_reset", extra={"workspace_id": workspace_id})
+    except Exception as exc:
+        log.warning(
+            "reset_import_cursor_failed",
+            extra={"workspace_id": workspace_id, "error": str(exc)},
+        )

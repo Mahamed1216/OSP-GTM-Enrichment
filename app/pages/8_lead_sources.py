@@ -32,6 +32,7 @@ from src.lead_source.settings import (
     LeadSourceConfig,
     load_lead_source_config,
     mask_api_key,
+    reset_import_cursor,
     save_lead_source_config,
 )
 
@@ -114,27 +115,20 @@ with st.form("lead_source_settings_form"):
 
 if save_clicked:
     resolved_key = new_api_key.strip() if new_api_key.strip() else cfg.api_key
+    # Use cfg.model_dump() as the base so all metadata and cursor fields
+    # (next_offset, last_auto_run_*, etc.) are preserved automatically.
     updated = LeadSourceConfig(
-        enabled=enabled,
-        api_base_url=api_base_url.strip(),
-        api_key=resolved_key,
-        client_slug=client_slug.strip(),
-        default_icp=default_icp.strip(),
-        default_status_filter=default_status,
-        include_suppressed=include_suppressed,
-        daily_fetch_limit=int(daily_fetch_limit),
-        # preserve automation fields (edited in the section below)
-        auto_import_enabled=cfg.auto_import_enabled,
-        auto_process_enabled=cfg.auto_process_enabled,
-        schedule_frequency=cfg.schedule_frequency,
-        last_auto_run_at=cfg.last_auto_run_at,
-        last_auto_run_status=cfg.last_auto_run_status,
-        last_auto_run_created=cfg.last_auto_run_created,
-        last_auto_run_scored=cfg.last_auto_run_scored,
-        last_auto_run_content=cfg.last_auto_run_content,
-        last_fetched_at=cfg.last_fetched_at,
-        last_fetch_status=cfg.last_fetch_status,
-        last_fetch_result_count=cfg.last_fetch_result_count,
+        **{
+            **cfg.model_dump(),
+            "enabled": enabled,
+            "api_base_url": api_base_url.strip(),
+            "api_key": resolved_key,
+            "client_slug": client_slug.strip(),
+            "default_icp": default_icp.strip(),
+            "default_status_filter": default_status,
+            "include_suppressed": include_suppressed,
+            "daily_fetch_limit": int(daily_fetch_limit),
+        }
     )
     try:
         save_lead_source_config(updated, ws_id)
@@ -426,6 +420,30 @@ if cfg.last_auto_run_at:
     ac2.metric("Status", cfg.last_auto_run_status or "—")
     ac3.metric("Created", cfg.last_auto_run_created or 0)
     ac4.metric("Scored / Content", f"{cfg.last_auto_run_scored or 0} / {cfg.last_auto_run_content or 0}")
+
+# ---------- Import cursor ----------
+st.markdown("**Import cursor** — tracks progress through the remote contact list")
+st.caption(
+    "Each scheduled run fetches from *Next offset* and advances the cursor by the "
+    "number of contacts returned. When the end of the list is reached the cursor "
+    "resets to 0 automatically. Manual imports always start at offset 0."
+)
+
+ic1, ic2, ic3, ic4 = st.columns(4)
+ic1.metric("Next scheduled offset", cfg.next_offset)
+ic2.metric("Last auto fetched", cfg.last_auto_run_fetched if cfg.last_auto_run_fetched is not None else "—")
+ic3.metric("Last auto created", cfg.last_auto_run_created if cfg.last_auto_run_created is not None else "—")
+ic4.metric("Last auto skipped", cfg.last_auto_run_skipped if cfg.last_auto_run_skipped is not None else "—")
+
+if st.button("Reset import cursor", key="btn_reset_cursor", type="secondary",
+             help="Set next_offset back to 0. The next scheduled run will start from the beginning of the contact list."):
+    try:
+        reset_import_cursor(ws_id)
+        cfg = load_lead_source_config(ws_id)
+        st.success("Import cursor reset to 0 — next scheduled run starts from the beginning.")
+        st.rerun()
+    except Exception as _exc:
+        st.error(f"Reset failed: {_exc}")
 
 st.divider()
 
