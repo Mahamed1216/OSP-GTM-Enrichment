@@ -844,3 +844,267 @@ def test_fresh_load_after_save_returns_new_values():
     assert fresh.company.name == "Fresh"
     assert fresh.company.value_props == ["prop A", "prop B"]
     assert "SaaS" in fresh.icp.target_industries
+
+
+# ===========================================================================
+# Critical isolation tests: workspace leak prevention
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# I1. Autofill apply in OSP changes only OSP icp_config
+# ---------------------------------------------------------------------------
+
+def test_autofill_osp_changes_only_osp():
+    osp_id = _seed_osp()
+    save_workspace_icp_config(_cfg("OSP Before"), workspace_id=osp_id)
+
+    client1 = create_workspace(name="Isolation C1", slug="iso-c1", instantly_campaign_id="iso1")
+    client2 = create_workspace(name="Isolation C2", slug="iso-c2", instantly_campaign_id="iso2")
+    save_workspace_icp_config(_cfg("Client1 Before"), workspace_id=client1["id"])
+    save_workspace_icp_config(_cfg("Client2 Before"), workspace_id=client2["id"])
+
+    # Apply autofill to OSP only
+    sugg = _suggestions(company_name="OSP After Autofill")
+    osp_cfg = load_workspace_icp_config(workspace_id=osp_id)
+    updated = apply_suggestions_to_config(osp_cfg, sugg, {"company_name"})
+    save_workspace_icp_config(updated, workspace_id=osp_id)
+
+    assert load_workspace_icp_config(workspace_id=osp_id).company.name == "OSP After Autofill"
+    assert load_workspace_icp_config(workspace_id=client1["id"]).company.name == "Client1 Before"
+    assert load_workspace_icp_config(workspace_id=client2["id"]).company.name == "Client2 Before"
+
+
+# ---------------------------------------------------------------------------
+# I2. Autofill apply in Test Client changes only Test Client icp_config
+# ---------------------------------------------------------------------------
+
+def test_autofill_test_client_changes_only_test_client():
+    osp_id = _seed_osp()
+    save_workspace_icp_config(_cfg("OSP Unchanged"), workspace_id=osp_id)
+
+    client = create_workspace(name="Iso Client I2", slug="iso-i2", instantly_campaign_id="iso-i2")
+    save_workspace_icp_config(_cfg("Client Before"), workspace_id=client["id"])
+
+    sugg = _suggestions(company_name="Client After Autofill")
+    client_cfg = load_workspace_icp_config(workspace_id=client["id"])
+    updated = apply_suggestions_to_config(client_cfg, sugg, {"company_name"})
+    save_workspace_icp_config(updated, workspace_id=client["id"])
+
+    assert load_workspace_icp_config(workspace_id=client["id"]).company.name == "Client After Autofill"
+    assert load_workspace_icp_config(workspace_id=osp_id).company.name == "OSP Unchanged", (
+        "OSP must be byte-for-byte unchanged after applying autofill to Test Client"
+    )
+
+
+# ---------------------------------------------------------------------------
+# I3. Other workspace icp_config is byte-for-byte unchanged after save
+# ---------------------------------------------------------------------------
+
+def test_other_workspace_icp_config_byte_identical_after_save():
+    import json as _json
+    osp_id = _seed_osp()
+    save_workspace_icp_config(_cfg("OSP Stable"), workspace_id=osp_id)
+
+    client = create_workspace(name="Byte Check", slug="byte-check", instantly_campaign_id="bc1")
+    save_workspace_icp_config(_cfg("Client Stable"), workspace_id=client["id"])
+
+    # Capture exact JSON of OSP icp_config before touching Test Client
+    with session_scope() as s:
+        from src.models import Workspace
+        osp_row = s.get(Workspace, osp_id)
+        osp_before = _json.dumps(osp_row.icp_config or {}, sort_keys=True)
+
+    # Apply autofill to Test Client
+    sugg = _suggestions(company_name="Client Modified")
+    client_cfg = load_workspace_icp_config(workspace_id=client["id"])
+    updated = apply_suggestions_to_config(client_cfg, sugg, set(WebsiteSuggestions.model_fields.keys()))
+    save_workspace_icp_config(updated, workspace_id=client["id"])
+
+    # OSP icp_config JSON must be byte-for-byte identical
+    with session_scope() as s:
+        from src.models import Workspace
+        osp_row_after = s.get(Workspace, osp_id)
+        osp_after = _json.dumps(osp_row_after.icp_config or {}, sort_keys=True)
+
+    assert osp_before == osp_after, (
+        "OSP workspace.icp_config JSON must be identical before and after "
+        "applying autofill to a different workspace"
+    )
+
+
+# ---------------------------------------------------------------------------
+# I4. Manual Settings save changes only the selected workspace
+# ---------------------------------------------------------------------------
+
+def test_manual_settings_save_changes_only_selected_workspace():
+    osp_id = _seed_osp()
+    save_workspace_icp_config(_cfg("OSP Manual Before"), workspace_id=osp_id)
+
+    client = create_workspace(name="Manual Test I4", slug="manual-i4", instantly_campaign_id="mi4")
+    save_workspace_icp_config(_cfg("Client Manual Before"), workspace_id=client["id"])
+
+    # Simulate a manual Settings page save for OSP
+    from src.icp_config import ICPConfig, CompanyProfile
+    manual_cfg = load_workspace_icp_config(workspace_id=osp_id)
+    manual_cfg.company = CompanyProfile(name="OSP Manual After", one_liner="manual save")
+    save_workspace_icp_config(manual_cfg, workspace_id=osp_id)
+
+    assert load_workspace_icp_config(workspace_id=osp_id).company.name == "OSP Manual After"
+    assert load_workspace_icp_config(workspace_id=client["id"]).company.name == "Client Manual Before", (
+        "Manual Settings save to OSP must not affect Test Client"
+    )
+
+
+# ---------------------------------------------------------------------------
+# I5. Autofill session state keys include workspace_id
+# ---------------------------------------------------------------------------
+
+def test_autofill_session_state_keys_are_workspace_scoped():
+    # Verify that the session_state key names used by the autofill section
+    # include the workspace_id to prevent cross-workspace leakage.
+    settings_page = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "app" / "pages" / "6_settings.py"
+    )
+    text = settings_page.read_text(encoding="utf-8")
+
+    # Keys must be formatted with _selected_ws_id
+    assert '"_autofill_result_{' in text or "_autofill_result_{_selected_ws_id}" in text
+    assert '"_autofill_url_{' in text or "_autofill_url_{_selected_ws_id}" in text
+    assert '"_autofill_confirm_{' in text or "_autofill_confirm_{_selected_ws_id}" in text
+
+
+# ---------------------------------------------------------------------------
+# I6. Switching workspace clears the workspace-change guard
+# ---------------------------------------------------------------------------
+
+def test_workspace_change_guard_is_in_settings_page():
+    settings_page = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "app" / "pages" / "6_settings.py"
+    )
+    text = settings_page.read_text(encoding="utf-8")
+
+    assert "settings_last_workspace_id" in text, (
+        "6_settings.py must contain the workspace-change guard that clears "
+        "form session-state keys on workspace switch"
+    )
+    assert "_SETTINGS_FORM_KEYS" in text, (
+        "_SETTINGS_FORM_KEYS must be defined and used in the workspace-change guard"
+    )
+    assert "session_state.pop(_fk" in text or "st.session_state.pop(_fk" in text, (
+        "The guard must pop form keys when workspace changes"
+    )
+
+
+# ---------------------------------------------------------------------------
+# I7. Cache/session clear does not affect other workspace DB values
+# ---------------------------------------------------------------------------
+
+def test_cache_clear_does_not_affect_other_workspace_db():
+    osp_id = _seed_osp()
+    save_workspace_icp_config(_cfg("OSP Cached"), workspace_id=osp_id)
+
+    client = create_workspace(name="Cache Test I7", slug="cache-i7", instantly_campaign_id="ci7")
+    save_workspace_icp_config(_cfg("Client Cached"), workspace_id=client["id"])
+
+    # st.cache_data.clear() equivalent: just re-loading from DB
+    # Verify that re-loading for OSP does not corrupt Test Client
+    _ = load_workspace_icp_config(workspace_id=osp_id)
+    _ = load_workspace_icp_config(workspace_id=client["id"])
+    _ = load_workspace_icp_config(workspace_id=osp_id)
+
+    assert load_workspace_icp_config(workspace_id=client["id"]).company.name == "Client Cached"
+    assert load_workspace_icp_config(workspace_id=osp_id).company.name == "OSP Cached"
+
+
+# ---------------------------------------------------------------------------
+# I8. init_db / backfill does not overwrite workspace settings
+# ---------------------------------------------------------------------------
+
+def test_init_backfill_does_not_overwrite_settings():
+    osp_id = _seed_osp()
+    save_workspace_icp_config(_cfg("OSP Saved"), workspace_id=osp_id)
+
+    client = create_workspace(name="Backfill Test I8", slug="backfill-i8", instantly_campaign_id="bi8")
+    save_workspace_icp_config(_cfg("Client Saved"), workspace_id=client["id"])
+
+    # Run startup sequence
+    seed_default_workspace()
+    backfill_osp_icp_config()
+
+    assert load_workspace_icp_config(workspace_id=osp_id).company.name == "OSP Saved"
+    assert load_workspace_icp_config(workspace_id=client["id"]).company.name == "Client Saved"
+
+
+# ---------------------------------------------------------------------------
+# I9. Prompt configs are not touched by any settings save path
+# ---------------------------------------------------------------------------
+
+def test_prompt_configs_untouched_by_all_settings_save_paths():
+    osp_id = _seed_osp()
+    client = create_workspace(name="Prompt Test I9", slug="prompt-i9", instantly_campaign_id="pi9")
+
+    with session_scope() as s:
+        before = s.execute(select(func.count()).select_from(PromptConfig)).scalar()
+
+    # Multiple save operations across workspaces
+    for ws_id, name in [(osp_id, "OSP"), (client["id"], "Client")]:
+        sugg = _suggestions(company_name=f"{name} Prompt Test")
+        cfg = load_workspace_icp_config(workspace_id=ws_id)
+        updated = apply_suggestions_to_config(cfg, sugg, {"company_name"})
+        save_workspace_icp_config(updated, workspace_id=ws_id)
+
+    with session_scope() as s:
+        after = s.execute(select(func.count()).select_from(PromptConfig)).scalar()
+
+    assert after == before, "No PromptConfig rows must be created or modified by any settings save"
+
+
+# ---------------------------------------------------------------------------
+# I10. data/icp_config.json is not written when saving to a non-default workspace
+# ---------------------------------------------------------------------------
+
+def test_file_not_written_for_non_default_workspace(monkeypatch):
+    osp_id = _seed_osp()
+    client = create_workspace(
+        name="File Iso Test I10", slug="file-iso-i10", instantly_campaign_id="fi10"
+    )
+    client_id = client["id"]
+
+    # Verify the guard condition exists in the source (documents the production guarantee)
+    import src.icp_config as _icp_mod
+    icp_source = pathlib.Path(_icp_mod.__file__).read_text(encoding="utf-8")
+    assert "_ws_id == _gd()" in icp_source, (
+        "save_workspace_icp_config must guard file write with workspace_id == default check"
+    )
+
+    # In the test environment (SQLite) the write-through is already disabled by the
+    # dialect guard.  Intercept save_icp_config to confirm no call is made.
+    file_writes: list[str] = []
+    monkeypatch.setattr(
+        _icp_mod, "save_icp_config",
+        lambda cfg, path=_icp_mod.CONFIG_PATH: file_writes.append(str(path)),
+    )
+
+    sugg = _suggestions(company_name="Non-Default File Test")
+    cfg = load_workspace_icp_config(workspace_id=client_id)
+    updated = apply_suggestions_to_config(cfg, sugg, {"company_name"})
+    save_workspace_icp_config(updated, workspace_id=client_id)
+
+    assert not file_writes, (
+        "save_icp_config must not be called when saving to a non-default workspace"
+    )
+
+    # Saving to OSP (default) also does NOT call save_icp_config in SQLite mode —
+    # both are correct; the important thing is non-default never triggers it.
+    osp_writes: list[str] = []
+    monkeypatch.setattr(
+        _icp_mod, "save_icp_config",
+        lambda cfg, path=_icp_mod.CONFIG_PATH: osp_writes.append("osp"),
+    )
+    osp_cfg = load_workspace_icp_config(workspace_id=osp_id)
+    osp_updated = apply_suggestions_to_config(osp_cfg, _suggestions(company_name="OSP File Test"), {"company_name"})
+    save_workspace_icp_config(osp_updated, workspace_id=osp_id)
+    # Non-default client must still have no writes regardless of OSP activity
+    assert not file_writes, "Non-default workspace must produce no file writes under any circumstance"

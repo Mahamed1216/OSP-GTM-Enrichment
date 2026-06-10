@@ -94,6 +94,36 @@ render_workspace_banner()
 # Phase 3: show the currently selected workspace prominently.
 _selected_ws = get_current_workspace()
 _selected_ws_id = get_current_workspace_id()
+
+# ---------------------------------------------------------------------------
+# Workspace-change guard
+#
+# Streamlit form widgets (st.text_input, st.text_area, st.toggle) cache their
+# displayed value in st.session_state under a fixed key like "s_company_name".
+# When the user switches to a different workspace, the script reruns with a
+# new _selected_ws_id but the same session_state — so every form field still
+# shows the *previous* workspace's value.  To an observer this looks exactly
+# like a settings leak across workspaces, even though the DB is correct.
+#
+# Fix: whenever _selected_ws_id changes, evict all form widget keys.  The
+# widgets then fall back to their value= parameter, which reads from the fresh
+# load_workspace_icp_config() call below, showing the correct workspace data.
+# ---------------------------------------------------------------------------
+_SETTINGS_FORM_KEYS = (
+    "s_company_name", "s_company_one_liner", "s_company_value_props",
+    "s_company_differentiators",
+    "s_icp_industries", "s_icp_sizes", "s_icp_stages", "s_icp_tech", "s_icp_geos",
+    "s_persona_titles", "s_persona_seniority", "s_persona_departments",
+    "s_persona_pains", "s_persona_objections",
+    "s_signals_positive", "s_signals_disqualifiers",
+    "s_news_terms", "s_demo_all_tiers",
+)
+_SETTINGS_LAST_WS_KEY = "settings_last_workspace_id"
+if st.session_state.get(_SETTINGS_LAST_WS_KEY) != _selected_ws_id:
+    for _fk in _SETTINGS_FORM_KEYS:
+        st.session_state.pop(_fk, None)
+    st.session_state[_SETTINGS_LAST_WS_KEY] = _selected_ws_id
+
 if _selected_ws:
     sc1, sc2, sc3, sc4 = st.columns(4)
     sc1.metric("Selected workspace", _selected_ws.get("name") or "—")
@@ -477,39 +507,79 @@ with st.expander("Autofill settings from website", expanded=False):
                 _to_apply = {k for k, v in _af_checked.items() if v}
                 if not _to_apply:
                     st.warning("No fields selected — nothing to apply.")
+                elif _selected_ws_id is None:
+                    st.error("No workspace selected — cannot save.")
                 else:
                     from src.website_analyzer import apply_suggestions_to_config as _apply_sugg
                     _updated_cfg = _apply_sugg(cfg, _s, _to_apply)
                     try:
+                        # ---- pre-save snapshot (other workspaces only) ----
+                        import json as _json_iso
+                        _ws_other_before: dict[int, str] = {}
+                        try:
+                            from src.db import session_scope as _isess
+                            from src.models import Workspace as _IsoWS
+                            with _isess() as _si:
+                                for _iw in _si.query(_IsoWS).filter(
+                                    _IsoWS.id != _selected_ws_id
+                                ).all():
+                                    _ws_other_before[_iw.id] = _json_iso.dumps(
+                                        _iw.icp_config or {}, sort_keys=True
+                                    )
+                        except Exception:
+                            pass
+
                         save_workspace_icp_config(_updated_cfg, workspace_id=_selected_ws_id)
                         st.cache_data.clear()
 
-                        # Store a confirmation record that survives the rerun.
-                        _ws_name = _selected_ws.get("name") if _selected_ws else str(_selected_ws_id)
-                        _confirm_fields = [
-                            (fkey, flabel, fcurrent, fsuggested)
-                            for fkey, flabel, fcurrent, fsuggested in _AF_FIELDS
-                            if fkey in _to_apply
-                        ]
-                        st.session_state[_af_confirm_key] = {
-                            "ws_id":   _selected_ws_id,
-                            "ws_name": _ws_name,
-                            "fields":  _confirm_fields,
-                        }
+                        # ---- post-save isolation check ----
+                        _breach_ids: list[int] = []
+                        if _ws_other_before:
+                            try:
+                                from src.db import session_scope as _isess2
+                                from src.models import Workspace as _IsoWS2
+                                with _isess2() as _si2:
+                                    for _iw2 in _si2.query(_IsoWS2).filter(
+                                        _IsoWS2.id != _selected_ws_id
+                                    ).all():
+                                        _after = _json_iso.dumps(
+                                            _iw2.icp_config or {}, sort_keys=True
+                                        )
+                                        if _after != _ws_other_before.get(_iw2.id, _after):
+                                            _breach_ids.append(_iw2.id)
+                            except Exception:
+                                pass
 
-                        # Clear the form widget session-state keys for every
-                        # updated field.  Without this, Streamlit uses the stale
-                        # cached widget value instead of the freshly-committed DB
-                        # value on the next rerun, making it appear as if nothing
-                        # was saved even though the DB was correctly updated.
-                        for _fk in _to_apply:
-                            _form_sk = _AUTOFILL_TO_FORM_KEY.get(_fk)
-                            if _form_sk and _form_sk in st.session_state:
-                                del st.session_state[_form_sk]
+                        if _breach_ids:
+                            st.error(
+                                f"WARNING: workspace isolation breach — workspace IDs "
+                                f"{_breach_ids} were unexpectedly modified. "
+                                "Do not use these workspaces until this is resolved."
+                            )
+                        else:
+                            # Save confirmed clean — commit confirmation + clear form cache
+                            _ws_name = _selected_ws.get("name") if _selected_ws else str(_selected_ws_id)
+                            _confirm_fields = [
+                                (fkey, flabel, fcurrent, fsuggested)
+                                for fkey, flabel, fcurrent, fsuggested in _AF_FIELDS
+                                if fkey in _to_apply
+                            ]
+                            st.session_state[_af_confirm_key] = {
+                                "ws_id":   _selected_ws_id,
+                                "ws_name": _ws_name,
+                                "fields":  _confirm_fields,
+                            }
 
-                        st.session_state.pop(_af_result_key, None)
-                        st.session_state.pop(_af_url_key, None)
-                        st.rerun()
+                            # Clear form widget session-state keys for updated fields
+                            # so the Settings forms re-initialise from fresh DB values.
+                            for _fk in _to_apply:
+                                _form_sk = _AUTOFILL_TO_FORM_KEY.get(_fk)
+                                if _form_sk and _form_sk in st.session_state:
+                                    del st.session_state[_form_sk]
+
+                            st.session_state.pop(_af_result_key, None)
+                            st.session_state.pop(_af_url_key, None)
+                            st.rerun()
                     except Exception as _save_exc:
                         st.error(f"Failed to save settings: {_save_exc}")
 
