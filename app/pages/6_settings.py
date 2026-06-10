@@ -299,8 +299,32 @@ st.info(
 )
 
 # ---------- Autofill settings from website ----------
-_af_result_key = f"_autofill_result_{_selected_ws_id}"
-_af_url_key = f"_autofill_url_{_selected_ws_id}"
+_af_result_key  = f"_autofill_result_{_selected_ws_id}"
+_af_url_key     = f"_autofill_url_{_selected_ws_id}"
+_af_confirm_key = f"_autofill_confirm_{_selected_ws_id}"
+
+# Maps each autofill suggestion field to the Streamlit session-state key used
+# by the corresponding Settings form widget.  Clearing a key here forces the
+# widget to re-initialise from the fresh DB value on the next rerun.
+_AUTOFILL_TO_FORM_KEY: dict[str, str] = {
+    "company_name":               "s_company_name",
+    "one_liner":                  "s_company_one_liner",
+    "value_props":                "s_company_value_props",
+    "differentiators":            "s_company_differentiators",
+    "target_industries":          "s_icp_industries",
+    "target_company_sizes":       "s_icp_sizes",
+    "target_company_stages":      "s_icp_stages",
+    "target_tech_stack_signals":  "s_icp_tech",
+    "target_geographies":         "s_icp_geos",
+    "target_titles":              "s_persona_titles",
+    "seniority_levels":           "s_persona_seniority",
+    "departments":                "s_persona_departments",
+    "top_pain_points":            "s_persona_pains",
+    "common_objections":          "s_persona_objections",
+    "positive_signals":           "s_signals_positive",
+    "disqualifiers":              "s_signals_disqualifiers",
+    "news_search_terms":          "s_news_terms",
+}
 
 with st.expander("Autofill settings from website", expanded=False):
     st.caption(
@@ -308,6 +332,29 @@ with st.expander("Autofill settings from website", expanded=False):
         "suggested settings, and let you review each field before saving."
     )
 
+    # ---- Persistent confirmation banner (shown after a successful apply) ----
+    _af_confirm = st.session_state.get(_af_confirm_key)
+    if _af_confirm:
+        st.success(
+            f"Settings saved for workspace: **{_af_confirm['ws_name']}** "
+            f"(ID {_af_confirm['ws_id']})"
+        )
+        with st.expander("What was saved", expanded=True):
+            for _cf_key, _cf_label, _cf_old, _cf_new in _af_confirm["fields"]:
+                st.markdown(f"**{_cf_label}**")
+                _cc1, _cc2 = st.columns(2)
+                with _cc1:
+                    st.caption(":gray[Before]")
+                    st.code((_cf_old or "(empty)")[:300], language=None)
+                with _cc2:
+                    st.caption(":gray[After]")
+                    st.code((_cf_new or "(empty)")[:300], language=None)
+        if st.button("Dismiss", key=f"af_dismiss_{_selected_ws_id}", type="secondary"):
+            st.session_state.pop(_af_confirm_key, None)
+            st.rerun()
+        st.divider()
+
+    # ---- URL input + Analyze button ----
     _af_url = st.text_input(
         "Website URL",
         placeholder="https://company.com",
@@ -344,6 +391,8 @@ with st.expander("Autofill settings from website", expanded=False):
                     _af_res = _analyze_website(_af_url.strip(), notes=_af_notes or "")
                     st.session_state[_af_result_key] = _af_res
                     st.session_state[_af_url_key] = _af_url.strip()
+                    # Clear any stale confirmation when starting a new analysis
+                    st.session_state.pop(_af_confirm_key, None)
                 except Exception as _af_exc:
                     st.error(f"Analysis failed: {_af_exc}")
                     st.session_state.pop(_af_result_key, None)
@@ -368,8 +417,9 @@ with st.expander("Autofill settings from website", expanded=False):
 
             st.divider()
             st.markdown("**Review suggested settings** — uncheck any field to keep your current value:")
+            _ws_display_name = _selected_ws.get("name") if _selected_ws else str(_selected_ws_id)
             st.warning(
-                f"Applying these settings only updates the current workspace: **{_selected_ws.get('name') if _selected_ws else str(_selected_ws_id)}**"
+                f"Applying these settings only updates the current workspace: **{_ws_display_name}**"
             )
 
             _s = _af_result.suggestions
@@ -380,23 +430,23 @@ with st.expander("Autofill settings from website", expanded=False):
                 return str(v) if v else ""
 
             _AF_FIELDS: list[tuple[str, str, str, str]] = [
-                ("company_name",            "Company name",          _fmt_val(cfg.company.name),                     _fmt_val(_s.company_name)),
-                ("one_liner",               "One-liner",             _fmt_val(cfg.company.one_liner),                _fmt_val(_s.one_liner)),
-                ("value_props",             "Value props",           _fmt_val(cfg.company.value_props),              _fmt_val(_s.value_props)),
-                ("differentiators",         "Differentiators",       _fmt_val(cfg.company.differentiators),          _fmt_val(_s.differentiators)),
-                ("target_industries",       "Target industries",     _fmt_val(cfg.icp.target_industries),            _fmt_val(_s.target_industries)),
-                ("target_company_sizes",    "Company sizes",         _fmt_val(cfg.icp.target_company_sizes),         _fmt_val(_s.target_company_sizes)),
-                ("target_company_stages",   "Company stages",        _fmt_val(cfg.icp.target_company_stages),        _fmt_val(_s.target_company_stages)),
-                ("target_tech_stack_signals","Tech stack signals",   _fmt_val(cfg.icp.target_tech_stack_signals),    _fmt_val(_s.target_tech_stack_signals)),
-                ("target_geographies",      "Geographies",           _fmt_val(cfg.icp.target_geographies),           _fmt_val(_s.target_geographies)),
-                ("target_titles",           "Target titles",         _fmt_val(cfg.persona.target_titles),            _fmt_val(_s.target_titles)),
-                ("seniority_levels",        "Seniority levels",      _fmt_val(cfg.persona.seniority_levels),         _fmt_val(_s.seniority_levels)),
-                ("departments",             "Departments",           _fmt_val(cfg.persona.departments),              _fmt_val(_s.departments)),
-                ("top_pain_points",         "Pain points",           _fmt_val(cfg.persona.top_pain_points),          _fmt_val(_s.top_pain_points)),
-                ("common_objections",       "Objections",            _fmt_val(cfg.persona.common_objections),        _fmt_val(_s.common_objections)),
-                ("positive_signals",        "Positive signals",      _fmt_val(cfg.signals.positive_signals),         _fmt_val(_s.positive_signals)),
-                ("disqualifiers",           "Disqualifiers",         _fmt_val(cfg.signals.disqualifiers),            _fmt_val(_s.disqualifiers)),
-                ("news_search_terms",       "News search terms",     _fmt_val(cfg.news_search_terms),                _fmt_val(_s.news_search_terms)),
+                ("company_name",             "Company name",       _fmt_val(cfg.company.name),                   _fmt_val(_s.company_name)),
+                ("one_liner",                "One-liner",          _fmt_val(cfg.company.one_liner),              _fmt_val(_s.one_liner)),
+                ("value_props",              "Value props",        _fmt_val(cfg.company.value_props),            _fmt_val(_s.value_props)),
+                ("differentiators",          "Differentiators",    _fmt_val(cfg.company.differentiators),        _fmt_val(_s.differentiators)),
+                ("target_industries",        "Target industries",  _fmt_val(cfg.icp.target_industries),          _fmt_val(_s.target_industries)),
+                ("target_company_sizes",     "Company sizes",      _fmt_val(cfg.icp.target_company_sizes),       _fmt_val(_s.target_company_sizes)),
+                ("target_company_stages",    "Company stages",     _fmt_val(cfg.icp.target_company_stages),      _fmt_val(_s.target_company_stages)),
+                ("target_tech_stack_signals","Tech stack signals", _fmt_val(cfg.icp.target_tech_stack_signals),  _fmt_val(_s.target_tech_stack_signals)),
+                ("target_geographies",       "Geographies",        _fmt_val(cfg.icp.target_geographies),         _fmt_val(_s.target_geographies)),
+                ("target_titles",            "Target titles",      _fmt_val(cfg.persona.target_titles),          _fmt_val(_s.target_titles)),
+                ("seniority_levels",         "Seniority levels",   _fmt_val(cfg.persona.seniority_levels),       _fmt_val(_s.seniority_levels)),
+                ("departments",              "Departments",        _fmt_val(cfg.persona.departments),            _fmt_val(_s.departments)),
+                ("top_pain_points",          "Pain points",        _fmt_val(cfg.persona.top_pain_points),        _fmt_val(_s.top_pain_points)),
+                ("common_objections",        "Objections",         _fmt_val(cfg.persona.common_objections),      _fmt_val(_s.common_objections)),
+                ("positive_signals",         "Positive signals",   _fmt_val(cfg.signals.positive_signals),       _fmt_val(_s.positive_signals)),
+                ("disqualifiers",            "Disqualifiers",      _fmt_val(cfg.signals.disqualifiers),          _fmt_val(_s.disqualifiers)),
+                ("news_search_terms",        "News search terms",  _fmt_val(cfg.news_search_terms),              _fmt_val(_s.news_search_terms)),
             ]
 
             _af_checked: dict[str, bool] = {}
@@ -433,8 +483,30 @@ with st.expander("Autofill settings from website", expanded=False):
                     try:
                         save_workspace_icp_config(_updated_cfg, workspace_id=_selected_ws_id)
                         st.cache_data.clear()
+
+                        # Store a confirmation record that survives the rerun.
                         _ws_name = _selected_ws.get("name") if _selected_ws else str(_selected_ws_id)
-                        st.success(f"Saved suggested settings for workspace: **{_ws_name}**")
+                        _confirm_fields = [
+                            (fkey, flabel, fcurrent, fsuggested)
+                            for fkey, flabel, fcurrent, fsuggested in _AF_FIELDS
+                            if fkey in _to_apply
+                        ]
+                        st.session_state[_af_confirm_key] = {
+                            "ws_id":   _selected_ws_id,
+                            "ws_name": _ws_name,
+                            "fields":  _confirm_fields,
+                        }
+
+                        # Clear the form widget session-state keys for every
+                        # updated field.  Without this, Streamlit uses the stale
+                        # cached widget value instead of the freshly-committed DB
+                        # value on the next rerun, making it appear as if nothing
+                        # was saved even though the DB was correctly updated.
+                        for _fk in _to_apply:
+                            _form_sk = _AUTOFILL_TO_FORM_KEY.get(_fk)
+                            if _form_sk and _form_sk in st.session_state:
+                                del st.session_state[_form_sk]
+
                         st.session_state.pop(_af_result_key, None)
                         st.session_state.pop(_af_url_key, None)
                         st.rerun()

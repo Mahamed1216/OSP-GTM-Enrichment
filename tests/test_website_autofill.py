@@ -563,3 +563,284 @@ def test_prompt_configs_not_touched_after_repair_path():
     assert after == before, (
         "PromptConfig rows must be unchanged after apply_suggestions + save"
     )
+
+
+# ===========================================================================
+# Hotfix tests: apply actually persists to workspace.icp_config
+# ===========================================================================
+
+# Field → form session-state key map (mirrors _AUTOFILL_TO_FORM_KEY in 6_settings.py)
+_FORM_KEYS = {
+    "company_name":               "s_company_name",
+    "one_liner":                  "s_company_one_liner",
+    "value_props":                "s_company_value_props",
+    "differentiators":            "s_company_differentiators",
+    "target_industries":          "s_icp_industries",
+    "target_company_sizes":       "s_icp_sizes",
+    "target_company_stages":      "s_icp_stages",
+    "target_tech_stack_signals":  "s_icp_tech",
+    "target_geographies":         "s_icp_geos",
+    "target_titles":              "s_persona_titles",
+    "seniority_levels":           "s_persona_seniority",
+    "departments":                "s_persona_departments",
+    "top_pain_points":            "s_persona_pains",
+    "common_objections":          "s_persona_objections",
+    "positive_signals":           "s_signals_positive",
+    "disqualifiers":              "s_signals_disqualifiers",
+    "news_search_terms":          "s_news_terms",
+}
+
+
+# ---------------------------------------------------------------------------
+# S1. Apply updates workspace.icp_config in the DB
+# ---------------------------------------------------------------------------
+
+def test_apply_updates_workspace_icp_config_in_db():
+    ws_id = _seed_osp()
+    save_workspace_icp_config(_cfg("Before Apply"), workspace_id=ws_id)
+
+    sugg = _suggestions(company_name="After Apply", one_liner="New one-liner")
+    cfg = load_workspace_icp_config(workspace_id=ws_id)
+    updated = apply_suggestions_to_config(cfg, sugg, {"company_name", "one_liner"})
+    save_workspace_icp_config(updated, workspace_id=ws_id)
+
+    # Read back directly from the DB row to confirm icp_config JSON was updated
+    with session_scope() as session:
+        from src.models import Workspace
+        ws_row = session.get(Workspace, ws_id)
+        stored = ws_row.icp_config or {}
+
+    assert stored.get("company", {}).get("name") == "After Apply", (
+        "workspace.icp_config['company']['name'] must be updated after apply+save"
+    )
+    assert stored.get("company", {}).get("one_liner") == "New one-liner"
+
+
+# ---------------------------------------------------------------------------
+# S2. Saved keys match the Settings page ICPConfig structure
+# ---------------------------------------------------------------------------
+
+def test_saved_keys_match_settings_page_structure():
+    ws_id = _seed_osp()
+    sugg = _suggestions(
+        company_name="Struct Test",
+        target_industries=["SaaS", "Fintech"],
+        top_pain_points=["manual prospecting"],
+        positive_signals=["hiring SDRs"],
+        news_search_terms=["outbound sales"],
+    )
+    cfg = load_workspace_icp_config(workspace_id=ws_id)
+    all_fields = set(WebsiteSuggestions.model_fields.keys())
+    updated = apply_suggestions_to_config(cfg, sugg, all_fields)
+    save_workspace_icp_config(updated, workspace_id=ws_id)
+
+    # Read back via load_workspace_icp_config — must reconstruct correctly
+    reloaded = load_workspace_icp_config(workspace_id=ws_id)
+
+    # Verify the structure matches what the Settings page reads
+    assert reloaded.company.name == "Struct Test"
+    assert "SaaS" in reloaded.icp.target_industries
+    assert "manual prospecting" in reloaded.persona.top_pain_points
+    assert "hiring SDRs" in reloaded.signals.positive_signals
+    assert "outbound sales" in reloaded.news_search_terms
+
+
+# ---------------------------------------------------------------------------
+# S3. After apply, loading settings returns the new values
+# ---------------------------------------------------------------------------
+
+def test_after_apply_load_returns_new_values():
+    ws_id = _seed_osp()
+    save_workspace_icp_config(_cfg("Old Value"), workspace_id=ws_id)
+
+    sugg = _suggestions(company_name="New Value", one_liner="Updated liner")
+    cfg = load_workspace_icp_config(workspace_id=ws_id)
+    updated = apply_suggestions_to_config(cfg, sugg, {"company_name", "one_liner"})
+    save_workspace_icp_config(updated, workspace_id=ws_id)
+
+    # Simulate what the Settings page does on next rerun: load from DB
+    reloaded = load_workspace_icp_config(workspace_id=ws_id)
+    assert reloaded.company.name == "New Value"
+    assert reloaded.company.one_liner == "Updated liner"
+
+
+# ---------------------------------------------------------------------------
+# S4. Only checked fields are written to icp_config
+# ---------------------------------------------------------------------------
+
+def test_only_checked_fields_written_to_icp_config():
+    ws_id = _seed_osp()
+    initial = default_icp_config()
+    initial.company = CompanyProfile(name="Keep Me", one_liner="Keep this too")
+    initial.icp = ICPDefinition(target_industries=["Keep Industry"])
+    save_workspace_icp_config(initial, workspace_id=ws_id)
+
+    sugg = _suggestions(
+        company_name="Replace Me",
+        one_liner="Replace this",
+        target_industries=["Replace Industry"],
+    )
+    cfg = load_workspace_icp_config(workspace_id=ws_id)
+    updated = apply_suggestions_to_config(cfg, sugg, {"company_name"})
+    save_workspace_icp_config(updated, workspace_id=ws_id)
+
+    reloaded = load_workspace_icp_config(workspace_id=ws_id)
+    assert reloaded.company.name == "Replace Me"
+    assert reloaded.company.one_liner == "Keep this too", "Unchecked field must not change"
+    assert reloaded.icp.target_industries == ["Keep Industry"], "Unchecked field must not change"
+
+
+# ---------------------------------------------------------------------------
+# S5. Unchecked fields are preserved in icp_config after apply
+# ---------------------------------------------------------------------------
+
+def test_unchecked_fields_preserved_in_icp_config():
+    ws_id = _seed_osp()
+    initial = default_icp_config()
+    initial.persona = BuyerPersona(
+        target_titles=["Preserved Title"],
+        top_pain_points=["preserved pain"],
+        seniority_levels=["VP"],
+    )
+    save_workspace_icp_config(initial, workspace_id=ws_id)
+
+    sugg = _suggestions(
+        target_titles=["New Title"],
+        top_pain_points=["new pain"],
+        seniority_levels=["Director"],
+    )
+    cfg = load_workspace_icp_config(workspace_id=ws_id)
+    # Only apply target_titles, not the rest of persona
+    updated = apply_suggestions_to_config(cfg, sugg, {"target_titles"})
+    save_workspace_icp_config(updated, workspace_id=ws_id)
+
+    reloaded = load_workspace_icp_config(workspace_id=ws_id)
+    assert reloaded.persona.target_titles == ["New Title"]
+    assert reloaded.persona.top_pain_points == ["preserved pain"]
+    assert reloaded.persona.seniority_levels == ["VP"]
+
+
+# ---------------------------------------------------------------------------
+# S6. No fields checked → no DB write, no success (pure logic test)
+# ---------------------------------------------------------------------------
+
+def test_no_fields_checked_does_not_save():
+    ws_id = _seed_osp()
+    save_workspace_icp_config(_cfg("Untouched"), workspace_id=ws_id)
+
+    sugg = _suggestions(company_name="Would Replace")
+    cfg = load_workspace_icp_config(workspace_id=ws_id)
+
+    # Simulate "no fields checked" — apply with empty set
+    updated = apply_suggestions_to_config(cfg, sugg, set())
+    # Nothing checked → caller must NOT save; verify apply returns original values
+    assert updated.company.name == "Untouched", (
+        "apply_suggestions_to_config with empty checked_fields must return original config"
+    )
+
+    # Verify DB is still untouched (no save was called)
+    reloaded = load_workspace_icp_config(workspace_id=ws_id)
+    assert reloaded.company.name == "Untouched"
+
+
+# ---------------------------------------------------------------------------
+# S7. Apply in Test Client does not change OSP
+# ---------------------------------------------------------------------------
+
+def test_apply_in_test_client_does_not_change_osp():
+    osp_id = _seed_osp()
+    save_workspace_icp_config(_cfg("OSP Untouched"), workspace_id=osp_id)
+
+    client_ws = create_workspace(
+        name="Test Client S7", slug="test-client-s7",
+        instantly_campaign_id="camp-s7",
+    )
+    client_id = client_ws["id"]
+    save_workspace_icp_config(_cfg("Client Before"), workspace_id=client_id)
+
+    sugg = _suggestions(company_name="Client After")
+    client_cfg = load_workspace_icp_config(workspace_id=client_id)
+    updated = apply_suggestions_to_config(client_cfg, sugg, {"company_name"})
+    save_workspace_icp_config(updated, workspace_id=client_id)
+
+    osp_reloaded = load_workspace_icp_config(workspace_id=osp_id)
+    client_reloaded = load_workspace_icp_config(workspace_id=client_id)
+
+    assert client_reloaded.company.name == "Client After"
+    assert osp_reloaded.company.name == "OSP Untouched", (
+        "Apply in Test Client must not modify OSP icp_config"
+    )
+
+
+# ---------------------------------------------------------------------------
+# S8. Apply in OSP does not change Test Client
+# ---------------------------------------------------------------------------
+
+def test_apply_in_osp_does_not_change_test_client():
+    osp_id = _seed_osp()
+    save_workspace_icp_config(_cfg("OSP Before"), workspace_id=osp_id)
+
+    client_ws = create_workspace(
+        name="Test Client S8", slug="test-client-s8",
+        instantly_campaign_id="camp-s8",
+    )
+    client_id = client_ws["id"]
+    save_workspace_icp_config(_cfg("Client Untouched"), workspace_id=client_id)
+
+    sugg = _suggestions(company_name="OSP After")
+    osp_cfg = load_workspace_icp_config(workspace_id=osp_id)
+    updated = apply_suggestions_to_config(osp_cfg, sugg, {"company_name"})
+    save_workspace_icp_config(updated, workspace_id=osp_id)
+
+    client_reloaded = load_workspace_icp_config(workspace_id=client_id)
+    osp_reloaded = load_workspace_icp_config(workspace_id=osp_id)
+
+    assert osp_reloaded.company.name == "OSP After"
+    assert client_reloaded.company.name == "Client Untouched", (
+        "Apply in OSP must not modify Test Client icp_config"
+    )
+
+
+# ---------------------------------------------------------------------------
+# S9. Prompt configs are not touched by apply
+# ---------------------------------------------------------------------------
+
+def test_prompt_configs_not_touched_by_apply():
+    ws_id = _seed_osp()
+
+    with session_scope() as s:
+        before = s.execute(select(func.count()).select_from(PromptConfig)).scalar()
+
+    sugg = _suggestions()
+    cfg = load_workspace_icp_config(workspace_id=ws_id)
+    updated = apply_suggestions_to_config(cfg, sugg, set(WebsiteSuggestions.model_fields.keys()))
+    save_workspace_icp_config(updated, workspace_id=ws_id)
+
+    with session_scope() as s:
+        after = s.execute(select(func.count()).select_from(PromptConfig)).scalar()
+
+    assert after == before, "apply + save must not create or modify PromptConfig rows"
+
+
+# ---------------------------------------------------------------------------
+# S10. After save, loading settings (fresh session) returns new values
+# ---------------------------------------------------------------------------
+
+def test_fresh_load_after_save_returns_new_values():
+    ws_id = _seed_osp()
+    save_workspace_icp_config(_cfg("Stale"), workspace_id=ws_id)
+
+    sugg = _suggestions(
+        company_name="Fresh",
+        value_props=["prop A", "prop B"],
+        target_industries=["SaaS"],
+    )
+    cfg = load_workspace_icp_config(workspace_id=ws_id)
+    updated = apply_suggestions_to_config(cfg, sugg, {"company_name", "value_props", "target_industries"})
+    save_workspace_icp_config(updated, workspace_id=ws_id)
+
+    # Simulate the Settings page re-loading in a fresh DB session (new session_scope)
+    fresh = load_workspace_icp_config(workspace_id=ws_id)
+    assert fresh.company.name == "Fresh"
+    assert fresh.company.value_props == ["prop A", "prop B"]
+    assert "SaaS" in fresh.icp.target_industries
