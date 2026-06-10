@@ -7,10 +7,15 @@ Entry points:
   analyze_website(url, notes)            — synchronous wrapper (Streamlit)
   analyze_website_async(url, notes)      — async version
   apply_suggestions_to_config(cfg, s, checked_fields) — apply reviewed fields
+
+Internal helpers exposed for testing:
+  _raw_llm_call(system, user, max_tokens)  — raw Anthropic call → str
+  _parse_llm_json(raw)                     — strip fences + parse + clamp → _LLMOutput
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from html.parser import HTMLParser
@@ -18,7 +23,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from src.config import settings
 
@@ -55,6 +60,7 @@ class AnalysisResult(BaseModel):
     confidence: str = "low"
     reasoning: dict[str, str] = Field(default_factory=dict)
     error: Optional[str] = None
+    debug_info: Optional[str] = None  # technical details for debug expander
 
 
 # ---------------------------------------------------------------------------
@@ -173,13 +179,18 @@ async def _search_tavily(domain: str, notes: str) -> tuple[list[str], str]:
 
 
 # ---------------------------------------------------------------------------
-# LLM analysis
+# LLM analysis — with JSON repair fallback
 # ---------------------------------------------------------------------------
 
 _SYSTEM = """You are a B2B sales intelligence analyst. Analyze website content and extract structured ICP (Ideal Customer Profile) information for an outbound sales team.
 
-Generate SPECIFIC, SALES-USABLE values — never generic marketing copy.
+CRITICAL OUTPUT FORMAT:
+- Return ONLY a valid JSON object
+- No markdown, no code fences (```), no comments, no trailing commas
+- No unescaped newlines inside string values — use a space instead
+- Start your response with { and end with }
 
+Generate SPECIFIC, SALES-USABLE values — never generic marketing copy.
 BAD: "We help companies grow."
 GOOD: "Helps B2B SaaS teams automate outbound prospecting with enriched lead data and personalized messaging."
 
@@ -190,7 +201,29 @@ Focus on:
 - What makes a lead a bad fit (disqualifiers)
 - What industry terms to monitor (news_search_terms)
 
-Leave list fields empty [] if you cannot reasonably infer them. Leave string fields blank "" if unknown."""
+Strict length limits — never exceed these to keep the JSON small:
+- company_name: max 80 chars
+- one_liner: max 250 chars
+- value_props: max 6 items, each max 120 chars
+- differentiators: max 6 items, each max 120 chars
+- target_industries: max 8 items
+- target_company_sizes: max 4 items
+- target_company_stages: max 4 items
+- target_tech_stack_signals: max 6 items
+- target_geographies: max 6 items
+- target_titles: max 8 items
+- seniority_levels: max 5 items
+- departments: max 6 items
+- top_pain_points: max 8 items, each max 120 chars
+- common_objections: max 6 items, each max 120 chars
+- positive_signals: max 10 items, each max 100 chars
+- disqualifiers: max 10 items, each max 100 chars
+- news_search_terms: max 10 items, each max 80 chars
+- reasoning: object, each value max 120 chars
+
+Leave lists as [] and strings as "" for fields you cannot reasonably infer."""
+
+_REPAIR_SYSTEM = "You are a JSON repair tool. Return ONLY the corrected JSON object — no markdown, no explanation, no code fences. Start with { and end with }."
 
 
 class _LLMOutput(BaseModel):
@@ -215,25 +248,111 @@ class _LLMOutput(BaseModel):
     reasoning: dict[str, str] = Field(default_factory=dict)
 
 
+async def _raw_llm_call(system: str, user: str, max_tokens: int = 4000) -> str:
+    """Make a raw Anthropic API call and return the text response."""
+    from src.llm import client as _llm_client
+    response = await _llm_client().messages.create(
+        model=settings.content_model,
+        max_tokens=max_tokens,
+        system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": user}],
+    )
+    return "".join(
+        block.text for block in response.content
+        if getattr(block, "type", None) == "text"
+    )
+
+
+def _parse_llm_json(raw: str) -> _LLMOutput:
+    """Strip code fences, extract the first JSON object, parse + validate + clamp."""
+    text = raw.strip()
+
+    # Strip markdown code fences (```json ... ``` or ``` ... ```)
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+        text = re.sub(r"\n?```\s*$", "", text)
+        text = text.strip()
+
+    # Skip any non-JSON preamble and find the first { or [
+    if text and text[0] not in "{[":
+        for start_ch in ("{", "["):
+            idx = text.find(start_ch)
+            if idx >= 0:
+                text = text[idx:]
+                break
+
+    parsed = json.loads(text)  # raises json.JSONDecodeError if malformed
+    result = _LLMOutput.model_validate(parsed)  # raises ValidationError if schema mismatch
+    return _clamp(result)
+
+
+def _clamp(raw: _LLMOutput) -> _LLMOutput:
+    """Enforce field-level length limits regardless of what the LLM returned."""
+    def _t(s: str, n: int) -> str:
+        return s[:n] if s else s
+
+    def _tl(lst: list, n_items: int, n_chars: int) -> list:
+        return [_t(str(x), n_chars) for x in lst[:n_items]]
+
+    def _hl(lst: list, n: int) -> list:
+        return lst[:n]
+
+    return _LLMOutput(
+        company_name=_t(raw.company_name, 80),
+        one_liner=_t(raw.one_liner, 250),
+        value_props=_tl(raw.value_props, 6, 120),
+        differentiators=_tl(raw.differentiators, 6, 120),
+        target_industries=_hl(raw.target_industries, 8),
+        target_company_sizes=_hl(raw.target_company_sizes, 4),
+        target_company_stages=_hl(raw.target_company_stages, 4),
+        target_tech_stack_signals=_hl(raw.target_tech_stack_signals, 6),
+        target_geographies=_hl(raw.target_geographies, 6),
+        target_titles=_hl(raw.target_titles, 8),
+        seniority_levels=_hl(raw.seniority_levels, 5),
+        departments=_hl(raw.departments, 6),
+        top_pain_points=_tl(raw.top_pain_points, 8, 120),
+        common_objections=_tl(raw.common_objections, 6, 120),
+        positive_signals=_tl(raw.positive_signals, 10, 100),
+        disqualifiers=_tl(raw.disqualifiers, 10, 100),
+        news_search_terms=_tl(raw.news_search_terms, 10, 80),
+        confidence=raw.confidence or "medium",
+        reasoning={k: _t(v, 120) for k, v in (raw.reasoning or {}).items()},
+    )
+
+
 async def _call_llm(content: str, url: str, notes: str) -> _LLMOutput:
-    from src.llm import generate_json
+    """Analyze content with the LLM. Retries once with a repair call on JSON failure."""
     notes_section = f"\n\nClient notes: {notes}" if notes else ""
     user_prompt = (
         f"Website: {url}{notes_section}\n\n"
         f"Content:\n{content}\n\n"
-        "Return a JSON object with: company_name, one_liner, value_props, differentiators, "
-        "target_industries, target_company_sizes, target_company_stages, "
+        "Return a JSON object with these exact keys: company_name, one_liner, value_props, "
+        "differentiators, target_industries, target_company_sizes, target_company_stages, "
         "target_tech_stack_signals, target_geographies, target_titles, seniority_levels, "
         "departments, top_pain_points, common_objections, positive_signals, disqualifiers, "
-        "news_search_terms, confidence (high/medium/low), reasoning (field→one-sentence reason)"
+        "news_search_terms, confidence (high/medium/low), reasoning (object: field→reason). "
+        "Remember: ONLY valid JSON — no markdown, no code fences."
     )
-    return await generate_json(
-        model=settings.content_model,
-        system=_SYSTEM,
-        user=user_prompt,
-        schema=_LLMOutput,
-        max_tokens=2000,
+
+    # First attempt
+    raw = await _raw_llm_call(_SYSTEM, user_prompt, max_tokens=4000)
+    try:
+        return _parse_llm_json(raw)
+    except (json.JSONDecodeError, ValidationError, Exception) as first_err:
+        log.warning(
+            "autofill_first_parse_failed_attempting_repair",
+            extra={"error": str(first_err)[:200], "raw_len": len(raw)},
+        )
+
+    # Repair attempt: ask the LLM to fix its own output
+    repair_user = (
+        "The following JSON is malformed or truncated. "
+        "Return ONLY the corrected, complete JSON object. "
+        "No markdown. No explanation. No code fences:\n\n"
+        f"{raw[:4000]}"
     )
+    raw2 = await _raw_llm_call(_REPAIR_SYSTEM, repair_user, max_tokens=4000)
+    return _parse_llm_json(raw2)  # raises if still broken — caller handles it
 
 
 # ---------------------------------------------------------------------------
@@ -276,12 +395,16 @@ async def analyze_website_async(url: str, notes: str = "") -> AnalysisResult:
     if not content_parts:
         return AnalysisResult(error="Website returned no readable content.")
 
-    # Step 3: LLM analysis
+    # Step 3: LLM analysis (with built-in repair fallback)
     try:
         raw = await _call_llm("\n\n".join(content_parts), url, notes)
     except Exception as llm_err:
         log.error("llm_analysis_failed", extra={"url": url, "error": str(llm_err)})
-        return AnalysisResult(sources_used=sources, error=f"Analysis failed: {llm_err}")
+        return AnalysisResult(
+            sources_used=sources,
+            error="Could not parse the analysis output. Please retry or add shorter notes.",
+            debug_info=str(llm_err),
+        )
 
     return AnalysisResult(
         suggestions=WebsiteSuggestions(

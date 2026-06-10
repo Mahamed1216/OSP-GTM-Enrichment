@@ -373,3 +373,193 @@ def test_api_keys_not_exposed_in_apply_output(monkeypatch):
     assert "tvly-fake-secret-99999" not in cfg_str, (
         "apply_suggestions_to_config must not include the Tavily API key in output"
     )
+
+
+# ===========================================================================
+# Hotfix tests: robust JSON parsing and repair fallback
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# H1. Valid JSON parses correctly
+# ---------------------------------------------------------------------------
+
+def test_parse_valid_json():
+    from src.website_analyzer import _parse_llm_json
+    raw = '{"company_name": "Acme Corp", "one_liner": "Test one-liner", "confidence": "high"}'
+    result = _parse_llm_json(raw)
+    assert result.company_name == "Acme Corp"
+    assert result.one_liner == "Test one-liner"
+    assert result.confidence == "high"
+    assert result.value_props == []
+
+
+# ---------------------------------------------------------------------------
+# H2. JSON inside a markdown code fence parses correctly
+# ---------------------------------------------------------------------------
+
+def test_parse_json_in_code_fence():
+    from src.website_analyzer import _parse_llm_json
+    raw = '```json\n{"company_name": "Fenced Corp", "one_liner": "inside fence"}\n```'
+    result = _parse_llm_json(raw)
+    assert result.company_name == "Fenced Corp"
+    assert result.one_liner == "inside fence"
+
+
+def test_parse_json_in_plain_fence():
+    from src.website_analyzer import _parse_llm_json
+    raw = '```\n{"company_name": "Plain Fence"}\n```'
+    result = _parse_llm_json(raw)
+    assert result.company_name == "Plain Fence"
+
+
+# ---------------------------------------------------------------------------
+# H3. Broken JSON triggers repair fallback
+# ---------------------------------------------------------------------------
+
+async def test_broken_json_triggers_repair_fallback(monkeypatch):
+    import src.website_analyzer as _wa
+    calls: list[str] = []
+
+    async def _mock_raw(system: str, user: str, max_tokens: int = 4000) -> str:
+        calls.append("repair" if "malformed" in user else "first")
+        if len(calls) == 1:
+            # Simulate truncated response (missing closing brace/quote)
+            return '{"company_name": "Acme", "one_liner": "truncated...'
+        # Repair response: valid JSON
+        return '{"company_name": "Acme Repaired", "one_liner": "fixed output"}'
+
+    monkeypatch.setattr(_wa, "_raw_llm_call", _mock_raw)
+
+    result = await _wa._call_llm("some website content", "https://example.com", "")
+
+    assert len(calls) == 2, "Must make exactly 2 calls: first attempt + repair"
+    assert calls[0] == "first"
+    assert calls[1] == "repair"
+    assert result.company_name == "Acme Repaired"
+    assert result.one_liner == "fixed output"
+
+
+# ---------------------------------------------------------------------------
+# H4. If repair fails, no settings are saved
+# ---------------------------------------------------------------------------
+
+async def test_repair_failure_does_not_save_settings(monkeypatch):
+    ws_id = _seed_osp()
+    save_workspace_icp_config(_cfg("Protected"), workspace_id=ws_id)
+
+    async def _always_bad(system: str, user: str, max_tokens: int = 4000) -> str:
+        return "{ this is definitely not valid json }"
+
+    async def _mock_fetch(url: str) -> tuple[str, str]:
+        return "Title", "Some content about a company"
+
+    import src.website_analyzer as _wa
+    monkeypatch.setattr(_wa, "_raw_llm_call", _always_bad)
+    monkeypatch.setattr(_wa, "_fetch_html", _mock_fetch)
+
+    result = await analyze_website_async("https://example.com")
+
+    assert result.error is not None, "Should surface an error when repair fails"
+    assert result.suggestions.company_name == "", "No suggestions should be set on failure"
+
+    loaded = load_workspace_icp_config(workspace_id=ws_id)
+    assert loaded.company.name == "Protected", (
+        "Settings must remain unchanged when LLM output cannot be parsed"
+    )
+
+
+# ---------------------------------------------------------------------------
+# H5. Missing fields do not crash — defaults apply
+# ---------------------------------------------------------------------------
+
+def test_missing_fields_do_not_crash():
+    from src.website_analyzer import _parse_llm_json
+    # Minimal JSON with only one field — all others should default
+    raw = '{"company_name": "Minimal Co"}'
+    result = _parse_llm_json(raw)
+    assert result.company_name == "Minimal Co"
+    assert result.one_liner == ""
+    assert result.value_props == []
+    assert result.target_industries == []
+    assert result.top_pain_points == []
+    assert result.confidence == "medium"
+    assert result.reasoning == {}
+
+
+# ---------------------------------------------------------------------------
+# H6. After repair path, suggestions are still workspace-scoped
+# ---------------------------------------------------------------------------
+
+def test_repaired_suggestions_are_workspace_scoped():
+    ws1_id = _seed_osp()
+    ws2 = create_workspace(
+        name="Test Client H6", slug="test-client-h6",
+        instantly_campaign_id="camp-h6",
+    )
+    ws2_id = ws2["id"]
+    save_workspace_icp_config(_cfg("WS1 Original"), workspace_id=ws1_id)
+    save_workspace_icp_config(_cfg("WS2 Original"), workspace_id=ws2_id)
+
+    # Simulate result from repair path (AnalysisResult with valid suggestions)
+    sugg = _suggestions(company_name="WS1 Updated via Repair")
+    cfg1 = load_workspace_icp_config(workspace_id=ws1_id)
+    updated = apply_suggestions_to_config(cfg1, sugg, {"company_name"})
+    save_workspace_icp_config(updated, workspace_id=ws1_id)
+
+    assert load_workspace_icp_config(workspace_id=ws1_id).company.name == "WS1 Updated via Repair"
+    assert load_workspace_icp_config(workspace_id=ws2_id).company.name == "WS2 Original", (
+        "Saving repaired suggestions to workspace 1 must not affect workspace 2"
+    )
+
+
+# ---------------------------------------------------------------------------
+# H7. Apply still requires confirmation even after repair path produces result
+# ---------------------------------------------------------------------------
+
+def test_apply_still_requires_confirmation_after_repair():
+    ws_id = _seed_osp()
+    save_workspace_icp_config(_cfg("Before Repair"), workspace_id=ws_id)
+
+    # Simulate a result that came through the repair path
+    sugg = _suggestions(company_name="After Repair Apply")
+    repaired_result = AnalysisResult(
+        suggestions=sugg,
+        sources_used=["https://example.com"],
+        confidence="high",
+    )
+
+    # Creating AnalysisResult does NOT touch DB
+    assert load_workspace_icp_config(workspace_id=ws_id).company.name == "Before Repair"
+
+    # apply_suggestions_to_config also does NOT touch DB
+    cfg = load_workspace_icp_config(workspace_id=ws_id)
+    updated = apply_suggestions_to_config(cfg, repaired_result.suggestions, {"company_name"})
+    assert load_workspace_icp_config(workspace_id=ws_id).company.name == "Before Repair"
+
+    # Only explicit save changes the DB
+    save_workspace_icp_config(updated, workspace_id=ws_id)
+    assert load_workspace_icp_config(workspace_id=ws_id).company.name == "After Repair Apply"
+
+
+# ---------------------------------------------------------------------------
+# H8. Prompt configs are not touched by repair path or apply
+# ---------------------------------------------------------------------------
+
+def test_prompt_configs_not_touched_after_repair_path():
+    ws_id = _seed_osp()
+
+    with session_scope() as s:
+        before = s.execute(select(func.count()).select_from(PromptConfig)).scalar()
+
+    sugg = _suggestions()
+    cfg = load_workspace_icp_config(workspace_id=ws_id)
+    all_fields = set(WebsiteSuggestions.model_fields.keys())
+    updated = apply_suggestions_to_config(cfg, sugg, all_fields)
+    save_workspace_icp_config(updated, workspace_id=ws_id)
+
+    with session_scope() as s:
+        after = s.execute(select(func.count()).select_from(PromptConfig)).scalar()
+
+    assert after == before, (
+        "PromptConfig rows must be unchanged after apply_suggestions + save"
+    )

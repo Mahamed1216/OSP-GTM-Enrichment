@@ -353,6 +353,9 @@ with st.expander("Autofill settings from website", expanded=False):
     if _af_result is not None:
         if _af_result.error:
             st.error(_af_result.error)
+            if _af_result.debug_info:
+                with st.expander("Debug info", expanded=False):
+                    st.code(_af_result.debug_info, language=None)
         else:
             _analyzed_url = st.session_state.get(_af_url_key, "")
             _conf_colors = {"high": ":green", "medium": ":orange", "low": ":red"}
