@@ -1,4 +1,4 @@
-"""Evergreen lead source scheduler — import + score + content for each enabled workspace.
+"""Evergreen lead source scheduler — import + enrich + score + content for each enabled workspace.
 
 Scheduling is deliberately external. Streamlit Cloud cannot reliably run
 background jobs. Use one of:
@@ -11,14 +11,13 @@ background jobs. Use one of:
       Header: X-Job-Secret: <LEAD_SOURCE_JOB_SECRET env var>
 
 Hard constraints (never relaxed):
-  - Enrichment is NEVER called. The OSP Lead Engine has already enriched
-    these contacts; calling our providers would burn credits needlessly.
   - No emails are auto-sent.
   - No Instantly push.
   - POST /api/v1/clients/{slug}/runs is never called.
   - Only enabled workspaces are touched.
   - Dedup prevents re-importing existing contacts.
   - Content generation is idempotent — skips leads that already have content.
+  - Enrichment is idempotent — skips leads that already have an Enrichment row.
 """
 from __future__ import annotations
 
@@ -82,28 +81,61 @@ async def _generate_content_one(lead_id: int, workspace_id: int) -> int:
     return generated
 
 
+def _has_enrichment(lead_id: int) -> bool:
+    """Return True if the lead already has an Enrichment row in the DB."""
+    from sqlalchemy import select
+    from src.db import session_scope
+    from src.models import Enrichment
+    with session_scope() as session:
+        return session.execute(
+            select(Enrichment.id).where(Enrichment.lead_id == lead_id)
+        ).scalar_one_or_none() is not None
+
+
 async def process_imported_leads(
     lead_ids: list[int],
     workspace_id: int,
     *,
     import_log_id: int | None = None,
 ) -> dict[str, int]:
-    """Score and generate content for newly imported leads.
+    """Enrich, score, and generate content for newly imported leads.
 
-    Enrichment is NEVER called — the external source is the enrichment provider.
-    Content generation is idempotent (skips leads that already have content).
+    Processing order per lead:
+      1. Enrichment + buyer research (via enrich_lead waterfall) — idempotent:
+         skipped if the lead already has an Enrichment row.
+      2. Scoring.
+      3. Content generation — idempotent: each generator skips if content exists.
 
     Returns counts for logging/display.
     """
+    from src.enrichment.waterfall import enrich_lead
     from src.lead_source.ingest import _update_import_log_processing
 
+    enriched = 0
+    enrichment_skipped = 0
     scored = 0
     content = 0
-    enrichment_skipped = len(lead_ids)  # 100% of imported leads skip enrichment
 
     for lead_id in lead_ids:
+        # 1. Enrichment + buyer research
+        if _has_enrichment(lead_id):
+            enrichment_skipped += 1
+        else:
+            try:
+                await enrich_lead(lead_id, workspace_id=workspace_id)
+                enriched += 1
+            except Exception as exc:
+                enrichment_skipped += 1
+                log.warning(
+                    "auto_enrich_failed",
+                    extra={"lead_id": lead_id, "workspace_id": workspace_id, "error": str(exc)},
+                )
+
+        # 2. Score
         if await _score_one(lead_id, workspace_id):
             scored += 1
+
+        # 3. Content
         content += await _generate_content_one(lead_id, workspace_id)
 
     log.info(
@@ -111,9 +143,10 @@ async def process_imported_leads(
         extra={
             "workspace_id": workspace_id,
             "lead_count": len(lead_ids),
+            "enriched": enriched,
+            "enrichment_skipped": enrichment_skipped,
             "scored": scored,
             "content": content,
-            "enrichment_skipped": enrichment_skipped,
         },
     )
 
@@ -126,9 +159,10 @@ async def process_imported_leads(
         )
 
     return {
+        "enriched_count": enriched,
+        "enrichment_skipped_count": enrichment_skipped,
         "scored_count": scored,
         "content_generated_count": content,
-        "enrichment_skipped_count": enrichment_skipped,
     }
 
 

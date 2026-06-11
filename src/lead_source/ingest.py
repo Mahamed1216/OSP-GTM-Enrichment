@@ -48,6 +48,8 @@ class ImportResult:
         self.skip_reasons: dict[str, int] = {}
         self.created_lead_ids: list[int] = []
         self.import_log_id: int | None = None   # set by run_import; for log updates
+        self.verified_email_count: int = 0     # contacts with email_verified=True
+        self.unverified_email_count: int = 0   # contacts with an email but not verified
 
     def bump_skip(self, reason: str) -> None:
         self.skipped += 1
@@ -62,6 +64,8 @@ class ImportResult:
             "errors": self.errors,
             "skip_reasons": self.skip_reasons,
             "created_lead_ids": self.created_lead_ids,
+            "verified_email_count": self.verified_email_count,
+            "unverified_email_count": self.unverified_email_count,
         }
 
 
@@ -141,6 +145,10 @@ def _update_missing_fields(lead, fields: dict) -> bool:
         ("external_contact_id", "external_contact_id"),
         ("external_source", "external_source"),
         ("external_client_slug", "external_client_slug"),
+        # Email verification — only promote to a verified state, never downgrade.
+        ("email_verification_status", "email_verification_status"),
+        ("email_verification_provider", "email_verification_provider"),
+        ("email_verified_at", "email_verified_at"),
     ]
     changed = False
     for model_attr, field_key in scalar_map:
@@ -194,6 +202,12 @@ def import_contacts(
                 )
                 continue
 
+            # Track email verification counts for the import log
+            if fields.get("email_verification_status") == "verified":
+                result.verified_email_count += 1
+            elif fields.get("email"):
+                result.unverified_email_count += 1
+
             with session_scope() as session:
                 existing = _find_existing(session, fields, workspace_id)
 
@@ -230,6 +244,10 @@ def import_contacts(
                         external_source=external_source,
                         external_client_slug=client_slug,
                         lead_source_raw=fields["lead_source_raw"],
+                        # Email verification from the external source payload
+                        email_verification_status=fields.get("email_verification_status"),
+                        email_verification_provider=fields.get("email_verification_provider"),
+                        email_verified_at=fields.get("email_verified_at"),
                     )
                     session.add(lead)
                     session.flush()
@@ -237,7 +255,8 @@ def import_contacts(
                     result.created_lead_ids.append(lead.id)
                     log.debug(
                         "lead_source_lead_created",
-                        extra={"lead_id": lead.id, "workspace_id": workspace_id},
+                        extra={"lead_id": lead.id, "workspace_id": workspace_id,
+                               "email_verified": fields.get("email_verification_status") == "verified"},
                     )
 
         except Exception as exc:

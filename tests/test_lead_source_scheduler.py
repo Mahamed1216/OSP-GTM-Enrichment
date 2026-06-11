@@ -322,37 +322,34 @@ def test_newly_imported_contacts_get_generated_content(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Test 7: Internal enrichment is skipped for OSP Lead Engine contacts
+# Test 7: Enrichment and buyer research run for newly imported OSP Lead Engine contacts
 # ---------------------------------------------------------------------------
 
-def test_enrichment_skipped_for_osp_lead_engine_contacts(monkeypatch):
+def test_enrichment_runs_for_osp_lead_engine_contacts(monkeypatch):
+    """Newly imported OSP Lead Engine leads get enrichment + buyer research."""
     ws_id = _seed_ws()
 
-    enrich_calls = []
+    enrich_calls: list[int] = []
 
-    async def spy_enrich(*args, **kwargs):
-        enrich_calls.append(args)
+    async def spy_enrich(lead_id, *, workspace_id=None):
+        enrich_calls.append(lead_id)
 
-    # The scheduler does NOT call enrichment. Verify by checking that no
-    # Enrichment rows exist after processing.
+    monkeypatch.setattr("src.enrichment.waterfall.enrich_lead", spy_enrich)
     monkeypatch.setattr("src.scoring.score_lead", fake_score_lead)
     monkeypatch.setattr("src.content.email.generate_email", fake_generate_email)
     monkeypatch.setattr("src.content.call_script.generate_call_script", fake_generate_call_script)
     monkeypatch.setattr("src.content.linkedin_msg.generate_linkedin_msg", fake_generate_linkedin_msg)
 
     lead_id = _import_one(
-        _make_contact(id="noenrich-s7", email="noenrich-s7@example.com",
-                      first_name="N7", last_name="Test"),
+        _make_contact(id="enrich-s7", email="enrich-s7@example.com",
+                      first_name="E7", last_name="Test"),
         ws_id,
     )
     result = _run(process_imported_leads([lead_id], ws_id))
 
-    with session_scope() as session:
-        enrichment_rows = session.execute(select(Enrichment)).scalars().all()
-
-    assert enrichment_rows == [], "Enrichment must never be called for OSP Lead Engine imports"
-    assert result["enrichment_skipped_count"] == 1
-    assert enrich_calls == []
+    assert lead_id in enrich_calls, "enrich_lead must be called for newly imported leads"
+    assert result["enriched_count"] == 1
+    assert result["enrichment_skipped_count"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -912,3 +909,417 @@ def test_no_instantly_push_or_email_send_during_cursor_run(monkeypatch):
     _run(run_workspace_auto_import(ws_id))
 
     assert instantly_calls == [], "No Instantly calls must be made during cursor-based scheduled runs"
+
+
+# ===========================================================================
+# Email verification + enrichment tests (Part A / B / C / D)
+# ===========================================================================
+
+from src.lead_source.ingest import import_contacts
+from src.lead_source.mapper import map_contact
+from src.delivery.eligibility import filter_eligible
+
+
+def _verified_contact(**overrides) -> dict:
+    base = _make_contact(id="v-contact", email="verified@x.com",
+                         first_name="Ver", last_name="Ified")
+    base["email_verified"] = True
+    base.update(overrides)
+    return base
+
+
+def _unverified_contact(**overrides) -> dict:
+    base = _make_contact(id="u-contact", email="unverified@x.com",
+                         first_name="Un", last_name="Verified")
+    base["email_verified"] = False
+    base.update(overrides)
+    return base
+
+
+# ---------------------------------------------------------------------------
+# V1. email_verified=True maps to local verified status
+# ---------------------------------------------------------------------------
+
+def test_email_verified_true_maps_to_verified_status():
+    fields = map_contact({"id": "vid-1", "email": "v1@x.com",
+                          "email_verified": True, "first_name": "V", "last_name": "1"})
+    assert fields["email_verification_status"] == "verified"
+    assert fields["email_verification_provider"] == "osp_lead_engine"
+    assert fields["email_verified_at"] is not None
+
+
+# ---------------------------------------------------------------------------
+# V2. Verified imported lead passes email_unverified eligibility gate
+# ---------------------------------------------------------------------------
+
+def test_verified_imported_lead_not_blocked_by_eligibility():
+    ws_id = _seed_ws()
+    contact = _verified_contact(id="v2-elig", email="v2-elig@x.com",
+                                first_name="V2", last_name="Elig")
+    log_id = _log(ws_id)
+    result = import_contacts([contact], workspace_id=ws_id, client_slug="osp", import_id=log_id)
+    assert result.created == 1
+    lead_id = result.created_lead_ids[0]
+
+    # Add a passing score and email content so only the email-verification gate matters
+    from src.models import Score, GeneratedContent
+    with session_scope() as session:
+        session.add(Score(lead_id=lead_id, score=90, tier="A", rationale="test",
+                          model="test", workspace_id=ws_id))
+        session.add(GeneratedContent(lead_id=lead_id, kind="email",
+                                     subject="Subj", body="Body",
+                                     prompt_version="v1", model="test",
+                                     workspace_id=ws_id))
+
+    with session_scope() as session:
+        eligible, skipped = filter_eligible([lead_id], session)
+
+    assert lead_id in eligible, "Verified imported lead must pass the email_unverified gate"
+    assert lead_id not in skipped.get("email_unverified", [])
+
+
+# ---------------------------------------------------------------------------
+# V3. email_verified=False remains unverified
+# ---------------------------------------------------------------------------
+
+def test_email_verified_false_remains_unverified():
+    fields = map_contact({"id": "uv-1", "email": "uv1@x.com",
+                          "email_verified": False, "first_name": "U", "last_name": "V"})
+    assert fields["email_verification_status"] is None
+    assert fields["email_verification_provider"] is None
+    assert fields["email_verified_at"] is None
+
+
+# ---------------------------------------------------------------------------
+# V4. Manual import maps verification status correctly
+# ---------------------------------------------------------------------------
+
+def test_manual_import_maps_verification_status():
+    ws_id = _seed_ws()
+    contact = _verified_contact(id="v4-manual", email="v4-manual@x.com",
+                                first_name="V4", last_name="Manual")
+    log_id = _log(ws_id)
+    result = import_contacts([contact], workspace_id=ws_id, client_slug="osp", import_id=log_id)
+    assert result.created == 1
+
+    with session_scope() as session:
+        from src.models import Lead
+        lead = session.get(Lead, result.created_lead_ids[0])
+        assert lead.email_verification_status == "verified"
+        assert lead.email_verification_provider == "osp_lead_engine"
+        assert lead.email_verified_at is not None
+
+
+# ---------------------------------------------------------------------------
+# V5. Scheduled import maps verification status correctly
+# ---------------------------------------------------------------------------
+
+def test_scheduled_import_maps_verification_status(monkeypatch):
+    ws_id = _seed_ws()
+    _cfg(ws_id, auto_import=True, auto_process=False)
+
+    contact = _verified_contact(id="v5-sched", email="v5-sched@x.com",
+                                first_name="V5", last_name="Sched")
+
+    def fake_get(url, **kwargs):
+        if "contacts" in url:
+            return _FakeResp(200, {"contacts": [contact], "count": 1, "limit": 10, "offset": 0})
+        return _FakeResp(200, {"status": "ok"})
+
+    monkeypatch.setattr(client_mod.httpx, "get", fake_get)
+
+    _run(run_workspace_auto_import(ws_id))
+
+    with session_scope() as session:
+        from src.models import Lead
+        lead = session.execute(
+            select(Lead).where(Lead.external_contact_id == "v5-sched",
+                               Lead.workspace_id == ws_id)
+        ).scalar_one_or_none()
+        assert lead is not None
+        assert lead.email_verification_status == "verified"
+
+
+# ---------------------------------------------------------------------------
+# V6. Evergreen processing runs enrichment for newly imported leads
+# ---------------------------------------------------------------------------
+
+def test_evergreen_processing_runs_enrichment(monkeypatch):
+    ws_id = _seed_ws()
+    enrich_calls: list[int] = []
+
+    async def spy_enrich(lead_id, *, workspace_id=None):
+        enrich_calls.append(lead_id)
+
+    monkeypatch.setattr("src.enrichment.waterfall.enrich_lead", spy_enrich)
+    monkeypatch.setattr("src.scoring.score_lead", fake_score_lead)
+    monkeypatch.setattr("src.content.email.generate_email", fake_generate_email)
+    monkeypatch.setattr("src.content.call_script.generate_call_script", fake_generate_call_script)
+    monkeypatch.setattr("src.content.linkedin_msg.generate_linkedin_msg", fake_generate_linkedin_msg)
+
+    lead_id = _import_one(
+        _make_contact(id="v6-enrich", email="v6-enrich@x.com", first_name="V6", last_name="E"),
+        ws_id,
+    )
+    result = _run(process_imported_leads([lead_id], ws_id))
+
+    assert lead_id in enrich_calls
+    assert result["enriched_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# V7. Evergreen processing runs buyer research (part of enrich_lead waterfall)
+# ---------------------------------------------------------------------------
+
+def test_evergreen_processing_runs_buyer_research(monkeypatch):
+    """buyer_accounts discovery is inside the enrich_lead waterfall.
+    Verifying enrich_lead is called confirms buyer research will run."""
+    ws_id = _seed_ws()
+    enrich_calls: list[int] = []
+
+    async def spy_enrich(lead_id, *, workspace_id=None):
+        enrich_calls.append(lead_id)
+
+    monkeypatch.setattr("src.enrichment.waterfall.enrich_lead", spy_enrich)
+    monkeypatch.setattr("src.scoring.score_lead", fake_score_lead)
+    monkeypatch.setattr("src.content.email.generate_email", fake_generate_email)
+    monkeypatch.setattr("src.content.call_script.generate_call_script", fake_generate_call_script)
+    monkeypatch.setattr("src.content.linkedin_msg.generate_linkedin_msg", fake_generate_linkedin_msg)
+
+    lead_id = _import_one(
+        _make_contact(id="v7-buyer", email="v7-buyer@x.com", first_name="V7", last_name="B"),
+        ws_id,
+    )
+    _run(process_imported_leads([lead_id], ws_id))
+
+    assert lead_id in enrich_calls, (
+        "enrich_lead must be called — it runs buyer_accounts discovery in the waterfall"
+    )
+
+
+# ---------------------------------------------------------------------------
+# V8. Evergreen processing runs scoring
+# ---------------------------------------------------------------------------
+
+def test_evergreen_processing_runs_scoring(monkeypatch):
+    ws_id = _seed_ws()
+    scored: list[int] = []
+
+    async def spy_score(lead_id, *, workspace_id=None):
+        scored.append(lead_id)
+        return _FakeScoreResult()
+
+    monkeypatch.setattr("src.enrichment.waterfall.enrich_lead",
+                        lambda lead_id, *, workspace_id=None: None)
+    monkeypatch.setattr("src.scoring.score_lead", spy_score)
+    monkeypatch.setattr("src.content.email.generate_email", fake_generate_email)
+    monkeypatch.setattr("src.content.call_script.generate_call_script", fake_generate_call_script)
+    monkeypatch.setattr("src.content.linkedin_msg.generate_linkedin_msg", fake_generate_linkedin_msg)
+
+    lead_id = _import_one(
+        _make_contact(id="v8-score", email="v8-score@x.com", first_name="V8", last_name="S"),
+        ws_id,
+    )
+    result = _run(process_imported_leads([lead_id], ws_id))
+
+    assert lead_id in scored
+    assert result["scored_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# V9. Evergreen processing runs content generation
+# ---------------------------------------------------------------------------
+
+def test_evergreen_processing_runs_content_generation(monkeypatch):
+    ws_id = _seed_ws()
+    generated: list[int] = []
+
+    async def spy_gen(lead_id, *, workspace_id=None, **kw):
+        generated.append(lead_id)
+
+    monkeypatch.setattr("src.enrichment.waterfall.enrich_lead",
+                        lambda lead_id, *, workspace_id=None: None)
+    monkeypatch.setattr("src.scoring.score_lead", fake_score_lead)
+    monkeypatch.setattr("src.content.email.generate_email", spy_gen)
+    monkeypatch.setattr("src.content.call_script.generate_call_script", spy_gen)
+    monkeypatch.setattr("src.content.linkedin_msg.generate_linkedin_msg", spy_gen)
+
+    lead_id = _import_one(
+        _make_contact(id="v9-content", email="v9-content@x.com", first_name="V9", last_name="C"),
+        ws_id,
+    )
+    result = _run(process_imported_leads([lead_id], ws_id))
+
+    assert generated.count(lead_id) == 3
+    assert result["content_generated_count"] == 3
+
+
+# ---------------------------------------------------------------------------
+# V10. Duplicate imported leads do not rerun enrichment/content
+# ---------------------------------------------------------------------------
+
+def test_duplicate_leads_do_not_rerun_enrichment(monkeypatch):
+    ws_id = _seed_ws()
+    enrich_calls: list[int] = []
+
+    async def spy_enrich(lead_id, *, workspace_id=None):
+        enrich_calls.append(lead_id)
+        # Create an actual Enrichment row so _has_enrichment returns True next time
+        from src.models import Enrichment
+        with session_scope() as s:
+            if not s.execute(
+                select(Enrichment).where(Enrichment.lead_id == lead_id)
+            ).scalar_one_or_none():
+                s.add(Enrichment(lead_id=lead_id, workspace_id=ws_id))
+
+    monkeypatch.setattr("src.enrichment.waterfall.enrich_lead", spy_enrich)
+    monkeypatch.setattr("src.scoring.score_lead", fake_score_lead)
+    monkeypatch.setattr("src.content.email.generate_email", fake_generate_email)
+    monkeypatch.setattr("src.content.call_script.generate_call_script", fake_generate_call_script)
+    monkeypatch.setattr("src.content.linkedin_msg.generate_linkedin_msg", fake_generate_linkedin_msg)
+
+    lead_id = _import_one(
+        _make_contact(id="v10-dup", email="v10-dup@x.com", first_name="V10", last_name="D"),
+        ws_id,
+    )
+
+    _run(process_imported_leads([lead_id], ws_id))
+    assert len(enrich_calls) == 1
+
+    # Second call — Enrichment row exists, must skip
+    _run(process_imported_leads([lead_id], ws_id))
+    assert len(enrich_calls) == 1, "Enrichment must not rerun when Enrichment row already exists"
+
+
+# ---------------------------------------------------------------------------
+# V11. Existing verified email is not overwritten by blank data
+# ---------------------------------------------------------------------------
+
+def test_existing_verified_email_not_overwritten():
+    ws_id = _seed_ws()
+
+    # Import a verified contact
+    contact1 = _verified_contact(id="v11-orig", email="v11@x.com",
+                                 first_name="V11", last_name="Orig")
+    log_id = _log(ws_id)
+    r1 = import_contacts([contact1], workspace_id=ws_id, client_slug="osp", import_id=log_id)
+    assert r1.created == 1
+
+    # Re-import with email_verified=False (should NOT overwrite existing "verified" status)
+    contact2 = dict(contact1)
+    contact2["email_verified"] = False
+    log_id2 = _log(ws_id)
+    import_contacts([contact2], workspace_id=ws_id, client_slug="osp", import_id=log_id2)
+
+    with session_scope() as session:
+        from src.models import Lead
+        lead = session.get(Lead, r1.created_lead_ids[0])
+        assert lead.email_verification_status == "verified", (
+            "Existing verified email must not be overwritten by a re-import with email_verified=False"
+        )
+
+
+# ---------------------------------------------------------------------------
+# V12. Workspace isolation remains intact
+# ---------------------------------------------------------------------------
+
+def test_workspace_isolation_email_verification():
+    ws_a = _seed_ws()
+    ws_b = _ws("IsoB-V12", "iso-b-v12")
+
+    contact_a = _verified_contact(id="v12-a", email="v12-a@x.com",
+                                  first_name="A12", last_name="Iso")
+    contact_b = _unverified_contact(id="v12-b", email="v12-b@x.com",
+                                    first_name="B12", last_name="Iso")
+
+    log_a = _log(ws_a)
+    import_contacts([contact_a], workspace_id=ws_a, client_slug="osp", import_id=log_a)
+
+    log_b = _log(ws_b)
+    import_contacts([contact_b], workspace_id=ws_b, client_slug="osp", import_id=log_b)
+
+    # Read all attributes inside the session scope to avoid DetachedInstanceError
+    with session_scope() as session:
+        from src.models import Lead
+        lead_a = session.execute(
+            select(Lead).where(Lead.external_contact_id == "v12-a",
+                               Lead.workspace_id == ws_a)
+        ).scalar_one_or_none()
+        lead_b = session.execute(
+            select(Lead).where(Lead.external_contact_id == "v12-b",
+                               Lead.workspace_id == ws_b)
+        ).scalar_one_or_none()
+        a_status = lead_a.email_verification_status if lead_a else None
+        b_status = lead_b.email_verification_status if lead_b else None
+        leads_in_b = session.execute(
+            select(Lead).where(Lead.workspace_id == ws_b)
+        ).scalars().all()
+        b_statuses = [l.email_verification_status for l in leads_in_b]
+
+    assert a_status == "verified"
+    assert b_status is None
+    assert not any(s == "verified" for s in b_statuses), (
+        "Verified lead in workspace A must not appear in workspace B"
+    )
+
+
+# ---------------------------------------------------------------------------
+# V13. No Instantly push happens automatically (with enrichment path)
+# ---------------------------------------------------------------------------
+
+def test_no_instantly_push_with_enrichment(monkeypatch):
+    ws_id = _seed_ws()
+    instantly_calls: list[str] = []
+
+    def spy_http(url, **kwargs):
+        if "instantly" in url.lower():
+            instantly_calls.append(url)
+        return _FakeResp(200, {"status": "ok"})
+
+    monkeypatch.setattr(client_mod.httpx, "get", spy_http)
+    monkeypatch.setattr("httpx.post", lambda url, **kw: _FakeResp(200, {}))
+    monkeypatch.setattr("src.enrichment.waterfall.enrich_lead",
+                        lambda lead_id, *, workspace_id=None: None)
+    monkeypatch.setattr("src.scoring.score_lead", fake_score_lead)
+    monkeypatch.setattr("src.content.email.generate_email", fake_generate_email)
+    monkeypatch.setattr("src.content.call_script.generate_call_script", fake_generate_call_script)
+    monkeypatch.setattr("src.content.linkedin_msg.generate_linkedin_msg", fake_generate_linkedin_msg)
+
+    lead_id = _import_one(
+        _verified_contact(id="v13-nopush", email="v13-nopush@x.com",
+                          first_name="V13", last_name="NP"),
+        ws_id,
+    )
+    _run(process_imported_leads([lead_id], ws_id))
+
+    assert instantly_calls == [], "No Instantly calls must occur even for verified leads"
+
+
+# ---------------------------------------------------------------------------
+# V14. No emails are sent automatically (with enrichment path)
+# ---------------------------------------------------------------------------
+
+def test_no_emails_sent_automatically_with_enrichment(monkeypatch):
+    ws_id = _seed_ws()
+    monkeypatch.setattr("src.enrichment.waterfall.enrich_lead",
+                        lambda lead_id, *, workspace_id=None: None)
+    monkeypatch.setattr("src.scoring.score_lead", fake_score_lead)
+    monkeypatch.setattr("src.content.email.generate_email", fake_generate_email)
+    monkeypatch.setattr("src.content.call_script.generate_call_script", fake_generate_call_script)
+    monkeypatch.setattr("src.content.linkedin_msg.generate_linkedin_msg", fake_generate_linkedin_msg)
+
+    lead_id = _import_one(
+        _verified_contact(id="v14-nosend", email="v14-nosend@x.com",
+                          first_name="V14", last_name="NS"),
+        ws_id,
+    )
+    _run(process_imported_leads([lead_id], ws_id))
+
+    with session_scope() as session:
+        contents = session.execute(
+            select(GeneratedContent).where(GeneratedContent.lead_id == lead_id)
+        ).scalars().all()
+        for c in contents:
+            assert c.delivered_at is None
+            assert c.delivery_status != "sent" if c.delivery_status else True
+

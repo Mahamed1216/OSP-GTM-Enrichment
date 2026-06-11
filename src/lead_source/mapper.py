@@ -12,9 +12,12 @@ Strategy:
   - Map known fields to Lead columns.
   - Store the entire ContactOut as lead_source_raw for provenance.
   - Never crash on missing optional fields — every get() has a default.
+  - email_verified=True  →  set email_verification_status="verified" so the
+    Push-to-Instantly eligibility check treats this lead as pre-verified.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 
@@ -40,6 +43,20 @@ def map_contact(contact: dict[str, Any]) -> dict[str, Any]:
 
     full_name = f"{first_name} {last_name}".strip()
 
+    # Email verification — OSP Lead Engine pre-verifies emails before exposure.
+    # When email_verified=True, stamp our local verification columns so the
+    # eligibility check (_is_verified in eligibility.py) sees the lead as
+    # verified without a separate verification pass.
+    email_verified = bool(contact.get("email_verified", False))
+    if email_verified:
+        email_verification_status = "verified"
+        email_verification_provider = "osp_lead_engine"
+        email_verified_at: datetime | None = datetime.utcnow()
+    else:
+        email_verification_status = None
+        email_verification_provider = None
+        email_verified_at = None
+
     return {
         # Lead model columns
         "external_contact_id": external_id or None,
@@ -55,6 +72,10 @@ def map_contact(contact: dict[str, Any]) -> dict[str, Any]:
         "industry": industry or None,
         "lead_source_raw": contact,        # full raw payload — includes signals, matched_icps,
                                            # tier, tier_score, source_metadata, etc.
+        # Email verification fields — set from API payload
+        "email_verification_status": email_verification_status,
+        "email_verification_provider": email_verification_provider,
+        "email_verified_at": email_verified_at,
         # Internal dedup helper — NOT a Lead column
         "_full_name": full_name,
     }
