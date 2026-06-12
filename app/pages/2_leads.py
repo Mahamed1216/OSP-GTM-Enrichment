@@ -14,7 +14,7 @@ import streamlit as st
 
 from app.lib.async_runner import run_async
 from app.lib.badges import status_pill, tier_badge
-from app.lib.db_queries import list_leads
+from app.lib.db_queries import count_leads, list_leads
 from app.lib.workspace_state import get_current_workspace_id, render_workspace_banner
 from app.styles import inject_styles
 from src.config import settings
@@ -33,20 +33,12 @@ inject_styles()
 
 _CONFIRM_TTL = 5.0  # seconds for two-click confirm window
 _BULK_PUSH_HARD_LIMIT = 10  # over this requires "I understand" checkbox
-
-@st.cache_data(ttl=30)
-def _list_leads_cached(workspace_id: int | None) -> pd.DataFrame:
-    return list_leads(workspace_id=workspace_id)
+_PAGE_SIZES = [25, 50, 100, 250]
+_DEFAULT_PAGE_SIZE = 50
 
 
 def _row_status(row: pd.Series) -> str:
-    """Pick the dominant delivery state for the Status pill.
-
-    Replied dominates Sent (any reply implies a send); Sent dominates the
-    default Pending. Bounced is surfaced when the engagement flag is set
-    on the existing list_leads frame — currently we don't carry bounced
-    into the leads frame, so this collapses to {replied, sent, pending}.
-    """
+    """Pick the dominant delivery state for the Status pill."""
     if bool(row.get("Replied")):
         return status_pill("replied")
     if bool(row.get("Sent")):
@@ -54,7 +46,62 @@ def _row_status(row: pd.Series) -> str:
     return status_pill("pending")
 
 
+@st.cache_data(ttl=30)
+def _count_leads_cached(
+    workspace_id: int | None,
+    search: str,
+    tier_filter: tuple,
+    sent_only: bool,
+    not_sent_only: bool,
+    enriched_only: bool,
+) -> int:
+    return count_leads(
+        workspace_id,
+        search=search,
+        tier_filter=list(tier_filter) if tier_filter else None,
+        sent_only=sent_only,
+        not_sent_only=not_sent_only,
+        enriched_only=enriched_only,
+    )
+
+
+@st.cache_data(ttl=30)
+def _list_leads_cached(
+    workspace_id: int | None,
+    page: int,
+    page_size: int,
+    search: str,
+    tier_filter: tuple,
+    sent_only: bool,
+    not_sent_only: bool,
+    enriched_only: bool,
+) -> pd.DataFrame:
+    return list_leads(
+        workspace_id,
+        limit=page_size,
+        offset=(page - 1) * page_size,
+        search=search,
+        tier_filter=list(tier_filter) if tier_filter else None,
+        sent_only=sent_only,
+        not_sent_only=not_sent_only,
+        enriched_only=enriched_only,
+    )
+
+
+# ---------- Page / session state ----------
 _ws_id = get_current_workspace_id()
+
+if "leads_page" not in st.session_state:
+    st.session_state["leads_page"] = 1
+if "leads_page_size" not in st.session_state:
+    st.session_state["leads_page_size"] = _DEFAULT_PAGE_SIZE
+
+
+def _reset_page() -> None:
+    """Reset to page 1 and clear the row selection when any filter changes."""
+    st.session_state["leads_page"] = 1
+    st.session_state.pop("leads_table", None)
+
 
 st.markdown(
     '<div style="margin-bottom: 3rem;">'
@@ -66,37 +113,25 @@ st.markdown(
 
 render_workspace_banner()
 
-try:
-    df = _list_leads_cached(workspace_id=_ws_id)
-except Exception as exc:
-    st.error(f"Could not load leads: {exc}")
-    st.stop()
-
-if df.empty:
-    st.info("No leads yet in this workspace. Use the Run Pipeline page to ingest a CSV.")
-    st.stop()
-
 # ---------- Search ----------
 search_query = st.text_input(
     "Search leads",
     placeholder="Search by name or email",
     key="leads_search",
+    on_change=_reset_page,
 )
 
 # ---------- Filters ----------
-# Wrapper is a presentational marker — Streamlit places its native widgets
-# in their own DOM tree, so this div mostly serves as visual scaffolding and
-# may not wrap the widgets at the DOM level. Kept for parity with the rest
-# of the design system (see .filter-row in app/styles.py).
 def _on_sent_change() -> None:
-    """When 'Sent only' is checked, clear 'Not sent' so the pair stays exclusive."""
     if st.session_state.get("leads_filter_sent"):
         st.session_state["leads_filter_not_sent"] = False
+    _reset_page()
 
 
 def _on_not_sent_change() -> None:
     if st.session_state.get("leads_filter_not_sent"):
         st.session_state["leads_filter_sent"] = False
+    _reset_page()
 
 
 st.markdown('<div class="filter-row">', unsafe_allow_html=True)
@@ -108,6 +143,7 @@ with fc1:
         default=[],
         key="leads_filter_tier",
         placeholder="All tiers",
+        on_change=_reset_page,
     )
 with fc2:
     sent_only = st.checkbox(
@@ -118,56 +154,91 @@ with fc3:
         "Not sent", key="leads_filter_not_sent", on_change=_on_not_sent_change
     )
 with fc4:
-    enriched_only = st.checkbox("Has enrichment", key="leads_filter_enriched")
+    enriched_only = st.checkbox("Has enrichment", key="leads_filter_enriched",
+                                on_change=_reset_page)
 st.markdown('</div>', unsafe_allow_html=True)
 
-filtered = df.copy()
-if tier_filter:
-    filtered = filtered[filtered["Tier"].isin(tier_filter)]
-if sent_only:
-    filtered = filtered[filtered["Sent"]]
-if not_sent_only:
-    filtered = filtered[~filtered["Sent"].astype(bool)]
-if enriched_only:
-    filtered = filtered[filtered["Enriched"]]
-if search_query and search_query.strip():
-    _q = search_query.strip().lower()
-    _mask = (
-        filtered["Name"].str.lower().str.contains(_q, na=False)
-        | filtered["Email"].str.lower().str.contains(_q, na=False)
-    )
-    filtered = filtered[_mask]
+# ---------- Resolve current pagination state ----------
+_page = st.session_state["leads_page"]
+_page_size = st.session_state["leads_page_size"]
+_search = (search_query or "").strip()
+_tiers = tuple(tier_filter)
+_sent = bool(st.session_state.get("leads_filter_sent"))
+_not_sent = bool(st.session_state.get("leads_filter_not_sent"))
+_enriched = bool(st.session_state.get("leads_filter_enriched"))
 
-# Markdown-rendered Tier + Status columns for display; keep the original Tier
-# (single-letter) for filtering above. Streamlit's :color-background[] shorthand
-# is rendered natively in dataframe string cells when no explicit column type
-# overrides it — we leave Tier and Status without an explicit column_config so
-# they auto-render as pills.
-display_df = filtered.copy()
-display_df["Tier"] = display_df["Tier"].apply(tier_badge)
-display_df["Status"] = filtered.apply(_row_status, axis=1)
-
-if filtered.empty:
-    if search_query and search_query.strip():
-        st.info("No leads found for this search.")
-    else:
-        st.info("No leads match the current filters.")
+# ---------- Load data (server-side filtered + paginated) ----------
+try:
+    _total = _count_leads_cached(_ws_id, _search, _tiers, _sent, _not_sent, _enriched)
+    df = _list_leads_cached(_ws_id, _page, _page_size, _search, _tiers, _sent, _not_sent, _enriched)
+except Exception as exc:
+    st.error(f"Could not load leads: {exc}")
     st.stop()
 
-if search_query and search_query.strip():
-    st.caption(f"Showing {len(filtered)} matching leads")
-else:
-    st.caption(f"{len(filtered)} of {len(df)} leads")
+if _total == 0:
+    if _search or _tiers or _sent or _not_sent or _enriched:
+        st.info("No leads match the current filters.")
+    else:
+        st.info("No leads yet in this workspace. Use the Run Pipeline page to ingest a CSV.")
+    st.stop()
 
-# ---------- Bulk select range (operates on current filtered/sorted view) ----------
+# Clamp page if it's beyond the last page (e.g. after bulk delete)
+_total_pages = max(1, (_total + _page_size - 1) // _page_size)
+if _page > _total_pages:
+    st.session_state["leads_page"] = _total_pages
+    _page = _total_pages
+
+_row_start = (_page - 1) * _page_size + 1
+_row_end = min(_page * _page_size, _total)
+
+
+# ---------- Pagination helper ----------
+def _pagination_controls(key_prefix: str) -> None:
+    """Render prev / next / info / page-size controls. key_prefix keeps keys unique."""
+    pc1, pc2, pc3, pc4 = st.columns([1, 1, 4, 2])
+    with pc1:
+        if st.button("← Prev", key=f"{key_prefix}_prev", disabled=(_page <= 1)):
+            st.session_state["leads_page"] = _page - 1
+            st.session_state.pop("leads_table", None)
+            st.rerun()
+    with pc2:
+        if st.button("Next →", key=f"{key_prefix}_next", disabled=(_page >= _total_pages)):
+            st.session_state["leads_page"] = _page + 1
+            st.session_state.pop("leads_table", None)
+            st.rerun()
+    with pc3:
+        st.caption(
+            f"Showing **{_row_start}–{_row_end}** of **{_total}** leads  ·  "
+            f"Page {_page} of {_total_pages}"
+        )
+    with pc4:
+        _sz_idx = _PAGE_SIZES.index(_page_size) if _page_size in _PAGE_SIZES else 1
+        _new_sz = st.selectbox(
+            "Rows per page",
+            options=_PAGE_SIZES,
+            index=_sz_idx,
+            key=f"{key_prefix}_page_size",
+            label_visibility="collapsed",
+        )
+        if _new_sz != _page_size:
+            st.session_state["leads_page_size"] = _new_sz
+            st.session_state["leads_page"] = 1
+            st.session_state.pop("leads_table", None)
+            st.rerun()
+
+
+# ---------- Top pagination ----------
+_pagination_controls("pag_top")
+
+# ---------- Bulk select range (operates on the current page) ----------
 nc1, nc2, nc3, _ = st.columns([1, 1, 1, 3], vertical_alignment="bottom")
-_n_total = len(filtered)
+_n_page = len(df)
 with nc1:
     select_from = st.number_input(
         "From",
         min_value=1,
-        max_value=_n_total,
-        value=min(1, _n_total),
+        max_value=max(1, _n_page),
+        value=min(1, _n_page),
         step=1,
         key="leads_select_from",
     )
@@ -175,19 +246,24 @@ with nc2:
     select_to = st.number_input(
         "To",
         min_value=1,
-        max_value=_n_total,
-        value=min(50, _n_total),
+        max_value=max(1, _n_page),
+        value=min(_n_page, _n_page),
         step=1,
         key="leads_select_to",
     )
 with nc3:
     if st.button("Select", key="leads_select_range_btn"):
         lo = max(1, int(min(select_from, select_to)))
-        hi = min(_n_total, int(max(select_from, select_to)))
+        hi = min(_n_page, int(max(select_from, select_to)))
         st.session_state["leads_table"] = {
             "selection": {"rows": list(range(lo - 1, hi)), "columns": []}
         }
         st.rerun()
+
+# ---------- Build display frame (badge columns only — SQL already filtered) ----------
+display_df = df.copy()
+display_df["Tier"] = display_df["Tier"].apply(tier_badge)
+display_df["Status"] = df.apply(_row_status, axis=1)
 
 selection = st.dataframe(
     display_df,
@@ -200,17 +276,18 @@ selection = st.dataframe(
         "id": st.column_config.NumberColumn("ID", width="small"),
         "Score": st.column_config.NumberColumn("Score", format="%d"),
         "Enriched": st.column_config.CheckboxColumn("Enriched"),
-        "Sent": None,       # hidden — Status column subsumes
-        "Replied": None,    # hidden — Status column subsumes
-        "Email": None,      # hidden — used for search only
-        # Tier + Status: no explicit type → Streamlit renders the
-        # :color-background[] markdown shorthand as colored pills.
+        "Sent": None,
+        "Replied": None,
+        "Email": None,
     },
     key="leads_table",
 )
 
+# ---------- Bottom pagination ----------
+_pagination_controls("pag_bot")
+
 selected_rows = selection.selection.rows if selection and selection.selection else []
-selected_lead_ids = [int(filtered.iloc[i]["id"]) for i in selected_rows if i < len(filtered)]
+selected_lead_ids = [int(df.iloc[i]["id"]) for i in selected_rows if i < len(df)]
 
 # ---------- Action bar (visible only when ≥1 row selected) ----------
 if selected_lead_ids:

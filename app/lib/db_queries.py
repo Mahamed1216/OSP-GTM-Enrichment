@@ -260,8 +260,24 @@ def ready_to_send_count(workspace_id: int | None = None) -> int:
         return int(session.execute(stmt).scalar() or 0)
 
 
-def list_leads(workspace_id: int | None = None) -> pd.DataFrame:
-    """Lead list with joined score/enrichment/email-delivery/reply flags."""
+def list_leads(
+    workspace_id: int | None = None,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    search: str = "",
+    tier_filter: list[str] | None = None,
+    sent_only: bool = False,
+    not_sent_only: bool = False,
+    enriched_only: bool = False,
+) -> pd.DataFrame:
+    """Lead list with joined score/enrichment/email-delivery/reply flags.
+
+    All filtering happens in SQL before LIMIT/OFFSET so the DB does the work
+    instead of loading the full table into Python for slicing.
+    """
+    from sqlalchemy import or_
+
     email_sub = _email_content_subq(workspace_id=workspace_id)
     stmt = (
         select(
@@ -303,10 +319,33 @@ def list_leads(workspace_id: int | None = None) -> pd.DataFrame:
             Enrichment.id,
             email_sub.c.any_delivered,
         )
-        .order_by(Lead.id.asc())
+        .order_by(Lead.id.desc())  # newest first
     )
     if workspace_id is not None:
         stmt = stmt.where(Lead.workspace_id == workspace_id)
+
+    if search and search.strip():
+        q = f"%{search.strip()}%"
+        stmt = stmt.where(
+            or_(
+                Lead.first_name.ilike(q),
+                Lead.last_name.ilike(q),
+                Lead.email.ilike(q),
+            )
+        )
+    if tier_filter:
+        stmt = stmt.where(Score.tier.in_(tier_filter))
+    if enriched_only:
+        stmt = stmt.where(Enrichment.id.is_not(None))
+    if sent_only:
+        stmt = stmt.where(email_sub.c.any_delivered == 1)
+    elif not_sent_only:
+        stmt = stmt.where(
+            or_(email_sub.c.any_delivered == 0, email_sub.c.any_delivered.is_(None))
+        )
+
+    stmt = stmt.limit(limit).offset(offset)
+
     with session_scope() as session:
         rows = session.execute(stmt).all()
 
@@ -330,6 +369,56 @@ def list_leads(workspace_id: int | None = None) -> pd.DataFrame:
         records,
         columns=["id", "Name", "Email", "Company", "Title", "Tier", "Score", "Enriched", "Sent", "Replied"],
     )
+
+
+def count_leads(
+    workspace_id: int | None = None,
+    *,
+    search: str = "",
+    tier_filter: list[str] | None = None,
+    sent_only: bool = False,
+    not_sent_only: bool = False,
+    enriched_only: bool = False,
+) -> int:
+    """COUNT(*) for the current filter set — used for pagination metadata."""
+    from sqlalchemy import or_
+
+    stmt = (
+        select(func.count(func.distinct(Lead.id)))
+        .select_from(Lead)
+        .outerjoin(Score, Score.lead_id == Lead.id)
+        .outerjoin(Enrichment, Enrichment.lead_id == Lead.id)
+    )
+
+    email_sub = None
+    if sent_only or not_sent_only:
+        email_sub = _email_content_subq(workspace_id=workspace_id)
+        stmt = stmt.outerjoin(email_sub, email_sub.c.lead_id == Lead.id)
+
+    if workspace_id is not None:
+        stmt = stmt.where(Lead.workspace_id == workspace_id)
+    if search and search.strip():
+        q = f"%{search.strip()}%"
+        stmt = stmt.where(
+            or_(
+                Lead.first_name.ilike(q),
+                Lead.last_name.ilike(q),
+                Lead.email.ilike(q),
+            )
+        )
+    if tier_filter:
+        stmt = stmt.where(Score.tier.in_(tier_filter))
+    if enriched_only:
+        stmt = stmt.where(Enrichment.id.is_not(None))
+    if sent_only and email_sub is not None:
+        stmt = stmt.where(email_sub.c.any_delivered == 1)
+    elif not_sent_only and email_sub is not None:
+        stmt = stmt.where(
+            or_(email_sub.c.any_delivered == 0, email_sub.c.any_delivered.is_(None))
+        )
+
+    with session_scope() as session:
+        return int(session.execute(stmt).scalar() or 0)
 
 
 def get_scored_lead_ids(lead_ids: list[int]) -> set[int]:
