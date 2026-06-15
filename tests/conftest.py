@@ -1,23 +1,40 @@
-"""Shared test fixtures: in-memory SQLite, fresh schema per test."""
-import os
+"""Shared test fixtures: file-based SQLite, fresh schema per test.
 
-# Set before importing src.* so settings load with this URL
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
+Why a file (not ``:memory:`` + StaticPool):
+
+An in-memory StaticPool engine shares ONE physical DBAPI connection across
+the whole process. That single-connection model is unfaithful to every real
+deployment (file-SQLite and Postgres both use a multi-connection QueuePool),
+and it breaks any code path that briefly checks out its own connection while
+a session is mid-transaction. Concretely, the ``Lead.workspace_id`` column
+default (``_default_workspace_id`` in ``src/models.py``) opens a short-lived
+AUTOCOMMIT connection during ``flush()``; under StaticPool that is the *same*
+connection the session is using, so it destroyed the active SAVEPOINT and
+made per-row CSV ingest skip every row (``no such savepoint``). A file DB
+hands out separate connections, so the checkout no longer collides — exactly
+matching production behavior.
+"""
+import atexit
+import os
+import tempfile
+from pathlib import Path
+
+# Create the temp DB path BEFORE importing src.* so settings bind to it.
+_TEST_DB_FD, _TEST_DB_PATH = tempfile.mkstemp(suffix=".sqlite", prefix="sdr_test_")
+os.close(_TEST_DB_FD)
+os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB_PATH}"
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-# Patch the db module's engine + SessionLocal to use a single in-memory DB
-# shared across the test process (StaticPool keeps the same connection alive)
-from sqlalchemy.pool import StaticPool
-
 from src import db as _db
 
+# File-based engine → default (Queue) pool, separate connections per checkout,
+# just like production. check_same_thread=False keeps async tests happy.
 _test_engine = create_engine(
-    "sqlite://",
+    os.environ["DATABASE_URL"],
     connect_args={"check_same_thread": False},
-    poolclass=StaticPool,
     future=True,
 )
 _db.engine = _test_engine
@@ -33,6 +50,18 @@ def fresh_db():
     Base.metadata.create_all(_test_engine)
     yield
     Base.metadata.drop_all(_test_engine)
+
+
+@atexit.register
+def _cleanup_test_db() -> None:
+    try:
+        _test_engine.dispose()
+    except Exception:
+        pass
+    try:
+        Path(_TEST_DB_PATH).unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 @pytest.fixture

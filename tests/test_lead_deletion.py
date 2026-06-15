@@ -151,15 +151,25 @@ def test_delete_lead_clears_supersede_chain_under_fk_enforcement(sample_lead_id)
     self-referencing GeneratedContent.superseded_by_id chain doesn't trip
     the cascade.
 
-    Tests use a shared StaticPool connection (conftest), so we set the
-    pragma on that single connection rather than disposing the engine —
-    disposing would lose the in-memory schema.
+    The conftest engine is file-based with a normal (multi-connection)
+    pool, so ``PRAGMA foreign_keys`` — a per-connection setting — has to be
+    applied via a connect-time listener that fires for every new connection,
+    not set once on a single shared connection. Register the listener and
+    dispose the pool so fresh connections pick it up; remove it and dispose
+    again in teardown so other tests keep FK enforcement off. Dispose is
+    safe here because the schema lives on disk (a file DB), not in memory.
     """
+    from sqlalchemy import event
+
     from src import db as db_module
 
-    with db_module.engine.connect() as conn:
-        conn.exec_driver_sql("PRAGMA foreign_keys = ON")
-        assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+    def _enable_fk(dbapi_connection, connection_record):
+        cur = dbapi_connection.cursor()
+        cur.execute("PRAGMA foreign_keys = ON")
+        cur.close()
+
+    event.listen(db_module.engine, "connect", _enable_fk)
+    db_module.engine.dispose()  # drop pooled connections so new ones enforce FKs
 
     try:
         with session_scope() as session:
@@ -178,8 +188,8 @@ def test_delete_lead_clears_supersede_chain_under_fk_enforcement(sample_lead_id)
             ).all()
             assert remaining == []
     finally:
-        with db_module.engine.connect() as conn:
-            conn.exec_driver_sql("PRAGMA foreign_keys = OFF")
+        event.remove(db_module.engine, "connect", _enable_fk)
+        db_module.engine.dispose()  # fresh connections revert to FK off
 
 
 def test_delete_lead_removes_engagements_without_cascade(sample_lead_id):
