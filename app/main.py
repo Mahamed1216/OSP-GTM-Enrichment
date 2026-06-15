@@ -29,6 +29,7 @@ bootstrap_env_from_streamlit_secrets()
 
 from app.lib.auth import (  # noqa: E402  after bootstrap
     is_auth_enabled,
+    is_auth_misconfigured,
     is_authenticated,
     login,
     logout,
@@ -38,8 +39,22 @@ from app.styles import inject_styles  # noqa: E402  after set_page_config
 inject_styles()
 
 # -----------------------------------------------------------------------
-# Auth gate. Shared password from APP_PASSWORD. If unset, dev-mode bypass.
+# Auth gate (fail-closed). Authentication is required by default; set
+# APP_PASSWORD to enable login. Auth can only be disabled by explicitly
+# setting AUTH_REQUIRED=false (local-dev opt-in). If auth is required but
+# no password is configured, refuse to render rather than expose the app.
 # -----------------------------------------------------------------------
+if is_auth_misconfigured():
+    st.title("Configuration required")
+    st.error(
+        "This deployment requires authentication but no access password is "
+        "set. Configure **APP_PASSWORD** (in Streamlit secrets or the "
+        "environment) to enable sign-in.\n\n"
+        "For local development only, you may set **AUTH_REQUIRED=false** to "
+        "run without a password."
+    )
+    st.stop()
+
 if is_auth_enabled() and not is_authenticated():
     st.title("Sign in to OSP")
     st.caption("Enter the access password to continue.")

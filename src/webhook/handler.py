@@ -71,7 +71,6 @@ class WebhookResult(BaseModel):
     detail: str | None = None
     ai_failed: bool = False
     anthropic_key_present: bool | None = None
-    anthropic_key_prefix: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -161,12 +160,14 @@ def _find_or_create_lead(
 # ---------------------------------------------------------------------------
 
 def _anthropic_key_diagnostic() -> dict:
-    """Return safe presence/prefix info for the Anthropic API key."""
+    """Return safe presence info for the Anthropic API key.
+
+    Only a boolean presence flag is exposed — no part of the key value is
+    ever returned or logged.
+    """
     import os
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
-    present = bool(key)
-    prefix = key[:8] if len(key) >= 8 else None
-    return {"anthropic_key_present": present, "anthropic_key_prefix": prefix}
+    present = bool(os.environ.get("ANTHROPIC_API_KEY", ""))
+    return {"anthropic_key_present": present}
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +382,6 @@ async def handle_reply_webhook(payload: WebhookPayload) -> WebhookResult:
         classification=agent_result.classification,
         ai_failed=ai_failed,
         anthropic_key_present=key_diag["anthropic_key_present"],
-        anthropic_key_prefix=key_diag["anthropic_key_prefix"],
     )
 
 
