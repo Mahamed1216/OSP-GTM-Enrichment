@@ -28,6 +28,7 @@ SkipReason = Literal[
     "already_delivered",
     "email_invalid",
     "no_email_content",
+    "workspace_not_configured",
 ]
 
 
@@ -94,13 +95,17 @@ def _accept_verification(status: str, strict: bool = False) -> bool:
 
 
 @retry_api
-async def get_lead(remote_lead_id: str) -> dict:
+async def get_lead(remote_lead_id: str, api_key: str | None = None) -> dict:
     """GET /api/v2/leads/{id}. Used by the push-one smoke to read back the
-    custom_variables that landed on Instantly's side."""
+    custom_variables that landed on Instantly's side.
+
+    api_key defaults to the env key (single-workspace behavior). Pass a
+    workspace-resolved key so multi-workspace flows read from the correct
+    Instantly account."""
     async with httpx.AsyncClient(timeout=_CLIENT_TIMEOUT) as client:
         resp = await client.get(
             f"{_API_BASE}/leads/{remote_lead_id}",
-            headers=_auth_headers(),
+            headers=_auth_headers(api_key),
         )
         resp.raise_for_status()
         return resp.json()
@@ -119,7 +124,9 @@ async def _post_lead_to_campaign(payload: dict, api_key: str | None = None) -> d
 
 
 @retry_api
-async def find_leads_by_email(email: str, campaign_id: str) -> list[dict]:
+async def find_leads_by_email(
+    email: str, campaign_id: str, api_key: str | None = None
+) -> list[dict]:
     """Look up leads in the configured campaign whose email matches `email`.
 
     Uses POST /api/v2/leads/list with the campaign filter + search term.
@@ -131,6 +138,10 @@ async def find_leads_by_email(email: str, campaign_id: str) -> list[dict]:
     Returns a list (zero, one, or many). The bulk-overwrite caller treats
     >1 as a duplicate-warning case and refuses to update without operator
     intervention.
+
+    api_key defaults to the env key (single-workspace behavior). Pass a
+    workspace-resolved key so the lookup runs against the correct campaign's
+    Instantly account.
     """
     if not email or not campaign_id:
         return []
@@ -138,7 +149,7 @@ async def find_leads_by_email(email: str, campaign_id: str) -> list[dict]:
     async with httpx.AsyncClient(timeout=_CLIENT_TIMEOUT) as client:
         resp = await client.post(
             f"{_API_BASE}/leads/list",
-            headers=_auth_headers(),
+            headers=_auth_headers(api_key),
             json={"campaign": campaign_id, "search": email, "limit": 50},
         )
         resp.raise_for_status()
@@ -154,18 +165,23 @@ async def find_leads_by_email(email: str, campaign_id: str) -> list[dict]:
 
 
 @retry_api
-async def patch_lead(remote_lead_id: str, payload: dict) -> dict:
+async def patch_lead(
+    remote_lead_id: str, payload: dict, api_key: str | None = None
+) -> dict:
     """PATCH /api/v2/leads/{id} — update fields on an existing Instantly lead.
 
     Used by the overwrite flow to update `custom_variables` (subject/body)
     without re-creating the lead or touching the campaign schedule.
     Raises httpx.HTTPStatusError on non-2xx; the caller distinguishes
     "Instantly refused to update" (405/400) from transient failures.
+
+    api_key defaults to the env key (single-workspace behavior). Pass a
+    workspace-resolved key so the update targets the correct account.
     """
     async with httpx.AsyncClient(timeout=_CLIENT_TIMEOUT) as client:
         resp = await client.patch(
             f"{_API_BASE}/leads/{remote_lead_id}",
-            headers=_auth_headers(),
+            headers=_auth_headers(api_key),
             json=payload,
         )
         resp.raise_for_status()
@@ -259,9 +275,15 @@ async def deliver_email(
 
     # All guards passed — build payload + send.
     # Phase 6: resolve campaign_id and api_key from workspace.
+    # When an explicit workspace is selected, never fall back to the env/default
+    # account — a missing workspace config must skip, not send through the wrong
+    # campaign. workspace_id=None keeps the single-workspace env fallback.
     from src.workspace import get_campaign_id_for_workspace, get_api_key_for_workspace
-    _campaign_id = get_campaign_id_for_workspace(workspace_id)
-    _api_key = get_api_key_for_workspace(workspace_id)
+    _allow_env_fallback = workspace_id is None
+    _campaign_id = get_campaign_id_for_workspace(workspace_id, allow_env_fallback=_allow_env_fallback)
+    _api_key = get_api_key_for_workspace(workspace_id, allow_env_fallback=_allow_env_fallback)
+    if workspace_id is not None and (not _campaign_id or not _api_key):
+        return await _record_skip(content_id, "workspace_not_configured", lead_id, tier_snapshot)
     with session_scope() as session:
         lead = session.get(Lead, lead_id)
         content = session.get(GeneratedContent, content_id)
@@ -445,7 +467,7 @@ def _read_back_matches(remote: dict, expected_subject: str, expected_body: str) 
 
 
 async def overwrite_lead_copy(
-    lead_id: int, *, create_if_missing: bool = True
+    lead_id: int, *, create_if_missing: bool = True, workspace_id: int | None = None
 ) -> OverwriteResult:
     """Push the latest local email copy to Instantly for one lead.
 
@@ -456,15 +478,31 @@ async def overwrite_lead_copy(
       4. 1 match  → PATCH custom_variables, then GET and verify.
       5. 0 match  → POST a new lead (only if create_if_missing).
 
+    Credentials are resolved per workspace (same resolver as
+    ``deliver_email``): the workspace's Instantly campaign id + API key, with
+    the env var as fallback when the workspace has none configured.
+    ``workspace_id=None`` resolves to the default workspace, preserving
+    single-workspace behavior. If neither workspace nor env yields both a
+    campaign id and an API key, the call fails clearly instead of silently
+    acting on the wrong (env/default) account.
+
     Never deletes, never activates the campaign, never touches
     delivered_at/delivery_status on existing rows (so the engagement
     sync continues to be the source of truth for "actually sent").
     """
-    if not settings.instantly_api_key or not settings.instantly_campaign_id:
+    from src.workspace import get_api_key_for_workspace, get_campaign_id_for_workspace
+
+    # When an explicit workspace is selected, never fall back to the env/default
+    # account — a missing workspace config must fail, not send through the wrong
+    # campaign. workspace_id=None keeps the single-workspace env fallback.
+    _allow_env_fallback = workspace_id is None
+    campaign_id = get_campaign_id_for_workspace(workspace_id, allow_env_fallback=_allow_env_fallback)
+    api_key = get_api_key_for_workspace(workspace_id, allow_env_fallback=_allow_env_fallback)
+    if not api_key or not campaign_id:
         return OverwriteResult(
             lead_id=lead_id,
             status="failed",
-            detail="INSTANTLY_API_KEY or INSTANTLY_CAMPAIGN_ID not configured",
+            detail="Instantly API key or campaign ID not configured for this workspace",
         )
 
     lead, content = _latest_email_content_for(lead_id)
@@ -477,10 +515,9 @@ async def overwrite_lead_copy(
 
     expected_subject = content.subject or ""
     expected_body = content.body
-    campaign_id = settings.instantly_campaign_id
 
     try:
-        matches = await find_leads_by_email(lead.email, campaign_id)
+        matches = await find_leads_by_email(lead.email, campaign_id, api_key=api_key)
     except Exception as exc:
         return OverwriteResult(
             lead_id=lead_id, status="failed",
@@ -509,7 +546,7 @@ async def overwrite_lead_copy(
             }
         }
         try:
-            await patch_lead(remote_id, patch_payload)
+            await patch_lead(remote_id, patch_payload, api_key=api_key)
         except httpx.HTTPStatusError as exc:
             code = exc.response.status_code
             if code in (400, 404, 405, 409, 422):
@@ -533,7 +570,7 @@ async def overwrite_lead_copy(
             )
 
         try:
-            remote = await get_lead(remote_id)
+            remote = await get_lead(remote_id, api_key=api_key)
         except Exception as exc:
             return OverwriteResult(
                 lead_id=lead_id, status="failed",
@@ -562,9 +599,9 @@ async def overwrite_lead_copy(
             detail="not in Instantly campaign; create_if_missing=False",
         )
 
-    payload = _build_payload(lead, content)
+    payload = _build_payload(lead, content, campaign_id=campaign_id)
     try:
-        response = await _post_lead_to_campaign(payload)
+        response = await _post_lead_to_campaign(payload, api_key=api_key)
     except Exception as exc:
         return OverwriteResult(
             lead_id=lead_id, status="failed",
@@ -573,7 +610,7 @@ async def overwrite_lead_copy(
     new_remote_id = str(response.get("id") or response.get("lead_id") or "")
 
     try:
-        remote = await get_lead(new_remote_id) if new_remote_id else {}
+        remote = await get_lead(new_remote_id, api_key=api_key) if new_remote_id else {}
     except Exception:
         remote = {}
     verified = _read_back_matches(remote, expected_subject, expected_body) if remote else False
@@ -593,13 +630,16 @@ async def overwrite_lead_copy(
 # ---------------------------------------------------------------------------
 
 async def _raw_request(
-    method: str, url: str, *, json_body: dict | None = None,
+    method: str, url: str, *, json_body: dict | None = None, api_key: str | None = None,
 ) -> dict:
     """Issue a raw httpx call (no retries) and capture the full response.
 
     Used by the debug flow so failures, error bodies, and unexpected shapes
     surface verbatim instead of being eaten by @retry_api. Returns a dict
     with request_url, request_body, status, response_json, response_text.
+
+    api_key defaults to the env key; pass a workspace-resolved key so the
+    diagnostic hits the same account the real overwrite flow would use.
     """
     safe_headers = {"Authorization": "Bearer ***REDACTED***", "Content-Type": "application/json"}
     record: dict = {
@@ -615,7 +655,7 @@ async def _raw_request(
     try:
         async with httpx.AsyncClient(timeout=_CLIENT_TIMEOUT) as client:
             resp = await client.request(
-                method, url, headers=_auth_headers(), json=json_body,
+                method, url, headers=_auth_headers(api_key), json=json_body,
             )
         record["status"] = resp.status_code
         text = resp.text
@@ -629,7 +669,7 @@ async def _raw_request(
     return record
 
 
-async def debug_overwrite_one_lead(lead_id: int) -> dict:
+async def debug_overwrite_one_lead(lead_id: int, *, workspace_id: int | None = None) -> dict:
     """Run the overwrite flow for one lead with FULL HTTP capture.
 
     Does not delete, does not activate the campaign, does not retry. Only
@@ -637,15 +677,27 @@ async def debug_overwrite_one_lead(lead_id: int) -> dict:
     Instantly record. Captures the 20 fields the operator needs to tell
     apart wrong-id / wrong-endpoint / wrong-body / wrong-key / not-supported.
 
+    Credentials are resolved per workspace (same resolver as the real
+    overwrite flow), so the diagnostic reflects the account the selected
+    workspace would actually act on. ``workspace_id=None`` resolves to the
+    default workspace.
+
     Always returns a dict (never raises). Caller renders it in the UI.
     """
+    from src.workspace import get_api_key_for_workspace, get_campaign_id_for_workspace
+
+    # Explicit workspace → no env fallback (see overwrite_lead_copy).
+    _allow_env_fallback = workspace_id is None
+    campaign_id = get_campaign_id_for_workspace(workspace_id, allow_env_fallback=_allow_env_fallback)
+    api_key = get_api_key_for_workspace(workspace_id, allow_env_fallback=_allow_env_fallback)
+
     out: dict = {
         "local_lead_id": lead_id,
         "local_email": None,
         "local_latest_subject": None,
         "local_latest_body_preview": None,
         "local_latest_body": None,
-        "campaign_id": settings.instantly_campaign_id,
+        "campaign_id": campaign_id,
         "search": None,
         "search_match_count": 0,
         "selected_remote_lead_id": None,
@@ -658,8 +710,8 @@ async def debug_overwrite_one_lead(lead_id: int) -> dict:
         "verdict": None,
     }
 
-    if not settings.instantly_api_key or not settings.instantly_campaign_id:
-        out["verdict"] = "INSTANTLY_API_KEY or INSTANTLY_CAMPAIGN_ID not configured"
+    if not api_key or not campaign_id:
+        out["verdict"] = "Instantly API key or campaign ID not configured for this workspace"
         return out
 
     lead, content = _latest_email_content_for(lead_id)
@@ -680,11 +732,11 @@ async def debug_overwrite_one_lead(lead_id: int) -> dict:
     # --- 1) Search Instantly for the lead by email + campaign ---
     search_url = f"{_API_BASE}/leads/list"
     search_body = {
-        "campaign": settings.instantly_campaign_id,
+        "campaign": campaign_id,
         "search": lead.email,
         "limit": 50,
     }
-    out["search"] = await _raw_request("POST", search_url, json_body=search_body)
+    out["search"] = await _raw_request("POST", search_url, json_body=search_body, api_key=api_key)
     items: list[dict] = []
     if out["search"] and isinstance(out["search"].get("response_json"), dict):
         payload = out["search"]["response_json"]
@@ -732,11 +784,11 @@ async def debug_overwrite_one_lead(lead_id: int) -> dict:
             "signals_cited": ", ".join(content.signals_cited or []),
         }
     }
-    out["update"] = await _raw_request("PATCH", update_url, json_body=update_body)
+    out["update"] = await _raw_request("PATCH", update_url, json_body=update_body, api_key=api_key)
 
     # --- 3) Read back the lead and surface what Instantly actually stored ---
     readback_url = f"{_API_BASE}/leads/{remote_id}"
-    out["readback"] = await _raw_request("GET", readback_url)
+    out["readback"] = await _raw_request("GET", readback_url, api_key=api_key)
 
     rb_json = (out["readback"] or {}).get("response_json") or {}
     # Custom vars empirically live under `payload`; also check `custom_variables`

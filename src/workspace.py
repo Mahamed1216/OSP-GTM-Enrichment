@@ -364,7 +364,9 @@ def get_active_workspaces() -> list[dict[str, Any]]:
 # Campaign-ID resolver — preserves Phase 1 env-based behavior.
 # ---------------------------------------------------------------------------
 
-def get_campaign_id_for_workspace(workspace_id: int | None = None) -> str | None:
+def get_campaign_id_for_workspace(
+    workspace_id: int | None = None, *, allow_env_fallback: bool = True
+) -> str | None:
     """Resolve the Instantly campaign ID for a workspace.
 
     Lookup priority:
@@ -374,8 +376,13 @@ def get_campaign_id_for_workspace(workspace_id: int | None = None) -> str | None
 
     When workspace_id is None, the default workspace is used. This means all
     existing code that reads settings.instantly_campaign_id directly still
-    works identically — they just bypass this helper. Phase 2 will route
-    those call sites through this function.
+    works identically — they just bypass this helper.
+
+    ``allow_env_fallback`` (default True) preserves the env-var fallback. Callers
+    acting on an *explicit* workspace selection (e.g. a UI flow) should pass
+    ``allow_env_fallback=False`` so a workspace with no campaign configured
+    returns None instead of silently falling back to the env/default campaign —
+    which would send through the wrong account.
     """
     workspace: dict[str, Any] | None = None
     if workspace_id is not None:
@@ -387,6 +394,9 @@ def get_campaign_id_for_workspace(workspace_id: int | None = None) -> str | None
         ws_campaign_id = (workspace.get("instantly_campaign_id") or "").strip()
         if ws_campaign_id:
             return ws_campaign_id
+
+    if not allow_env_fallback:
+        return None
 
     # Env fallback — preserves all existing behavior from Phase 0.
     env_campaign_id = (settings.instantly_campaign_id or "").strip()
@@ -593,7 +603,9 @@ def get_workspace_table_stats() -> dict[str, Any]:
 # Instantly API key resolver (Phase 4)
 # ---------------------------------------------------------------------------
 
-def get_api_key_for_workspace(workspace_id: int | None = None) -> str | None:
+def get_api_key_for_workspace(
+    workspace_id: int | None = None, *, allow_env_fallback: bool = True
+) -> str | None:
     """Resolve the Instantly API key for a workspace.
 
     Lookup priority:
@@ -602,6 +614,11 @@ def get_api_key_for_workspace(workspace_id: int | None = None) -> str | None:
       3. None
 
     When workspace_id is None, uses the default workspace.
+
+    ``allow_env_fallback`` (default True) preserves the env-var fallback. Callers
+    acting on an *explicit* workspace selection should pass
+    ``allow_env_fallback=False`` so a workspace with no API key configured
+    returns None instead of silently using the env/default key.
     """
     workspace: dict[str, Any] | None = None
     if workspace_id is not None:
@@ -613,6 +630,9 @@ def get_api_key_for_workspace(workspace_id: int | None = None) -> str | None:
         ws_key = (workspace.get("instantly_api_key") or "").strip()
         if ws_key:
             return ws_key
+
+    if not allow_env_fallback:
+        return None
 
     env_key = (settings.instantly_api_key or "").strip()
     return env_key or None

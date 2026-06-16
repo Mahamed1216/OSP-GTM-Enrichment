@@ -470,7 +470,9 @@ if selected_lead_ids:
                 with status:
                     for i, lid in enumerate(eligible_ids, start=1):
                         try:
-                            result = run_async(deliver_email(lid, dry_run=False))
+                            result = run_async(
+                                deliver_email(lid, dry_run=False, workspace_id=_ws_id)
+                            )
                         except Exception as exc:
                             n_failed += 1
                             st.write(f"❌ lead {lid} — {type(exc).__name__}: {exc}")
@@ -563,7 +565,9 @@ if selected_lead_ids:
                     try:
                         res = run_async(
                             overwrite_lead_copy(
-                                lid, create_if_missing=create_missing
+                                lid,
+                                create_if_missing=create_missing,
+                                workspace_id=_ws_id,
                             )
                         )
                     except Exception as exc:
@@ -674,7 +678,9 @@ if selected_lead_ids:
             target_lid = int(selected_lead_ids[0])
             with st.spinner(f"Running diagnostic on lead {target_lid}…"):
                 try:
-                    debug = run_async(debug_overwrite_one_lead(target_lid))
+                    debug = run_async(
+                        debug_overwrite_one_lead(target_lid, workspace_id=_ws_id)
+                    )
                 except Exception as exc:
                     st.error(f"Diagnostic crashed: {type(exc).__name__}: {exc}")
                     debug = None
