@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
@@ -8,7 +8,17 @@ from src.db import Base
 
 
 def now_utc() -> datetime:
-    return datetime.utcnow()
+    """Current UTC time as a NAIVE datetime (no tzinfo).
+
+    Returns the same value as the deprecated ``datetime.utcnow()`` but via the
+    non-deprecated ``datetime.now(timezone.utc)`` idiom. Kept naive on purpose:
+    all DateTime columns here are timezone-naive (no ``timezone=True``), and
+    analytics cutoffs / UI deltas compare against these naive values, so storing
+    or returning tz-aware datetimes would break SQLite read-back and
+    naive-vs-aware comparisons. Switching to true tz-aware datetimes would be a
+    separate schema + query change.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _default_workspace_id() -> int | None:

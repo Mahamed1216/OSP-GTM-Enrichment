@@ -17,7 +17,7 @@ Strategy:
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -51,7 +51,7 @@ def map_contact(contact: dict[str, Any]) -> dict[str, Any]:
     if email_verified:
         email_verification_status = "verified"
         email_verification_provider = "osp_lead_engine"
-        email_verified_at: datetime | None = datetime.utcnow()
+        email_verified_at: datetime | None = datetime.now(timezone.utc).replace(tzinfo=None)
     else:
         email_verification_status = None
         email_verification_provider = None

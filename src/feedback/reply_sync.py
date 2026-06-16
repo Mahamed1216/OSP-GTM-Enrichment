@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -33,7 +33,7 @@ from src.feedback.reply_agent import (
     INTENT_UNSUBSCRIBE,
     classify_and_draft_reply,
 )
-from src.models import Engagement, GeneratedContent, Lead, ReplyThread
+from src.models import Engagement, GeneratedContent, Lead, ReplyThread, now_utc
 from src.retry import retry_api
 
 log = logging.getLogger(__name__)
@@ -405,7 +405,9 @@ def _extract_email_timestamp(email: dict) -> datetime | None:
             return val
         if isinstance(val, (int, float)):
             try:
-                return datetime.utcfromtimestamp(val / 1000 if val > 1e10 else val)
+                return datetime.fromtimestamp(
+                    val / 1000 if val > 1e10 else val, timezone.utc
+                ).replace(tzinfo=None)
             except (OSError, OverflowError, ValueError):
                 pass
         if isinstance(val, str):
@@ -1276,7 +1278,7 @@ async def try_send_reply(
             }
 
         resp.raise_for_status()
-        _mark_thread(thread_id, STATUS_SENT, sent_at=datetime.utcnow(), send_error=None)
+        _mark_thread(thread_id, STATUS_SENT, sent_at=now_utc(), send_error=None)
         return {"status": STATUS_SENT, "detail": "Reply sent successfully via Instantly.", "debug": debug}
 
     except httpx.HTTPStatusError as exc:

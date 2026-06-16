@@ -9,7 +9,7 @@ from sqlalchemy import and_, case, func, select
 
 from src.config import settings
 from src.db import session_scope
-from src.models import ContentRating, GeneratedContent, Score
+from src.models import ContentRating, GeneratedContent, Score, now_utc
 
 log = logging.getLogger(__name__)
 
@@ -163,7 +163,7 @@ def get_rating_trends(days: int = 30) -> dict[str, list[dict]]:
     Returns {kind: [{date, up_count, down_count, up_rate}, ...]} sorted by date asc.
     Empty days are omitted (caller decides how to fill).
     """
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = now_utc() - timedelta(days=days)
     stmt = (
         select(
             GeneratedContent.kind,

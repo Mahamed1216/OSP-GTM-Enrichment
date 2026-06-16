@@ -50,6 +50,7 @@ from src.models import (
     GeneratedContent,
     InstantlyAnalyticsSnapshot,
     PromptRecommendation,
+    now_utc,
 )
 
 # Latest-send source labels — exposed for the Engagement debug panel.
@@ -270,7 +271,7 @@ def _parse_instantly_ts(value: Any) -> datetime | None:
     if isinstance(value, (int, float)):
         # Epoch seconds — unlikely but cheap to handle.
         try:
-            return datetime.utcfromtimestamp(float(value))
+            return datetime.fromtimestamp(float(value), timezone.utc).replace(tzinfo=None)
         except (OverflowError, OSError, ValueError):
             return None
     if isinstance(value, str):
@@ -445,7 +446,7 @@ def diagnose(
     else:
         send_source = "override"
     if now is None:
-        now = datetime.utcnow()
+        now = now_utc()
     hours_since_send: float | None = None
     if latest_send is not None:
         hours_since_send = max(0.0, (now - latest_send).total_seconds() / 3600.0)
@@ -798,7 +799,7 @@ def save_recommendation(
         return None
 
     initial_status = "ready_for_approval" if diag.loop_status == LOOP_READY else "draft"
-    drafted_at = datetime.utcnow() if initial_status == "draft" else None
+    drafted_at = now_utc() if initial_status == "draft" else None
     try:
         with session_scope() as session:
             rec = PromptRecommendation(
@@ -866,7 +867,7 @@ def approve_recommendation(rec_id: int, *, approved_by: str, workspace_id: int |
             )
         rec.status = "approved"
         rec.approved_by = approved_by
-        rec.approved_at = datetime.utcnow()
+        rec.approved_at = now_utc()
         channel = rec.channel
         addendum = addendum_text
         # Re-read the current overlay HERE (not at diagnosis time) so a
@@ -895,7 +896,7 @@ def reject_recommendation(rec_id: int, *, rejected_by: str) -> None:
         rec.approved_by = rejected_by
         # `rejected_at` is the new dedicated column; `approved_at` is also
         # set for backward compatibility with old history-page queries.
-        now = datetime.utcnow()
+        now = now_utc()
         rec.rejected_at = now
         rec.approved_at = now
 
@@ -906,7 +907,7 @@ def save_as_draft(rec_id: int) -> None:
         if rec is None:
             raise ValueError(f"Recommendation {rec_id} not found")
         rec.status = "draft"
-        rec.drafted_at = datetime.utcnow()
+        rec.drafted_at = now_utc()
 
 
 def rollback_recommendation(rec_id: int, *, workspace_id: int | None = None) -> dict[str, Any]:
@@ -939,7 +940,7 @@ def archive_recommendation(rec_id: int) -> None:
         if rec is None:
             raise ValueError(f"Recommendation {rec_id} not found")
         rec.status = "archived"
-        rec.rejected_at = datetime.utcnow()
+        rec.rejected_at = now_utc()
     log.info("recommendation_archived", extra={"rec_id": rec_id})
 
 

@@ -4,7 +4,7 @@ File path is logs/sdr_run_<YYYY-MM-DD>.log so scheduled runs are debuggable.
 """
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from rich.logging import RichHandler
 
@@ -22,7 +22,7 @@ _RESERVED = {
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload: dict = {
-            "ts": datetime.utcnow().isoformat() + "Z",
+            "ts": datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z",
             "level": record.levelname,
             "logger": record.name,
             "msg": record.getMessage(),
@@ -45,7 +45,7 @@ def setup_logging(console: bool = True) -> None:
         return
 
     settings.log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = settings.log_dir / f"sdr_run_{datetime.utcnow().strftime('%Y-%m-%d')}.log"
+    log_file = settings.log_dir / f"sdr_run_{datetime.now(timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%d')}.log"
 
     root = logging.getLogger()
     root.setLevel(settings.log_level)

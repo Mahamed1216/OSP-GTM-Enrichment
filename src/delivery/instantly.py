@@ -18,7 +18,7 @@ from sqlalchemy import select
 from src.config import settings
 from src.db import session_scope
 from src.delivery.verify_email import verify_email
-from src.models import GeneratedContent, Lead, Score
+from src.models import GeneratedContent, Lead, Score, now_utc
 from src.retry import retry_api
 
 log = logging.getLogger(__name__)
@@ -324,7 +324,7 @@ async def deliver_email(
 
     with session_scope() as session:
         content = session.get(GeneratedContent, content_id)
-        content.delivered_at = datetime.utcnow()
+        content.delivered_at = now_utc()
         content.delivery_provider = "instantly"
         content.delivery_id = delivery_id
         content.delivery_status = "sent"
@@ -438,7 +438,7 @@ def _mark_local_sent(content_id: int, remote_lead_id: str) -> None:
         if content is None:
             return
         if content.delivered_at is None:
-            content.delivered_at = datetime.utcnow()
+            content.delivered_at = now_utc()
         if remote_lead_id:
             content.delivery_id = remote_lead_id
         content.delivery_provider = "instantly"

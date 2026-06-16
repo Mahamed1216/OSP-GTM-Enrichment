@@ -33,7 +33,7 @@ from pathlib import Path
 from sqlalchemy import select
 
 from src.db import session_scope
-from src.models import PromptConfig
+from src.models import PromptConfig, now_utc
 
 log = logging.getLogger(__name__)
 
@@ -125,7 +125,7 @@ def _db_upsert(
         existing = session.execute(stmt).scalar_one_or_none()
         if existing:
             existing.content = content
-            existing.updated_at = datetime.utcnow()
+            existing.updated_at = now_utc()
             if prompt_version is not None:
                 existing.prompt_version = prompt_version
             if prompt_fingerprint is not None:

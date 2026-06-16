@@ -19,7 +19,7 @@ On no match without email: skip with "no_email_no_match".
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -301,7 +301,7 @@ def start_import_log(
             status_filter=status_filter or None,
             include_suppressed=include_suppressed,
             auto_run=auto_run,
-            started_at=datetime.utcnow(),
+            started_at=datetime.now(timezone.utc).replace(tzinfo=None),
             status="running",
             requested_limit=requested_limit,
         )
@@ -316,7 +316,7 @@ def _finish_import(import_id: int, result: ImportResult) -> None:
         with session_scope() as session:
             imp = session.get(LeadSourceImport, import_id)
             if imp:
-                imp.finished_at = datetime.utcnow()
+                imp.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 imp.status = "completed"
                 imp.fetched_count = result.fetched
                 imp.created_count = result.created
@@ -361,7 +361,7 @@ def _fail_import(import_id: int, error_msg: str) -> None:
         with session_scope() as session:
             imp = session.get(LeadSourceImport, import_id)
             if imp:
-                imp.finished_at = datetime.utcnow()
+                imp.finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 imp.status = "failed"
                 imp.error_message = error_msg[:2000]
     except Exception:

@@ -13,7 +13,7 @@ from sqlalchemy import select
 
 from src.config import settings
 from src.db import session_scope
-from src.models import Lead
+from src.models import Lead, now_utc
 from src.retry import retry_api
 
 log = logging.getLogger(__name__)
@@ -158,7 +158,7 @@ async def verify_email(lead_id: int, *, force: bool = False) -> VerifyResult:
         lead = session.get(Lead, lead_id)
         lead.email_verification_status = result.status
         lead.email_verification_provider = result.provider
-        lead.email_verified_at = datetime.utcnow()
+        lead.email_verified_at = now_utc()
 
     log.info("verify_email_complete", extra={
         "lead_id": lead_id, "status": result.status, "provider": result.provider,

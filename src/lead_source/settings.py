@@ -11,7 +11,7 @@ Security notes:
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from pydantic import BaseModel
@@ -105,7 +105,7 @@ def update_fetch_metadata(
         cfg = load_lead_source_config(workspace_id)
         cfg.last_fetch_status = status
         cfg.last_fetch_result_count = result_count
-        cfg.last_fetched_at = fetched_at or datetime.utcnow().isoformat()
+        cfg.last_fetched_at = fetched_at or datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         save_lead_source_config(cfg, workspace_id)
     except Exception as exc:
         log.warning(
@@ -128,7 +128,7 @@ def update_auto_run_metadata(
     """Persist last_auto_run_* fields after an evergreen scheduler run."""
     try:
         cfg = load_lead_source_config(workspace_id)
-        cfg.last_auto_run_at = ran_at or datetime.utcnow().isoformat()
+        cfg.last_auto_run_at = ran_at or datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         cfg.last_auto_run_status = status
         cfg.last_auto_run_created = created
         cfg.last_auto_run_scored = scored

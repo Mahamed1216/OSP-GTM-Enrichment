@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -1330,7 +1330,7 @@ with st.expander("Sync debug — raw Instantly analytics + DB comparison"):
             _source = _send_info.get("source") or "—"
             _hours = (
                 None if _chosen_ts is None
-                else max(0.0, (datetime.utcnow() - _chosen_ts).total_seconds() / 3600.0)
+                else max(0.0, (datetime.now(timezone.utc).replace(tzinfo=None) - _chosen_ts).total_seconds() / 3600.0)
             )
             st.dataframe(
                 pd.DataFrame([

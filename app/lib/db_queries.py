@@ -16,6 +16,7 @@ from src.models import (
     InstantlyAnalyticsSnapshot,
     Lead,
     Score,
+    now_utc,
 )
 
 
@@ -948,7 +949,7 @@ def sent_emails(workspace_id: int | None = None) -> pd.DataFrame:
 
 def reply_rate_series(days: int = 30, workspace_id: int | None = None) -> pd.DataFrame:
     """Aggregate replies / sends by date(synced_at) over the last N days."""
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = now_utc() - timedelta(days=days)
     with session_scope() as session:
         stmt = (
             select(

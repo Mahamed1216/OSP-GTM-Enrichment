@@ -21,7 +21,7 @@ from sqlalchemy import select
 
 from src.config import settings
 from src.db import session_scope
-from src.models import Engagement, GeneratedContent, InstantlyAnalyticsSnapshot
+from src.models import Engagement, GeneratedContent, InstantlyAnalyticsSnapshot, now_utc
 from src.retry import retry_api
 
 log = logging.getLogger(__name__)
@@ -574,7 +574,7 @@ async def sync_campaign_analytics(workspace_id: int | None = None) -> dict:
     parsed["raw_opportunity_source"] = raw_opportunity_source
 
     snapshot_id: int
-    synced_at = datetime.utcnow()
+    synced_at = now_utc()
     from src.workspace import get_default_workspace_id as _get_default_ws_id
     _snapshot_workspace_id = workspace_id if workspace_id is not None else _get_default_ws_id()
     with session_scope() as session:
@@ -673,7 +673,7 @@ async def sync_engagement(workspace_id: int | None = None) -> dict:
                     if existing:
                         for k, v in metrics.items():
                             setattr(existing, k, v)
-                        existing.synced_at = datetime.utcnow()
+                        existing.synced_at = now_utc()
                     else:
                         session.add(
                             Engagement(content_id=content_id, **metrics)
