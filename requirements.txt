@@ -1,15 +1,33 @@
-anthropic>=0.40.0
-apify-client>=1.7.0
-fastapi>=0.111.0
-httpx>=0.27.0
-pydantic>=2.6.0
-pydantic-settings>=2.2.0
-python-dotenv>=1.0.0
-rich>=13.7.0
-sqlalchemy>=2.0.0
-tavily-python>=0.5.0
-tenacity>=8.2.0
-uvicorn[standard]>=0.29.0
-psycopg2-binary>=2.9.9
-pytest>=8.0.0
-pytest-asyncio>=0.23.0
+# Core runtime + test dependencies (human-maintained input file).
+#
+# Dependency upper-bound GUARDRAILS — not a full reproducible lock.
+#   - Each line keeps its existing >= floor and adds a <next-major upper bound
+#     to prevent a surprise major-version upgrade from silently breaking builds.
+#   - Current resolution is unchanged: every cap sits above the version already
+#     in use, so this neither upgrades nor downgrades anything.
+#   - This does NOT lock transitive dependencies (minor/patch versions of these
+#     packages and their dependencies can still change between installs).
+#
+# FOLLOW-UP for true reproducibility: generate a constraints.txt from the
+# production/CI Python (likely 3.12 — do NOT generate it from 3.14), e.g.:
+#     python3.12 -m venv .lockenv
+#     .lockenv/bin/pip install -r requirements.txt -r requirements-ui.txt
+#     .lockenv/bin/pip freeze > constraints.txt
+# Once constraints.txt exists, install with:
+#     pip install -r requirements.txt -c constraints.txt
+#     pip install -r requirements-ui.txt -c constraints.txt
+anthropic>=0.40.0,<1.0
+apify-client>=1.7.0,<4.0
+fastapi>=0.111.0,<1.0
+httpx>=0.27.0,<1.0
+pydantic>=2.6.0,<3.0
+pydantic-settings>=2.2.0,<3.0
+python-dotenv>=1.0.0,<2.0
+rich>=13.7.0,<16.0
+sqlalchemy>=2.0.0,<3.0
+tavily-python>=0.5.0,<1.0
+tenacity>=8.2.0,<10.0
+uvicorn[standard]>=0.29.0,<1.0
+psycopg2-binary>=2.9.9,<3.0
+pytest>=8.0.0,<10.0
+pytest-asyncio>=0.23.0,<2.0
