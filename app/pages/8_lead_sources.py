@@ -359,10 +359,17 @@ else:
             cols[1].metric("Created", imp["created_count"])
             cols[2].metric("Updated", imp["updated_count"])
             cols[3].metric("Skipped", imp["skipped_count"])
+            _summary = imp.get("raw_summary") or {}
+            # Source-signal + email-verification breakdown from the import.
+            scols = st.columns(4)
+            scols[0].metric("With source signals", _summary.get("with_source_signals", 0))
+            scols[1].metric("Without source signals", _summary.get("without_source_signals", 0))
+            scols[2].metric("Verified emails", _summary.get("verified_email_count", 0))
+            scols[3].metric("Unverified emails", _summary.get("unverified_email_count", 0))
             if imp.get("error_message"):
                 st.error(imp["error_message"])
-            if imp.get("raw_summary", {}) and imp["raw_summary"].get("skip_reasons"):
-                st.caption("Skip reasons: " + str(imp["raw_summary"]["skip_reasons"]))
+            if _summary.get("skip_reasons"):
+                st.caption("Skip reasons: " + str(_summary["skip_reasons"]))
 
 st.divider()
 

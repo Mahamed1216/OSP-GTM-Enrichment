@@ -58,6 +58,23 @@ def _hiring_signal_subq(workspace_id: int | None = None):
     return stmt.subquery()
 
 
+def _source_signal_subq(workspace_id: int | None = None):
+    """Subquery: imported source-signal strength per lead (1:1)."""
+    from src.models import LeadSignal
+
+    stmt = (
+        select(
+            LeadSignal.lead_id.label("lead_id"),
+            LeadSignal.signal_strength.label("source_strength"),
+            LeadSignal.signal_found.label("source_found"),
+        )
+        .where(LeadSignal.signal_type == "source_import")
+    )
+    if workspace_id is not None:
+        stmt = stmt.where(LeadSignal.workspace_id == workspace_id)
+    return stmt.subquery()
+
+
 def kpi_counts(workspace_id: int | None = None) -> dict[str, int]:
     with session_scope() as session:
         leads_q = select(func.count(Lead.id))
@@ -302,6 +319,7 @@ def list_leads(
 
     email_sub = _email_content_subq(workspace_id=workspace_id)
     hiring_sub = _hiring_signal_subq(workspace_id=workspace_id)
+    source_sub = _source_signal_subq(workspace_id=workspace_id)
     stmt = (
         select(
             Lead.id.label("id"),
@@ -316,6 +334,8 @@ def list_leads(
             email_sub.c.any_delivered,
             hiring_sub.c.hiring_strength,
             hiring_sub.c.hiring_found,
+            source_sub.c.source_strength,
+            source_sub.c.source_found,
             func.coalesce(
                 func.max(case((Engagement.replied.is_(True), 1), else_=0)), 0
             ).label("any_reply"),
@@ -325,6 +345,7 @@ def list_leads(
         .outerjoin(Enrichment, Enrichment.lead_id == Lead.id)
         .outerjoin(email_sub, email_sub.c.lead_id == Lead.id)
         .outerjoin(hiring_sub, hiring_sub.c.lead_id == Lead.id)
+        .outerjoin(source_sub, source_sub.c.lead_id == Lead.id)
         .outerjoin(
             GeneratedContent,
             and_(
@@ -346,6 +367,8 @@ def list_leads(
             email_sub.c.any_delivered,
             hiring_sub.c.hiring_strength,
             hiring_sub.c.hiring_found,
+            source_sub.c.source_strength,
+            source_sub.c.source_found,
         )
         .order_by(Lead.id.desc())  # newest first
     )
@@ -408,13 +431,19 @@ def list_leads(
                     else row.hiring_strength.title() if row.hiring_found
                     else "None"
                 ),
+                # Source signal: imported strength, or "No" when none in payload.
+                "Src signal": (
+                    row.source_strength.title()
+                    if (row.source_strength and row.source_found)
+                    else "No"
+                ),
                 "Sent": bool(row.any_delivered),
                 "Replied": bool(row.any_reply),
             }
         )
     return pd.DataFrame.from_records(
         records,
-        columns=["id", "Name", "Email", "Company", "Title", "Tier", "Score", "Enriched", "Hiring", "Sent", "Replied"],
+        columns=["id", "Name", "Email", "Company", "Title", "Tier", "Score", "Enriched", "Hiring", "Src signal", "Sent", "Replied"],
     )
 
 
@@ -667,6 +696,13 @@ def get_lead_full(
             "email_verification_provider": lead.email_verification_provider,
             "email_verified_at": lead.email_verified_at,
             "created_at": lead.created_at,
+            # Source signal layer (imported enrichment from OSP Lead Engine).
+            "external_contact_id": lead.external_contact_id,
+            "external_source": lead.external_source,
+            "external_client_slug": lead.external_client_slug,
+            "source_tier": getattr(lead, "source_tier", None),
+            "source_tier_score": getattr(lead, "source_tier_score", None),
+            "lead_source_raw": lead.lead_source_raw,
         }
 
         enrichment = session.execute(
@@ -758,9 +794,11 @@ def get_lead_full(
                     }
                 )
 
-        # Hiring signal (C-tier rescue layer). Best-effort: the table may not
-        # exist on a pre-migration DB, so a failure degrades to None.
+        # Hiring signal (C-tier rescue layer) + imported source signal.
+        # Best-effort: the table may not exist on a pre-migration DB, so a
+        # failure degrades to None.
         hiring_signal_dict: dict[str, Any] | None = None
+        source_signal_dict: dict[str, Any] | None = None
         try:
             from src.models import LeadSignal
             sig = session.execute(
@@ -769,6 +807,26 @@ def get_lead_full(
                     LeadSignal.signal_type == "hiring",
                 )
             ).scalar_one_or_none()
+            src_sig = session.execute(
+                select(LeadSignal).where(
+                    LeadSignal.lead_id == lead_id,
+                    LeadSignal.signal_type == "source_import",
+                )
+            ).scalar_one_or_none()
+            if src_sig is not None:
+                source_signal_dict = {
+                    "signal_found": bool(src_sig.signal_found),
+                    "signal_strength": src_sig.signal_strength,
+                    "signal_names": list(src_sig.relevant_roles or []),
+                    "matched_icps": list(src_sig.relevant_departments or []),
+                    "summary": src_sig.summary,
+                    "source_urls": list(src_sig.source_urls or []),
+                    "recommended_email_angle": src_sig.recommended_email_angle,
+                    "tier_uplift_recommendation": src_sig.tier_uplift_recommendation,
+                    "applied_uplift": src_sig.applied_uplift,
+                    "raw_payload": src_sig.raw_payload,
+                    "updated_at": src_sig.updated_at,
+                }
             if sig is not None:
                 hiring_signal_dict = {
                     "signal_found": bool(sig.signal_found),
@@ -799,6 +857,7 @@ def get_lead_full(
             "contents": contents_list,
             "engagements": engagements_list,
             "hiring_signal": hiring_signal_dict,
+            "source_signal": source_signal_dict,
         }
 
 

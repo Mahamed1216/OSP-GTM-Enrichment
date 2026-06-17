@@ -172,6 +172,7 @@ score = bundle["score"]
 contents = bundle["contents"]
 engagements = bundle["engagements"]
 hiring_signal = bundle.get("hiring_signal")
+source_signal = bundle.get("source_signal")
 
 render_workspace_banner()
 
@@ -388,6 +389,74 @@ with tab_lead:
         c1, c2 = st.columns([1, 3])
         c1.markdown(f"**{label}**")
         c2.write(value)
+
+    # ---------- Source Signal / Imported Enrichment ----------
+    st.divider()
+    st.subheader("Source Signal / Imported Enrichment")
+    _raw = lead.get("lead_source_raw") or {}
+    _has_any_source = bool(_raw) or source_signal is not None
+    if not _has_any_source:
+        st.caption("This lead was not imported from the OSP Lead Engine.")
+    else:
+        _src_strength = (source_signal or {}).get("signal_strength")
+        _STRENGTH_COLOR = {"high": ":green", "medium": ":orange", "low": ":gray", "none": ":gray"}
+        with st.container(border=True):
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                st.markdown(f"**Source system:** {lead.get('external_source') or '—'}")
+                st.markdown(f"**External contact id:** `{lead.get('external_contact_id') or '—'}`")
+                st.markdown(f"**Source tier:** {lead.get('source_tier') or '—'}")
+                _score = lead.get("source_tier_score")
+                st.markdown(f"**Source tier score:** {_score if _score is not None else '—'}")
+            with sc2:
+                st.markdown(f"**Enrichment status:** {_raw.get('enrichment_status') or '—'}")
+                _ev = (
+                    "verified" if _raw.get("email_verified")
+                    else (lead.get("email_verification_status") or "—")
+                )
+                st.markdown(f"**Email verification:** {_ev}")
+                if _raw.get("email_bounce_risk") is not None:
+                    st.markdown(f"**Email bounce risk:** {_raw.get('email_bounce_risk')}")
+                _icps = (source_signal or {}).get("matched_icps") or _raw.get("matched_icps") or []
+                if _icps:
+                    st.markdown(
+                        "**Matched ICPs:** "
+                        + ", ".join(str(i) for i in (_icps if isinstance(_icps, list) else [_icps]))
+                    )
+
+            # Signals
+            if source_signal and source_signal.get("signal_found"):
+                color = _STRENGTH_COLOR.get((_src_strength or "none").lower(), ":gray")
+                st.markdown(
+                    f"**Signal strength:** {color}[**{(_src_strength or 'unknown').title()}**]"
+                )
+                names = source_signal.get("signal_names") or []
+                if names:
+                    st.markdown("**Signals:** " + "  ".join(pill(str(n), "violet") for n in names))
+                if source_signal.get("summary"):
+                    st.markdown(f"**Signal summary:** {source_signal['summary']}")
+                if source_signal.get("recommended_email_angle"):
+                    st.markdown(
+                        f"**Suggested angle:** _{source_signal['recommended_email_angle']}_"
+                    )
+                _surls = source_signal.get("source_urls") or []
+                if _surls:
+                    with st.expander(f"Signal source URLs ({len(_surls)})", expanded=False):
+                        for u in _surls:
+                            st.markdown(f"- {u}")
+            else:
+                st.info("No source signals were included in the imported payload.")
+
+            # Source metadata
+            _meta = _raw.get("source_metadata")
+            if _meta:
+                with st.expander("Source metadata", expanded=False):
+                    st.json(_meta)
+
+            # Full raw payload (audit)
+            if _raw:
+                with st.expander("Raw imported payload (JSON)", expanded=False):
+                    st.json(_raw)
 
 # === Tab 2: Enrichment ===
 with tab_enrich:

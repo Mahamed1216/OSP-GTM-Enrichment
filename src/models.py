@@ -134,6 +134,13 @@ class Lead(Base):
     external_client_slug: Mapped[Optional[str]] = mapped_column(String(128))
     phone: Mapped[Optional[str]] = mapped_column(String(64))
     lead_source_raw: Mapped[Optional[dict]] = mapped_column(JSON)
+    # Source signal layer: the colleague's own tier / tier_score from the
+    # OSP Lead Engine payload, stored SEPARATELY from our local Score.tier so
+    # it's supporting evidence, never blindly copied. NULL when the payload
+    # carried no tier. The full signals/matched_icps live in lead_source_raw
+    # and a normalized copy in the lead_signals row (signal_type="source_import").
+    source_tier: Mapped[Optional[str]] = mapped_column(String(16))
+    source_tier_score: Mapped[Optional[float]] = mapped_column(Float)
 
     enrichment: Mapped[Optional["Enrichment"]] = relationship(
         back_populates="lead", uselist=False, cascade="all, delete-orphan"

@@ -166,6 +166,10 @@ _RUNTIME_COLUMN_ADDS: list[tuple[str, str, str]] = [
     ("lead_signals", "status", "VARCHAR(16) DEFAULT 'not_started'"),
     ("lead_signals", "last_run_at", "TIMESTAMP"),
     ("lead_signals", "error", "TEXT"),
+    # Source-signal layer: colleague's tier / tier_score from the lead engine
+    # payload, stored separately from our local Score.tier.
+    ("leads", "source_tier", "VARCHAR(16)"),
+    ("leads", "source_tier_score", "FLOAT"),
 ]
 
 # Postgres-only column widenings. SQLite ignores VARCHAR length caps so

@@ -39,8 +39,8 @@ from src.prompts.sanitize import (
 log = logging.getLogger(__name__)
 
 
-def _load_hiring_signal(session, lead_id: int) -> dict | None:
-    """Read the hiring LeadSignal for a lead as a plain dict (in-session).
+def _load_signal(session, lead_id: int, signal_type: str) -> dict | None:
+    """Read a LeadSignal of the given type for a lead as a plain dict (in-session).
 
     Returns None when there is no signal or the table doesn't exist yet
     (pre-migration DB) — content generation must never break on its absence.
@@ -50,7 +50,7 @@ def _load_hiring_signal(session, lead_id: int) -> dict | None:
         row = session.execute(
             select(LeadSignal).where(
                 LeadSignal.lead_id == lead_id,
-                LeadSignal.signal_type == "hiring",
+                LeadSignal.signal_type == signal_type,
             )
         ).scalar_one_or_none()
         if row is None:
@@ -60,12 +60,21 @@ def _load_hiring_signal(session, lead_id: int) -> dict | None:
             "signal_strength": row.signal_strength,
             "relevant_roles": list(row.relevant_roles or []),
             "relevant_departments": list(row.relevant_departments or []),
+            "summary": row.summary,
             "why_it_matters": row.why_it_matters,
             "recommended_email_angle": row.recommended_email_angle,
         }
     except Exception as exc:  # pragma: no cover - defensive
-        log.warning("hiring_signal_load_failed", extra={"lead_id": lead_id, "error": str(exc)})
+        log.warning("signal_load_failed", extra={"lead_id": lead_id, "type": signal_type, "error": str(exc)})
         return None
+
+
+def _load_hiring_signal(session, lead_id: int) -> dict | None:
+    return _load_signal(session, lead_id, "hiring")
+
+
+def _load_source_signal(session, lead_id: int) -> dict | None:
+    return _load_signal(session, lead_id, "source_import")
 
 
 class EmailResult(BaseModel):
@@ -94,10 +103,14 @@ async def generate_email(
         # leads. Snapshot the flag here so we can short-circuit AFTER the
         # session closes (no detached-attribute access on the score row).
         is_icp_skip = bool(score and getattr(score, "tier", None) == "D")
-        # Hiring signal (C-tier rescue layer) — read inside the session so the
-        # email prompt can lead with a hiring angle when one was found.
+        # Hiring signal (C-tier rescue layer) + imported source signal — read
+        # inside the session so the email prompt can lead with either angle.
         hiring_signal = _load_hiring_signal(session, lead_id)
-        user_msg = format_lead_context(lead, enrichment, score, hiring_signal=hiring_signal)
+        source_signal = _load_source_signal(session, lead_id)
+        user_msg = format_lead_context(
+            lead, enrichment, score,
+            hiring_signal=hiring_signal, source_signal=source_signal,
+        )
         user_msg += "\n\nWrite the email now. Output JSON only."
         # Snapshot buyer-account fields for the post-generation validators.
         # Read INSIDE the session so we never touch detached attributes.

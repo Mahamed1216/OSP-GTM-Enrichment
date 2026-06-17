@@ -50,6 +50,9 @@ class ImportResult:
         self.import_log_id: int | None = None   # set by run_import; for log updates
         self.verified_email_count: int = 0     # contacts with email_verified=True
         self.unverified_email_count: int = 0   # contacts with an email but not verified
+        # Source-signal layer: contacts whose payload carried signals vs not.
+        self.with_source_signals: int = 0
+        self.without_source_signals: int = 0
 
     def bump_skip(self, reason: str) -> None:
         self.skipped += 1
@@ -66,6 +69,8 @@ class ImportResult:
             "created_lead_ids": self.created_lead_ids,
             "verified_email_count": self.verified_email_count,
             "unverified_email_count": self.unverified_email_count,
+            "with_source_signals": self.with_source_signals,
+            "without_source_signals": self.without_source_signals,
         }
 
 
@@ -181,6 +186,8 @@ def import_contacts(
     cannot abort the rest of the batch.
     """
     from src.models import Lead
+    from src.lead_source.source_signals import parse_source_signals
+    from src.signals.store import upsert_source_signal
 
     result = ImportResult()
     result.fetched = len(contacts)
@@ -192,6 +199,13 @@ def import_contacts(
             # Inject import-context fields so _update_missing_fields can backfill them
             fields["external_source"] = external_source
             fields["external_client_slug"] = client_slug
+
+            # Parse imported source signals/enrichment from the payload (pure).
+            parsed = parse_source_signals(raw_contact)
+            if parsed.has_signals:
+                result.with_source_signals += 1
+            else:
+                result.without_source_signals += 1
 
             # Identity gate — must have at least one usable anchor
             if not has_identity(fields):
@@ -208,10 +222,15 @@ def import_contacts(
             elif fields.get("email"):
                 result.unverified_email_count += 1
 
+            # Lead id resolved inside the session so source signals can be
+            # stored AFTER commit (the store opens its own session).
+            target_lead_id: int | None = None
+
             with session_scope() as session:
                 existing = _find_existing(session, fields, workspace_id)
 
                 if existing:
+                    target_lead_id = existing.id
                     changed = _update_missing_fields(existing, fields)
                     if changed:
                         result.updated += 1
@@ -251,12 +270,34 @@ def import_contacts(
                     )
                     session.add(lead)
                     session.flush()
+                    target_lead_id = lead.id
                     result.created += 1
                     result.created_lead_ids.append(lead.id)
                     log.debug(
                         "lead_source_lead_created",
                         extra={"lead_id": lead.id, "workspace_id": workspace_id,
                                "email_verified": fields.get("email_verification_status") == "verified"},
+                    )
+
+            # Persist source signals + source tier/score (post-commit so the
+            # lead row exists in its own transaction). Best-effort: a failure
+            # here must not fail the import row. Never overwrites lead content.
+            if target_lead_id is not None and parsed.has_signals:
+                try:
+                    upsert_source_signal(target_lead_id, parsed.as_dict(), workspace_id=workspace_id)
+                except Exception as exc:
+                    log.warning(
+                        "lead_source_signal_store_failed",
+                        extra={"lead_id": target_lead_id, "error": f"{type(exc).__name__}: {exc}"},
+                    )
+            elif target_lead_id is not None and (parsed.source_tier or parsed.source_tier_score is not None):
+                # No signals but a source tier/score exists — still promote it.
+                try:
+                    upsert_source_signal(target_lead_id, parsed.as_dict(), workspace_id=workspace_id)
+                except Exception as exc:
+                    log.warning(
+                        "lead_source_tier_store_failed",
+                        extra={"lead_id": target_lead_id, "error": f"{type(exc).__name__}: {exc}"},
                     )
 
         except Exception as exc:

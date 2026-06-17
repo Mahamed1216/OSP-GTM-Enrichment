@@ -44,7 +44,10 @@
       "Bash(Select-Object Name, Mode)",
       "Bash(Format-Table -AutoSize)",
       "Bash(echo \"exit: $?\")",
-      "Bash(echo \"EXIT=$?\")"
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(py -m pytest tests/ -q --ignore=tests/test_llm_live.py --ignore=tests/test_ingest_writer.py -p no:cacheprovider)",
+      "Read(//tmp/**)",
+      "Bash(echo \"exit=$?\")"
     ]
   }
 }

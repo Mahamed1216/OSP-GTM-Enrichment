@@ -22,6 +22,7 @@ def format_lead_context(
     include_score: bool = True,
     max_news: int = 5,
     hiring_signal: Optional[dict] = None,
+    source_signal: Optional[dict] = None,
 ) -> str:
     parts: list[str] = [
         "# Lead",
@@ -56,6 +57,25 @@ def format_lead_context(
         angle = hiring_signal.get("recommended_email_angle")
         if angle:
             parts.append(f"- Suggested angle (use only the roles above): {angle}")
+
+    # Imported source signal (from the OSP Lead Engine — the colleague's
+    # signal-first sourcing). Surfaced so content can lead with the ORIGINAL
+    # signal that caused the lead to be captured. Use only what's listed —
+    # never invent details.
+    if source_signal and source_signal.get("signal_found"):
+        parts.append("\n## Source signal (imported from lead engine)")
+        parts.append(f"- Strength: {source_signal.get('signal_strength') or 'unknown'}")
+        names = [n for n in (source_signal.get("relevant_roles") or []) if n]
+        if names:
+            parts.append(f"- Signals: {', '.join(names)}")
+        icps = [i for i in (source_signal.get("relevant_departments") or []) if i]
+        if icps:
+            parts.append(f"- Matched ICPs: {', '.join(icps)}")
+        if source_signal.get("summary"):
+            parts.append(f"- Summary: {source_signal['summary']}")
+        s_angle = source_signal.get("recommended_email_angle")
+        if s_angle:
+            parts.append(f"- Suggested angle (use only real signals above): {s_angle}")
 
     if not enrichment:
         return "\n".join(parts)
