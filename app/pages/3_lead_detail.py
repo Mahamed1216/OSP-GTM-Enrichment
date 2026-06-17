@@ -324,11 +324,34 @@ with _action_cols[3]:
                 if "score" in scoring
                 else ""
             )
+            # Stash per-step status so it survives the rerun below and is
+            # rendered as a "Last pipeline run" panel (requirement: pipeline
+            # run logs must be visible, including hiring signal enrichment).
+            st.session_state[f"ld_last_refresh_{_action_lead_id}"] = (result or {}).get("steps") or {}
             st.success(
                 f"Full refresh complete{score_bit}. "
                 "No Instantly push, no campaign activation."
             )
             st.rerun()
+
+# ---------- Last pipeline run panel ----------
+# Renders the per-step status from the most recent "Run full refresh" so the
+# operator can confirm every step ran — including hiring signal enrichment.
+_last_refresh = st.session_state.get(f"ld_last_refresh_{_action_lead_id}")
+if _last_refresh:
+    with st.container(border=True):
+        st.markdown("**Last pipeline run**")
+        _glyph = {"completed": "✅", "skipped": "⏭", "failed": "❌"}
+        _order = [
+            ("enrichment", "Enrichment"),
+            ("buyer_research", "Buyer research"),
+            ("hiring_signal", "Hiring signal enrichment"),
+            ("scoring", "Scoring"),
+            ("content", "Content generation"),
+        ]
+        for k, label in _order:
+            if k in _last_refresh:
+                st.markdown(f"{_glyph.get(_last_refresh[k], '•')} {label}: `{_last_refresh[k]}`")
 
 st.divider()
 
@@ -573,10 +596,16 @@ with tab_score:
             chips = "  ".join(pill(s, "blue") for s in signals)
             st.markdown(chips)
 
-    # ---------- Hiring signal (C-tier rescue layer) ----------
+    # ---------- Hiring Signal Enrichment (C-tier rescue layer) ----------
     st.divider()
-    st.subheader("Hiring signal")
+    st.subheader("Hiring Signal Enrichment")
     _STRENGTH_COLOR = {"high": ":green", "medium": ":orange", "low": ":gray", "none": ":gray"}
+    _STATUS_BADGE = {
+        "completed": ":green[completed]",
+        "skipped": ":gray[skipped]",
+        "failed": ":red[failed]",
+        "not_started": ":gray[not started]",
+    }
     _UPLIFT_LABEL = {
         "none": "No uplift",
         "C_to_B": "C → B",
@@ -584,64 +613,73 @@ with tab_score:
         "B_to_A": "B → A",
     }
     if hiring_signal is None:
-        st.caption(
-            "No hiring research yet. Click below to check for open "
-            "RevOps / SDR / GTM / automation roles (uses Tavily)."
-        )
-    elif not hiring_signal.get("signal_found"):
-        st.info(
-            "Hiring research ran but found no relevant open roles. "
-            f"({hiring_signal.get('why_it_matters') or 'no signal'})"
-        )
+        st.info("Hiring signal enrichment has not run for this lead.")
     else:
-        strength = (hiring_signal.get("signal_strength") or "none").lower()
-        color = _STRENGTH_COLOR.get(strength, ":gray")
+        status = (hiring_signal.get("status") or "completed").lower()
+        last_run = hiring_signal.get("last_run_at") or hiring_signal.get("updated_at")
         with st.container(border=True):
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown(f"**Strength:** {color}[**{strength.title()}**]")
-                applied = hiring_signal.get("applied_uplift") or "none"
-                rec = hiring_signal.get("tier_uplift_recommendation") or "none"
-                st.markdown(
-                    f"**Tier uplift:** {_UPLIFT_LABEL.get(applied, applied)}"
-                    + (
-                        f"  _(recommended {_UPLIFT_LABEL.get(rec, rec)})_"
-                        if rec != applied else ""
-                    )
-                )
-            with c2:
-                if hiring_signal.get("recency_estimate"):
-                    st.markdown(f"**Recency:** {hiring_signal['recency_estimate']}")
-                depts = hiring_signal.get("relevant_departments") or []
-                if depts:
-                    st.markdown(f"**Departments:** {', '.join(depts)}")
+            st.markdown(
+                f"**Status:** {_STATUS_BADGE.get(status, status)}"
+                f"  &nbsp;·&nbsp; **Last updated:** {fmt_timestamp(last_run)}"
+            )
+            if status == "failed" and hiring_signal.get("error"):
+                st.markdown(f":red[**Error:**] `{hiring_signal['error']}`")
+
+            found = bool(hiring_signal.get("signal_found"))
+            st.markdown(f"**hiring_signal_found:** {found}")
+            strength = (hiring_signal.get("signal_strength") or "none").lower()
+            color = _STRENGTH_COLOR.get(strength, ":gray")
+            st.markdown(f"**hiring_signal_strength:** {color}[**{strength.title()}**]")
+
             roles = hiring_signal.get("relevant_roles") or []
             if roles:
-                st.markdown("**Roles found:** " + "  ".join(pill(r, "green") for r in roles))
+                st.markdown("**relevant_roles_found:** " + "  ".join(pill(r, "green") for r in roles))
+            else:
+                st.markdown("**relevant_roles_found:** :gray[(none)]")
+
+            depts = hiring_signal.get("relevant_departments") or []
+            st.markdown(
+                "**relevant_departments:** "
+                + (", ".join(depts) if depts else ":gray[(none)]")
+            )
+            st.markdown(
+                f"**recency_estimate:** {hiring_signal.get('recency_estimate') or 'unknown'}"
+            )
+
+            applied = hiring_signal.get("applied_uplift") or "none"
+            rec = hiring_signal.get("tier_uplift_recommendation") or "none"
+            st.markdown(
+                f"**tier_uplift_recommendation:** {_UPLIFT_LABEL.get(rec, rec)}"
+                + (
+                    f"  _(applied: {_UPLIFT_LABEL.get(applied, applied)})_"
+                    if applied != rec else ""
+                )
+            )
             if hiring_signal.get("why_it_matters"):
-                st.markdown(f"**Why it matters:** {hiring_signal['why_it_matters']}")
+                st.markdown(f"**why_it_matters:** {hiring_signal['why_it_matters']}")
             if hiring_signal.get("recommended_email_angle"):
                 st.markdown(
-                    f"**Recommended email angle:** _{hiring_signal['recommended_email_angle']}_"
+                    f"**recommended_email_angle:** _{hiring_signal['recommended_email_angle']}_"
                 )
             urls = hiring_signal.get("source_urls") or []
             if urls:
-                with st.expander(f"Source URLs ({len(urls)})", expanded=False):
+                with st.expander(f"source_urls ({len(urls)})", expanded=False):
                     for u in urls:
                         st.markdown(f"- {u}")
 
-    if st.button("Research hiring signal (Tavily)", key=f"ld_hiring_{lead['id']}"):
+    if st.button("Run hiring signal enrichment", key=f"ld_hiring_{lead['id']}", type="secondary"):
         ok, result = _run_with_spinner(
-            "Researching hiring signal…",
+            "Running hiring signal enrichment…",
             research_hiring_signal_sync,
             int(lead["id"]),
             workspace_id=_ws_id,
         )
         if not ok:
-            st.error(f"Hiring research failed: {result}")
+            st.error(f"Hiring signal enrichment failed: {result}")
         else:
+            _status = (result or {}).get("status", "completed")
             st.success(
-                "Hiring research complete. No email sent, no Instantly push."
+                f"Hiring signal enrichment {_status}. No email sent, no Instantly push."
             )
             st.cache_data.clear()
             st.rerun()

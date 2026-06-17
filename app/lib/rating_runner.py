@@ -151,32 +151,65 @@ def regenerate_email_sync(lead_id: int, *, workspace_id: int | None = None) -> i
 
 
 def full_refresh_sync(lead_id: int, *, workspace_id: int | None = None) -> dict[str, Any]:
-    """Enrichment → scoring → email regeneration for one lead.
+    """Enrichment → hiring signal → scoring → email regeneration for one lead.
 
-    Stops the chain at the first failure and reports which step failed
-    so the UI can surface a precise error. The completed steps are NOT
-    rolled back — re-running picks up from the failed step on the next
-    click.
+    Hiring-signal enrichment runs (force=True) BEFORE scoring so any tier
+    uplift is in effect when the lead is rescored. Buyer-account research is
+    part of enrichment (the waterfall), so it's covered by the enrichment step.
+
+    Stops the chain at the first HARD failure (enrichment/scoring/email) and
+    reports which step failed. Hiring-signal enrichment never aborts the
+    chain — it records its own status and the run continues to scoring.
+
+    `steps` maps each step → "completed" | "skipped" | "failed" so the UI can
+    render a per-step status line.
     """
-    out: dict[str, Any] = {"enrichment": None, "scoring": None, "email_id": None}
+    out: dict[str, Any] = {
+        "enrichment": None, "hiring_signal": None, "scoring": None, "email_id": None,
+        "steps": {},
+    }
+    steps = out["steps"]
+
     try:
         out["enrichment"] = rerun_enrichment_sync(lead_id, workspace_id=workspace_id)
+        # Buyer research is one source inside the waterfall; surface its status.
+        ba = (out["enrichment"] or {}).get("buyer_accounts") or {}
+        steps["enrichment"] = "completed"
+        steps["buyer_research"] = ba.get("status") or "completed"
     except Exception as exc:
+        steps["enrichment"] = "failed"
         out["failed_step"] = "enrichment"
         out["error"] = f"{type(exc).__name__}: {exc}"
         return out
+
+    # Hiring signal (force re-run on a full refresh). Non-fatal.
+    try:
+        out["hiring_signal"] = research_hiring_signal_sync(
+            lead_id, workspace_id=workspace_id, force=True,
+        )
+        steps["hiring_signal"] = (out["hiring_signal"] or {}).get("status") or "completed"
+    except Exception as exc:
+        steps["hiring_signal"] = "failed"
+        out["hiring_signal"] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+
     try:
         out["scoring"] = rerun_scoring_sync(lead_id, workspace_id=workspace_id)
+        steps["scoring"] = "completed"
     except Exception as exc:
+        steps["scoring"] = "failed"
         out["failed_step"] = "scoring"
         out["error"] = f"{type(exc).__name__}: {exc}"
         return out
+
     try:
         out["email_id"] = regenerate_email_sync(lead_id, workspace_id=workspace_id)
+        steps["content"] = "completed"
     except Exception as exc:
+        steps["content"] = "failed"
         out["failed_step"] = "email"
         out["error"] = f"{type(exc).__name__}: {exc}"
         return out
+
     return out
 
 

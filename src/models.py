@@ -553,6 +553,12 @@ class LeadSignal(Base):
     base_tier: Mapped[Optional[str]] = mapped_column(String(1))
     base_score: Mapped[Optional[int]] = mapped_column(Integer)
 
+    # Run bookkeeping so the UI can show whether enrichment ran.
+    # status: not_started | completed | skipped | failed.
+    status: Mapped[str] = mapped_column(String(16), default="not_started")
+    last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    error: Mapped[Optional[str]] = mapped_column(Text)
+
     raw_payload: Mapped[Optional[dict]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(

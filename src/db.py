@@ -160,6 +160,12 @@ _RUNTIME_COLUMN_ADDS: list[tuple[str, str, str]] = [
     ("lead_source_imports", "scored_count", "INTEGER DEFAULT 0"),
     ("lead_source_imports", "content_generated_count", "INTEGER DEFAULT 0"),
     ("lead_source_imports", "enrichment_skipped_count", "INTEGER DEFAULT 0"),
+    # Hiring-signal run bookkeeping (added in the visibility hotfix). Older
+    # lead_signals rows (created before these columns) read back as
+    # status="not_started" via the model default on the next write.
+    ("lead_signals", "status", "VARCHAR(16) DEFAULT 'not_started'"),
+    ("lead_signals", "last_run_at", "TIMESTAMP"),
+    ("lead_signals", "error", "TEXT"),
 ]
 
 # Postgres-only column widenings. SQLite ignores VARCHAR length caps so

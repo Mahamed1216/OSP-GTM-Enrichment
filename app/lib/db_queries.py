@@ -401,10 +401,12 @@ def list_leads(
                 "Tier": row.tier or "",
                 "Score": int(row.score) if row.score is not None else None,
                 "Enriched": bool(row.enrichment_id is not None),
+                # "Not run" = no signal row; "None" = ran, no relevant hiring;
+                # otherwise the strength (High/Medium/Low).
                 "Hiring": (
-                    row.hiring_strength
-                    if (row.hiring_strength and row.hiring_found)
-                    else ""
+                    "Not run" if row.hiring_strength is None
+                    else row.hiring_strength.title() if row.hiring_found
+                    else "None"
                 ),
                 "Sent": bool(row.any_delivered),
                 "Replied": bool(row.any_reply),
@@ -782,6 +784,9 @@ def get_lead_full(
                     "applied_uplift": sig.applied_uplift,
                     "base_tier": sig.base_tier,
                     "base_score": sig.base_score,
+                    "status": getattr(sig, "status", None),
+                    "last_run_at": getattr(sig, "last_run_at", None),
+                    "error": getattr(sig, "error", None),
                     "updated_at": sig.updated_at,
                 }
         except Exception:

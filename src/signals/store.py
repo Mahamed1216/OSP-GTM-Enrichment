@@ -63,6 +63,9 @@ def _to_dict(row: LeadSignal) -> dict:
         "applied_uplift": row.applied_uplift,
         "base_tier": row.base_tier,
         "base_score": row.base_score,
+        "status": row.status,
+        "last_run_at": row.last_run_at,
+        "error": row.error,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
@@ -74,11 +77,13 @@ def upsert_hiring_signal(
     *,
     workspace_id: int | None = None,
     summary: str | None = None,
+    status: str = "completed",
+    error: str | None = None,
 ) -> dict:
     """Create or update the hiring LeadSignal row for a lead. Idempotent.
 
-    Stores the classifier output. Does NOT touch the Score row — call
-    apply_hiring_uplift for that.
+    Stores the classifier output plus run bookkeeping (status, last_run_at,
+    error). Does NOT touch the Score row — call apply_hiring_uplift for that.
     """
     with session_scope() as session:
         row = session.execute(
@@ -104,6 +109,41 @@ def upsert_hiring_signal(
         row.recommended_email_angle = result.recommended_email_angle or None
         row.tier_uplift_recommendation = result.tier_uplift_recommendation
         row.raw_payload = result.model_dump()
+        row.status = status
+        row.error = error
+        row.last_run_at = now_utc()
+        row.updated_at = now_utc()
+        session.flush()
+        return _to_dict(row)
+
+
+def record_hiring_failure(
+    lead_id: int,
+    error: str,
+    *,
+    workspace_id: int | None = None,
+) -> dict:
+    """Record a failed hiring-enrichment run (status="failed" + error).
+
+    Creates the row if absent; preserves any previously-found signal fields
+    on an existing row (only the status/error/last_run_at are stamped) so a
+    transient failure doesn't wipe out good prior research.
+    """
+    with session_scope() as session:
+        row = session.execute(
+            select(LeadSignal).where(
+                LeadSignal.lead_id == lead_id,
+                LeadSignal.signal_type == HIRING,
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            row = LeadSignal(lead_id=lead_id, signal_type=HIRING, workspace_id=workspace_id)
+            session.add(row)
+        elif workspace_id is not None:
+            row.workspace_id = workspace_id
+        row.status = "failed"
+        row.error = error
+        row.last_run_at = now_utc()
         row.updated_at = now_utc()
         session.flush()
         return _to_dict(row)

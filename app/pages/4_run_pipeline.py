@@ -53,9 +53,10 @@ inject_styles()
 
 _PHASE_LABELS = {
     "enrichment": "1. Enrichment",
-    "scoring": "2. Scoring",
-    "content": "3. Content",
-    "delivery": "4. Delivery",
+    "hiring_signal": "2. Hiring signal",
+    "scoring": "3. Scoring",
+    "content": "4. Content",
+    "delivery": "5. Delivery",
 }
 
 _SKIP_LABEL = "— Skip —"
@@ -126,6 +127,13 @@ def _run_pipeline_thread(
                 "status": "refreshed" if force_refresh else "ran",
                 "detail": "",
             }
+        elif u.phase == "hiring_signal":
+            status = str(payload.get("status") or "completed")
+            strength = payload.get("strength")
+            detail = (
+                f"strength={strength}" if (status == "completed" and strength) else ""
+            )
+            per["hiring_signal"] = {"status": status, "detail": detail}
         elif u.phase == "scoring":
             if payload.get("skipped"):
                 per["scoring"] = {
@@ -880,6 +888,7 @@ if running:
     if per_lead:
         _STEP_LABEL = {
             "enrichment": "Enrichment",
+            "hiring_signal": "Hiring signal",
             "scoring": "Scoring",
             "email": "Email",
             "call_script": "Call script",
@@ -891,16 +900,18 @@ if running:
             "regenerated": "🔄",
             "ran": "✅",
             "generated": "✅",
+            "completed": "✅",
             "skipped": "⏭",
             "delivered": "📬",
             "dry-run": "🧪",
             "failed": "❌",
+            "not_started": "•",
         }
         with st.expander(f"Per-lead step status ({len(per_lead)} lead(s))", expanded=True):
             for lid in sorted(per_lead.keys()):
                 lines = [f"**Lead {lid}**"]
                 steps: dict = per_lead[lid]
-                for step in ("enrichment", "scoring", "email", "call_script", "linkedin_msg", "delivery"):
+                for step in ("enrichment", "hiring_signal", "scoring", "email", "call_script", "linkedin_msg", "delivery"):
                     info = steps.get(step)
                     if not info:
                         continue

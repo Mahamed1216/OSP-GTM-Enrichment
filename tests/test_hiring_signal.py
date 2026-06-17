@@ -367,3 +367,132 @@ def test_rescue_run_never_sends_or_pushes(monkeypatch):
     with session_scope() as session:
         score = session.execute(select(Score).where(Score.lead_id == lead_id)).scalar_one()
         assert score.tier == "A"
+
+
+# ---------------------------------------------------------------------------
+# Visibility hotfix — pipeline phase, status fields, manual button, scoring
+# ---------------------------------------------------------------------------
+
+def test_pipeline_runs_hiring_signal_phase(monkeypatch):
+    """The UI pipeline (pipeline_runner) calls hiring enrichment as a phase."""
+    osp = _seed_osp()
+    lead_id = _make_lead("c@x.com", osp)
+
+    called: list[int] = []
+
+    async def fake_hiring(lid, *, workspace_id=None, force=False):
+        called.append(lid)
+        return {"lead_id": lid, "status": "completed", "skipped": False,
+                "strength": "high", "found": True}
+
+    monkeypatch.setattr("src.signals.hiring.enrich_hiring_signal", fake_hiring)
+
+    from app.lib.pipeline_runner import process_single_lead
+    process_single_lead(
+        lead_id, dry_run=True,
+        run_enrichment=False, run_scoring=False,
+        run_email=False, run_call_script=False, run_linkedin_msg=False,
+    )
+    assert called == [lead_id]
+
+
+def test_pipeline_emits_hiring_signal_status(monkeypatch):
+    osp = _seed_osp()
+    lead_id = _make_lead("c@x.com", osp)
+
+    async def fake_hiring(lid, *, workspace_id=None, force=False):
+        return {"lead_id": lid, "status": "completed", "skipped": False,
+                "strength": "medium", "found": True}
+
+    monkeypatch.setattr("src.signals.hiring.enrich_hiring_signal", fake_hiring)
+
+    from app.lib.pipeline_runner import process_single_lead
+    updates = []
+    process_single_lead(
+        lead_id, dry_run=True,
+        run_enrichment=False, run_scoring=False,
+        run_email=False, run_call_script=False, run_linkedin_msg=False,
+        on_update=updates.append,
+    )
+    hiring_updates = [u for u in updates if u.phase == "hiring_signal"]
+    assert hiring_updates
+    assert hiring_updates[0].payload["status"] == "completed"
+
+
+def test_get_lead_full_includes_hiring_status():
+    osp = _seed_osp()
+    lead_id = _make_lead("c@x.com", osp)
+    upsert_hiring_signal(lead_id, _high_signal(["RevOps"]), workspace_id=osp, status="completed")
+
+    from app.lib.db_queries import get_lead_full
+    bundle = get_lead_full(lead_id, workspace_id=osp)
+    assert bundle["hiring_signal"] is not None
+    assert bundle["hiring_signal"]["status"] == "completed"
+    assert bundle["hiring_signal"]["signal_found"] is True
+    assert bundle["hiring_signal"]["last_run_at"] is not None
+
+
+def test_get_lead_full_hiring_none_when_not_run():
+    osp = _seed_osp()
+    lead_id = _make_lead("c@x.com", osp)
+
+    from app.lib.db_queries import get_lead_full
+    bundle = get_lead_full(lead_id, workspace_id=osp)
+    assert bundle["hiring_signal"] is None  # UI renders "has not run"
+
+
+def test_manual_button_runs_for_single_lead(monkeypatch):
+    osp = _seed_osp()
+    lead_a = _make_lead("a@x.com", osp)
+    _make_score(lead_a, "C", 55, osp)
+    lead_b = _make_lead("b@x.com", osp)
+    _make_score(lead_b, "C", 55, osp)
+
+    async def fake_research(*a, **k):
+        return _high_signal(["RevOps"])
+
+    monkeypatch.setattr("src.signals.hiring.research_hiring_signal", fake_research)
+
+    from app.lib.rating_runner import research_hiring_signal_sync
+    out = research_hiring_signal_sync(lead_a, workspace_id=osp)
+    assert out["status"] == "completed"
+    assert has_hiring_signal(lead_a)
+    assert not has_hiring_signal(lead_b)  # only the selected lead ran
+
+
+def test_failed_enrichment_stores_failed_status_and_error(monkeypatch):
+    osp = _seed_osp()
+    lead_id = _make_lead("c@x.com", osp)
+
+    async def boom(*a, **k):
+        raise RuntimeError("tavily down")
+
+    monkeypatch.setattr("src.signals.hiring.research_hiring_signal", boom)
+
+    out = asyncio.run(enrich_hiring_signal(lead_id, workspace_id=osp, force=True))
+    assert out["status"] == "failed"
+    row = get_hiring_signal(lead_id)
+    assert row["status"] == "failed"
+    assert "tavily down" in (row["error"] or "")
+
+
+def test_high_signal_available_to_scoring(monkeypatch):
+    """A stored high hiring signal is applied during score_lead (tier bump)."""
+    from src.scoring import ScoreResult, score_lead
+
+    osp = _seed_osp()
+    lead_id = _make_lead("c@x.com", osp)
+    upsert_hiring_signal(lead_id, _high_signal(["RevOps", "SDR Manager"]), workspace_id=osp)
+
+    async def fake_gen(**kwargs):
+        return ScoreResult(score=65, tier="C", rationale="base fit", signals_used=[])
+
+    monkeypatch.setattr("src.scoring.generate_json", fake_gen)
+
+    result = asyncio.run(score_lead(lead_id, workspace_id=osp))
+    # Base C(65) + high signal + 2 relevant roles + decent fit → C_to_A.
+    assert result.tier == "A"
+    with session_scope() as session:
+        score = session.execute(select(Score).where(Score.lead_id == lead_id)).scalar_one()
+        assert score.tier == "A"
+        assert any(str(s).startswith("hiring:") for s in score.signals_used)

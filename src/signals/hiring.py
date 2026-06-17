@@ -22,7 +22,12 @@ from src.icp_config import load_workspace_icp_config
 from src.llm import generate_json
 from src.retry import retry_api
 from src.signals.schemas import HiringSignalResult
-from src.signals.store import apply_hiring_uplift, has_hiring_signal, upsert_hiring_signal
+from src.signals.store import (
+    apply_hiring_uplift,
+    has_hiring_signal,
+    record_hiring_failure,
+    upsert_hiring_signal,
+)
 
 log = logging.getLogger(__name__)
 
@@ -279,17 +284,30 @@ async def enrich_hiring_signal(
 
     if not force and has_hiring_signal(lead_id):
         log.info("hiring_skip_existing", extra={"lead_id": lead_id})
-        return {"lead_id": lead_id, "skipped": True, "reason": "signal_exists"}
+        return {"lead_id": lead_id, "skipped": True, "status": "skipped", "reason": "signal_exists"}
 
     # Snapshot the lead inside a session.
     with session_scope() as session:
         lead = session.get(Lead, lead_id)
         if lead is None:
-            return {"lead_id": lead_id, "error": "lead_not_found"}
+            return {"lead_id": lead_id, "error": "lead_not_found", "status": "failed"}
         company = lead.company
         domain = lead.company_domain
         industry = lead.industry
         ws_id = workspace_id if workspace_id is not None else lead.workspace_id
+
+    # No company name or domain to search on → record a skipped run so the UI
+    # shows the lead was considered (rather than silently doing nothing).
+    if not build_hiring_queries(company, domain):
+        upsert_hiring_signal(
+            lead_id,
+            _empty_result("No company name or domain to research."),
+            workspace_id=ws_id,
+            status="skipped",
+        )
+        log.info("hiring_skip_no_input", extra={"lead_id": lead_id})
+        return {"lead_id": lead_id, "skipped": True, "status": "skipped",
+                "reason": "no_company_or_domain"}
 
     icp_context = None
     try:
@@ -298,14 +316,22 @@ async def enrich_hiring_signal(
     except Exception:  # pragma: no cover - icp is best-effort context
         icp_context = None
 
-    result = await research_hiring_signal(
-        company,
-        company_domain=domain,
-        industry=industry,
-        icp_context=icp_context,
-    )
+    # Research is wrapped so a genuine failure (exception) is recorded with
+    # status="failed" + error, distinct from "ran fine, found nothing".
+    try:
+        result = await research_hiring_signal(
+            company,
+            company_domain=domain,
+            industry=industry,
+            icp_context=icp_context,
+        )
+    except Exception as exc:
+        msg = f"{type(exc).__name__}: {exc}"
+        record_hiring_failure(lead_id, msg, workspace_id=ws_id)
+        log.warning("hiring_enrich_failed", extra={"lead_id": lead_id, "error": msg})
+        return {"lead_id": lead_id, "skipped": False, "status": "failed", "error": msg}
 
-    upsert_hiring_signal(lead_id, result, workspace_id=ws_id)
+    upsert_hiring_signal(lead_id, result, workspace_id=ws_id, status="completed")
     uplift = apply_hiring_uplift(lead_id, workspace_id=ws_id)
 
     log.info(
@@ -321,6 +347,7 @@ async def enrich_hiring_signal(
     return {
         "lead_id": lead_id,
         "skipped": False,
+        "status": "completed",
         "found": result.hiring_signal_found,
         "strength": result.hiring_signal_strength,
         "roles": result.relevant_roles_found,
