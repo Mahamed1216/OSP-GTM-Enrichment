@@ -28,9 +28,49 @@ SKIP_LABELS: dict[str, str] = {
     "email_unverified": "email unverified",
     "below_tier": "below tier gate",
     "no_content": "missing content",
+    "unsafe_content": "needs review / regeneration",
     "already_sent": "already sent",
     "in_progress": "send in progress",
 }
+
+
+# Internal-only / placeholder markers that must NEVER reach a prospect or be
+# pushed to Instantly. These are written into GeneratedContent.body by the
+# generator as status records (e.g. the buyer-research "NEEDS REVIEW: ..."
+# marker and the ICP-skip "SKIP: ..." marker). The send paths used to gate
+# only on tier/dedupe/verify/has-content, so a sendable-tier lead with such a
+# placeholder could have the marker delivered. This is the single source of
+# truth for "this content is internal and unsafe to send".
+_INTERNAL_CONTENT_MARKERS: tuple[str, ...] = (
+    "needs review",             # buyer-research placeholder ("NEEDS REVIEW: ...")
+    "no direct buyer account",
+    "lookalike buyer account",
+    "trigger based buyer",
+)
+
+
+def is_unsafe_internal_content(subject: str | None, body: str | None) -> bool:
+    """Return True when an email's subject/body is empty or contains internal
+    review / placeholder text that must never be sent to a prospect or pushed
+    to Instantly.
+
+    Shared by every pre-send path (deliver_email, overwrite_lead_copy, the
+    bulk-push eligibility filter, and the debug push diagnostic) so the safety
+    rule is enforced identically everywhere. Failure code: unsafe_content /
+    unsafe_internal_review_content.
+    """
+    stripped = (body or "").strip()
+    if not stripped:
+        return True  # empty/whitespace body is never sendable
+    combined = f"{subject or ''}\n{body or ''}".lower()
+    if any(marker in combined for marker in _INTERNAL_CONTENT_MARKERS):
+        return True
+    # ICP-skip / explicit placeholder markers (defense in depth).
+    if stripped.startswith("SKIP:"):
+        return True
+    if stripped.lower() in ("(needs review)", "(skip)"):
+        return True
+    return False
 
 
 def _verifier_configured() -> bool:
@@ -120,6 +160,12 @@ def filter_eligible(
         content = latest_content.get(lid)
         if not content or not (content.body or "").strip():
             skipped["no_content"].append(lid)
+            continue
+
+        # Hard content-safety gate: never bulk-send internal review/placeholder
+        # text (e.g. the "NEEDS REVIEW: ..." buyer-research marker).
+        if is_unsafe_internal_content(content.subject, content.body):
+            skipped["unsafe_content"].append(lid)
             continue
 
         if content.delivery_status == "sent" and (content.delivery_id or "").strip():

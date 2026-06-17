@@ -17,6 +17,7 @@ from sqlalchemy import select
 
 from src.config import settings
 from src.db import session_scope
+from src.delivery.eligibility import is_unsafe_internal_content
 from src.delivery.verify_email import verify_email
 from src.models import GeneratedContent, Lead, Score, now_utc
 from src.retry import retry_api
@@ -28,6 +29,7 @@ SkipReason = Literal[
     "already_delivered",
     "email_invalid",
     "no_email_content",
+    "unsafe_internal_review_content",
     "workspace_not_configured",
 ]
 
@@ -252,6 +254,8 @@ async def deliver_email(
         # expires attributes; later access would raise DetachedInstanceError).
         lead_email = lead.email
         content_id = content.id if content else None
+        content_subject = content.subject if content else None
+        content_body = content.body if content else None
         tier_snapshot: str | None = score.tier if score else None
         already_delivered_flag = already_delivered is not None
         has_content = content is not None
@@ -267,6 +271,12 @@ async def deliver_email(
     # Guard 3: no content
     if not has_content:
         return await _record_skip(None, "no_email_content", lead_id, tier_snapshot)
+
+    # Guard 3b: content safety — never send internal review / placeholder text
+    # (e.g. the "NEEDS REVIEW: ..." buyer-research marker). Runs before the
+    # verification API call and before any send.
+    if is_unsafe_internal_content(content_subject, content_body):
+        return await _record_skip(content_id, "unsafe_internal_review_content", lead_id, tier_snapshot)
 
     # Guard 4: email verification
     verify = await verify_email(lead_id)
@@ -513,6 +523,17 @@ async def overwrite_lead_copy(
     if content is None or not (content.body or "").strip():
         return OverwriteResult(lead_id=lead_id, status="skipped", detail="no email content generated")
 
+    # Hard content-safety gate: never overwrite/push internal review or
+    # placeholder text (e.g. the "NEEDS REVIEW: ..." marker). Returns BEFORE
+    # any Instantly lookup/PATCH/POST, so existing valid Instantly copy is
+    # never clobbered with internal text.
+    if is_unsafe_internal_content(content.subject, content.body):
+        return OverwriteResult(
+            lead_id=lead_id,
+            status="skipped",
+            detail="unsafe_internal_review_content: content needs review/regeneration",
+        )
+
     expected_subject = content.subject or ""
     expected_body = content.body
 
@@ -721,6 +742,18 @@ async def debug_overwrite_one_lead(lead_id: int, *, workspace_id: int | None = N
     if content is None:
         out["verdict"] = "no email content generated locally for this lead"
         out["local_email"] = lead.email
+        return out
+
+    # Content-safety gate: the diagnostic PATCHes Instantly with this content,
+    # so it must also refuse internal review / placeholder text before any push.
+    if is_unsafe_internal_content(content.subject, content.body):
+        out["local_email"] = lead.email
+        out["local_latest_subject"] = content.subject
+        out["local_latest_body"] = content.body or ""
+        out["verdict"] = (
+            "unsafe_internal_review_content: content needs review/regeneration — "
+            "refusing to push internal text to Instantly."
+        )
         return out
 
     out["local_email"] = lead.email
