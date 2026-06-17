@@ -54,6 +54,7 @@ def _count_leads_cached(
     sent_only: bool,
     not_sent_only: bool,
     enriched_only: bool,
+    hiring_filter: str = "any",
 ) -> int:
     return count_leads(
         workspace_id,
@@ -62,6 +63,7 @@ def _count_leads_cached(
         sent_only=sent_only,
         not_sent_only=not_sent_only,
         enriched_only=enriched_only,
+        hiring_filter=hiring_filter,
     )
 
 
@@ -75,6 +77,7 @@ def _list_leads_cached(
     sent_only: bool,
     not_sent_only: bool,
     enriched_only: bool,
+    hiring_filter: str = "any",
 ) -> pd.DataFrame:
     return list_leads(
         workspace_id,
@@ -85,6 +88,7 @@ def _list_leads_cached(
         sent_only=sent_only,
         not_sent_only=not_sent_only,
         enriched_only=enriched_only,
+        hiring_filter=hiring_filter,
     )
 
 
@@ -135,7 +139,7 @@ def _on_not_sent_change() -> None:
 
 
 st.markdown('<div class="filter-row">', unsafe_allow_html=True)
-fc1, fc2, fc3, fc4, _ = st.columns([2, 1, 1, 1, 2])
+fc1, fc2, fc3, fc4, fc5 = st.columns([2, 1, 1, 1, 2])
 with fc1:
     tier_filter = st.multiselect(
         "Tier",
@@ -156,7 +160,46 @@ with fc3:
 with fc4:
     enriched_only = st.checkbox("Has enrichment", key="leads_filter_enriched",
                                 on_change=_reset_page)
+with fc5:
+    hiring_filter = st.selectbox(
+        "Hiring signal",
+        options=["any", "high", "medium", "none"],
+        index=0,
+        key="leads_filter_hiring",
+        on_change=_reset_page,
+    )
 st.markdown('</div>', unsafe_allow_html=True)
+
+# ---------- C-tier hiring rescue ----------
+# Workspace-scoped: researches hiring signals for C-tier leads missing one
+# (limit 25 by default) and applies tier uplifts. Never sends or pushes.
+with st.expander("🚀 Run C-tier hiring rescue", expanded=False):
+    st.caption(
+        "Researches open RevOps / SDR / GTM / automation roles for C-tier "
+        "leads in this workspace that have no hiring signal yet, then applies "
+        "any tier uplift. Uses Tavily. No emails sent, no Instantly push."
+    )
+    rc1, rc2 = st.columns([1, 3])
+    with rc1:
+        _rescue_limit = st.number_input(
+            "Limit", min_value=1, max_value=200, value=25, step=5,
+            key="leads_rescue_limit",
+        )
+    if st.button("Run hiring rescue", key="leads_rescue_run", type="primary"):
+        try:
+            from src.signals.hiring_rescue import run_hiring_rescue_sync
+            with st.spinner("Researching hiring signals…"):
+                report = run_hiring_rescue_sync(_ws_id, limit=int(_rescue_limit))
+            st.success(
+                f"Processed {report.processed_count} leads · "
+                f"high {report.high_signal_count} / med {report.medium_signal_count} "
+                f"/ low {report.low_signal_count} / none {report.no_signal_count} · "
+                f"bumped → B: {report.bumped_to_B_count}, → A: {report.bumped_to_A_count}"
+                + (f" · {report.errors} errors" if report.errors else "")
+            )
+            st.cache_data.clear()
+        except Exception as exc:
+            st.error(f"Hiring rescue failed: {type(exc).__name__}: {exc}")
 
 # ---------- Resolve current pagination state ----------
 _page = st.session_state["leads_page"]
@@ -166,17 +209,18 @@ _tiers = tuple(tier_filter)
 _sent = bool(st.session_state.get("leads_filter_sent"))
 _not_sent = bool(st.session_state.get("leads_filter_not_sent"))
 _enriched = bool(st.session_state.get("leads_filter_enriched"))
+_hiring = st.session_state.get("leads_filter_hiring", "any")
 
 # ---------- Load data (server-side filtered + paginated) ----------
 try:
-    _total = _count_leads_cached(_ws_id, _search, _tiers, _sent, _not_sent, _enriched)
-    df = _list_leads_cached(_ws_id, _page, _page_size, _search, _tiers, _sent, _not_sent, _enriched)
+    _total = _count_leads_cached(_ws_id, _search, _tiers, _sent, _not_sent, _enriched, _hiring)
+    df = _list_leads_cached(_ws_id, _page, _page_size, _search, _tiers, _sent, _not_sent, _enriched, _hiring)
 except Exception as exc:
     st.error(f"Could not load leads: {exc}")
     st.stop()
 
 if _total == 0:
-    if _search or _tiers or _sent or _not_sent or _enriched:
+    if _search or _tiers or _sent or _not_sent or _enriched or _hiring != "any":
         st.info("No leads match the current filters.")
     else:
         st.info("No leads yet in this workspace. Use the Run Pipeline page to ingest a CSV.")
@@ -271,11 +315,12 @@ selection = st.dataframe(
     use_container_width=True,
     on_select="rerun",
     selection_mode="multi-row",
-    column_order=["id", "Name", "Company", "Title", "Tier", "Score", "Enriched", "Status"],
+    column_order=["id", "Name", "Company", "Title", "Tier", "Score", "Enriched", "Hiring", "Status"],
     column_config={
         "id": st.column_config.NumberColumn("ID", width="small"),
         "Score": st.column_config.NumberColumn("Score", format="%d"),
         "Enriched": st.column_config.CheckboxColumn("Enriched"),
+        "Hiring": st.column_config.TextColumn("Hiring", width="small"),
         "Sent": None,
         "Replied": None,
         "Email": None,

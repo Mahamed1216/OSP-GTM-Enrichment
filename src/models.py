@@ -503,6 +503,63 @@ class ReplyThread(Base):
     )
 
 
+class LeadSignal(Base):
+    """A buying-intent signal discovered for a lead (workspace scoped).
+
+    First signal_type is "hiring" — the C-tier rescue layer researches
+    whether a lead's company has active job postings (RevOps / SDR / GTM /
+    automation roles) that indicate active GTM investment, timing, and pain.
+    The table is generic on `signal_type` so future signals (funding, tech
+    adoption, etc.) can reuse the same shape.
+
+    One row per (lead_id, signal_type) — the unique constraint makes the
+    enrichment idempotent: re-running the rescue updates the existing row
+    instead of appending a duplicate. `base_tier` / `base_score` capture the
+    lead's score at uplift time so the deterministic tier-uplift step in
+    src.signals.uplift can re-apply itself idempotently without compounding.
+
+    NOTHING here ever triggers a send or an Instantly push — it is research
+    + a scoring uplift recommendation only.
+    """
+    __tablename__ = "lead_signals"
+    __table_args__ = (
+        UniqueConstraint("lead_id", "signal_type", name="uq_lead_signals_lead_type"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    lead_id: Mapped[int] = mapped_column(ForeignKey("leads.id"), index=True)
+    workspace_id: Mapped[Optional[int]] = mapped_column(
+        Integer, default=_default_workspace_id, index=True
+    )
+    signal_type: Mapped[str] = mapped_column(String(32), default="hiring", index=True)
+
+    # Classifier output.
+    signal_found: Mapped[bool] = mapped_column(Boolean, default=False)
+    signal_strength: Mapped[str] = mapped_column(String(16), default="none")  # none|low|medium|high
+    relevant_roles: Mapped[list] = mapped_column(JSON, default=list)
+    relevant_departments: Mapped[list] = mapped_column(JSON, default=list)
+    recency_estimate: Mapped[Optional[str]] = mapped_column(String(32))  # last_30/90/180_days|unknown
+    summary: Mapped[Optional[str]] = mapped_column(Text)
+    why_it_matters: Mapped[Optional[str]] = mapped_column(Text)
+    source_urls: Mapped[list] = mapped_column(JSON, default=list)
+    recommended_email_angle: Mapped[Optional[str]] = mapped_column(Text)
+
+    # Uplift bookkeeping.
+    # tier_uplift_recommendation = the deterministic recommendation (none|C_to_B|C_to_A|B_to_A).
+    # applied_uplift = what was actually applied to the Score row (or "none").
+    # base_tier/base_score = the pre-uplift score, captured so re-applying is idempotent.
+    tier_uplift_recommendation: Mapped[str] = mapped_column(String(16), default="none")
+    applied_uplift: Mapped[Optional[str]] = mapped_column(String(16))
+    base_tier: Mapped[Optional[str]] = mapped_column(String(1))
+    base_score: Mapped[Optional[int]] = mapped_column(Integer)
+
+    raw_payload: Mapped[Optional[dict]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=now_utc, onupdate=now_utc, nullable=False
+    )
+
+
 class LeadSourceImport(Base):
     """Audit record for one pull-based import from the external lead source API.
 

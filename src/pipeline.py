@@ -52,6 +52,13 @@ async def run_pipeline_for_lead(lead_id: int, *, dry_run: bool = True) -> Pipeli
         icp = load_icp_config()
 
         result.enrichment_status = await enrich_lead(lead_id)
+        # Hiring-signal enrichment before scoring so the deterministic tier
+        # uplift is in effect when the lead is scored. Graceful — never raises.
+        try:
+            from src.signals.hiring import enrich_hiring_signal
+            await enrich_hiring_signal(lead_id)
+        except Exception:
+            log.warning("pipeline_hiring_signal_failed", extra={"lead_id": lead_id})
         result.score = await score_lead(lead_id)
 
         send_gate_open = settings.should_send(result.score.tier)

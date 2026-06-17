@@ -36,6 +36,7 @@ _RUNTIME_NEW_TABLES: tuple[str, ...] = (
     "reply_drafts",
     "reply_threads",
     "lead_source_imports",   # Phase 7: external lead source import log
+    "lead_signals",          # Hiring signal C-tier rescue layer
 )
 
 

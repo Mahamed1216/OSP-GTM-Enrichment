@@ -21,6 +21,7 @@ def format_lead_context(
     *,
     include_score: bool = True,
     max_news: int = 5,
+    hiring_signal: Optional[dict] = None,
 ) -> str:
     parts: list[str] = [
         "# Lead",
@@ -37,6 +38,24 @@ def format_lead_context(
         parts.append(f"Rationale: {score.rationale}")
         if score.signals_used:
             parts.append(f"Signals: {', '.join(score.signals_used)}")
+
+    # Hiring signal (from the C-tier rescue layer). Surfaced so content
+    # generators can lead with a hiring angle when one was actually found.
+    # Only real roles/sources are passed through — never invent certainty.
+    if hiring_signal and hiring_signal.get("signal_found"):
+        roles = [r for r in (hiring_signal.get("relevant_roles") or []) if r]
+        parts.append("\n## Hiring signal")
+        parts.append(f"- Strength: {hiring_signal.get('signal_strength') or 'unknown'}")
+        if roles:
+            parts.append(f"- Open roles found: {', '.join(roles)}")
+        depts = [d for d in (hiring_signal.get("relevant_departments") or []) if d]
+        if depts:
+            parts.append(f"- Departments: {', '.join(depts)}")
+        if hiring_signal.get("why_it_matters"):
+            parts.append(f"- Why it matters: {hiring_signal['why_it_matters']}")
+        angle = hiring_signal.get("recommended_email_angle")
+        if angle:
+            parts.append(f"- Suggested angle (use only the roles above): {angle}")
 
     if not enrichment:
         return "\n".join(parts)

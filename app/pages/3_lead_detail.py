@@ -26,6 +26,7 @@ from app.lib.rating_runner import (
     regenerate_sync,
     rerun_enrichment_sync,
     rerun_scoring_sync,
+    research_hiring_signal_sync,
 )
 from app.styles import inject_styles
 from src.feedback.ratings import get_rating
@@ -170,6 +171,7 @@ enrichment = bundle["enrichment"]
 score = bundle["score"]
 contents = bundle["contents"]
 engagements = bundle["engagements"]
+hiring_signal = bundle.get("hiring_signal")
 
 render_workspace_banner()
 
@@ -570,6 +572,79 @@ with tab_score:
         else:
             chips = "  ".join(pill(s, "blue") for s in signals)
             st.markdown(chips)
+
+    # ---------- Hiring signal (C-tier rescue layer) ----------
+    st.divider()
+    st.subheader("Hiring signal")
+    _STRENGTH_COLOR = {"high": ":green", "medium": ":orange", "low": ":gray", "none": ":gray"}
+    _UPLIFT_LABEL = {
+        "none": "No uplift",
+        "C_to_B": "C → B",
+        "C_to_A": "C → A",
+        "B_to_A": "B → A",
+    }
+    if hiring_signal is None:
+        st.caption(
+            "No hiring research yet. Click below to check for open "
+            "RevOps / SDR / GTM / automation roles (uses Tavily)."
+        )
+    elif not hiring_signal.get("signal_found"):
+        st.info(
+            "Hiring research ran but found no relevant open roles. "
+            f"({hiring_signal.get('why_it_matters') or 'no signal'})"
+        )
+    else:
+        strength = (hiring_signal.get("signal_strength") or "none").lower()
+        color = _STRENGTH_COLOR.get(strength, ":gray")
+        with st.container(border=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown(f"**Strength:** {color}[**{strength.title()}**]")
+                applied = hiring_signal.get("applied_uplift") or "none"
+                rec = hiring_signal.get("tier_uplift_recommendation") or "none"
+                st.markdown(
+                    f"**Tier uplift:** {_UPLIFT_LABEL.get(applied, applied)}"
+                    + (
+                        f"  _(recommended {_UPLIFT_LABEL.get(rec, rec)})_"
+                        if rec != applied else ""
+                    )
+                )
+            with c2:
+                if hiring_signal.get("recency_estimate"):
+                    st.markdown(f"**Recency:** {hiring_signal['recency_estimate']}")
+                depts = hiring_signal.get("relevant_departments") or []
+                if depts:
+                    st.markdown(f"**Departments:** {', '.join(depts)}")
+            roles = hiring_signal.get("relevant_roles") or []
+            if roles:
+                st.markdown("**Roles found:** " + "  ".join(pill(r, "green") for r in roles))
+            if hiring_signal.get("why_it_matters"):
+                st.markdown(f"**Why it matters:** {hiring_signal['why_it_matters']}")
+            if hiring_signal.get("recommended_email_angle"):
+                st.markdown(
+                    f"**Recommended email angle:** _{hiring_signal['recommended_email_angle']}_"
+                )
+            urls = hiring_signal.get("source_urls") or []
+            if urls:
+                with st.expander(f"Source URLs ({len(urls)})", expanded=False):
+                    for u in urls:
+                        st.markdown(f"- {u}")
+
+    if st.button("Research hiring signal (Tavily)", key=f"ld_hiring_{lead['id']}"):
+        ok, result = _run_with_spinner(
+            "Researching hiring signal…",
+            research_hiring_signal_sync,
+            int(lead["id"]),
+            workspace_id=_ws_id,
+        )
+        if not ok:
+            st.error(f"Hiring research failed: {result}")
+        else:
+            st.success(
+                "Hiring research complete. No email sent, no Instantly push."
+            )
+            st.cache_data.clear()
+            st.rerun()
 
 # === Tab 4: Generated Content ===
 with tab_content:

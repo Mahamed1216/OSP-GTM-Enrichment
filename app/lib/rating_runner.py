@@ -84,6 +84,21 @@ def rerun_scoring_sync(lead_id: int, *, workspace_id: int | None = None) -> dict
     }
 
 
+def research_hiring_signal_sync(
+    lead_id: int, *, workspace_id: int | None = None, force: bool = True
+) -> dict[str, Any]:
+    """Research + store the hiring signal for one lead and apply the tier uplift.
+
+    Wraps `src.signals.hiring.enrich_hiring_signal`. `force=True` so a manual
+    click always re-researches even when a signal already exists. Never sends
+    or pushes anything. Returns the enrich outcome dict.
+    """
+    from src.signals.hiring import enrich_hiring_signal
+    return run_async(
+        enrich_hiring_signal(lead_id, workspace_id=workspace_id, force=force)
+    )
+
+
 def regenerate_email_sync(lead_id: int, *, workspace_id: int | None = None) -> int:
     """Re-generate email for a single lead (no feedback). Returns the new
     GeneratedContent id.

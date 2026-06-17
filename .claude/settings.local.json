@@ -42,7 +42,9 @@
       "WebFetch(domain:leads.osp.tools)",
       "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\moham\\\\Documents\\\\OSP-GTM-Enrichment\" -Force)",
       "Bash(Select-Object Name, Mode)",
-      "Bash(Format-Table -AutoSize)"
+      "Bash(Format-Table -AutoSize)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(echo \"EXIT=$?\")"
     ]
   }
 }

@@ -39,6 +39,35 @@ from src.prompts.sanitize import (
 log = logging.getLogger(__name__)
 
 
+def _load_hiring_signal(session, lead_id: int) -> dict | None:
+    """Read the hiring LeadSignal for a lead as a plain dict (in-session).
+
+    Returns None when there is no signal or the table doesn't exist yet
+    (pre-migration DB) — content generation must never break on its absence.
+    """
+    try:
+        from src.models import LeadSignal
+        row = session.execute(
+            select(LeadSignal).where(
+                LeadSignal.lead_id == lead_id,
+                LeadSignal.signal_type == "hiring",
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        return {
+            "signal_found": bool(row.signal_found),
+            "signal_strength": row.signal_strength,
+            "relevant_roles": list(row.relevant_roles or []),
+            "relevant_departments": list(row.relevant_departments or []),
+            "why_it_matters": row.why_it_matters,
+            "recommended_email_angle": row.recommended_email_angle,
+        }
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("hiring_signal_load_failed", extra={"lead_id": lead_id, "error": str(exc)})
+        return None
+
+
 class EmailResult(BaseModel):
     subject: str = Field(min_length=1, max_length=200)
     body: str = Field(min_length=1)
@@ -65,7 +94,10 @@ async def generate_email(
         # leads. Snapshot the flag here so we can short-circuit AFTER the
         # session closes (no detached-attribute access on the score row).
         is_icp_skip = bool(score and getattr(score, "tier", None) == "D")
-        user_msg = format_lead_context(lead, enrichment, score)
+        # Hiring signal (C-tier rescue layer) — read inside the session so the
+        # email prompt can lead with a hiring angle when one was found.
+        hiring_signal = _load_hiring_signal(session, lead_id)
+        user_msg = format_lead_context(lead, enrichment, score, hiring_signal=hiring_signal)
         user_msg += "\n\nWrite the email now. Output JSON only."
         # Snapshot buyer-account fields for the post-generation validators.
         # Read INSIDE the session so we never touch detached attributes.

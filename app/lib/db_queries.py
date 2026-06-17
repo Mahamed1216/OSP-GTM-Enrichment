@@ -41,6 +41,23 @@ def _email_content_subq(workspace_id: int | None = None):
     return stmt.subquery()
 
 
+def _hiring_signal_subq(workspace_id: int | None = None):
+    """Subquery: hiring-signal strength per lead (1:1 on the unique constraint)."""
+    from src.models import LeadSignal
+
+    stmt = (
+        select(
+            LeadSignal.lead_id.label("lead_id"),
+            LeadSignal.signal_strength.label("hiring_strength"),
+            LeadSignal.signal_found.label("hiring_found"),
+        )
+        .where(LeadSignal.signal_type == "hiring")
+    )
+    if workspace_id is not None:
+        stmt = stmt.where(LeadSignal.workspace_id == workspace_id)
+    return stmt.subquery()
+
+
 def kpi_counts(workspace_id: int | None = None) -> dict[str, int]:
     with session_scope() as session:
         leads_q = select(func.count(Lead.id))
@@ -271,15 +288,20 @@ def list_leads(
     sent_only: bool = False,
     not_sent_only: bool = False,
     enriched_only: bool = False,
+    hiring_filter: str = "any",
 ) -> pd.DataFrame:
     """Lead list with joined score/enrichment/email-delivery/reply flags.
 
     All filtering happens in SQL before LIMIT/OFFSET so the DB does the work
     instead of loading the full table into Python for slicing.
+
+    `hiring_filter` is one of: "any" (no filter), "high", "medium", or "none"
+    (no signal row, or a signal row with no relevant hiring found).
     """
     from sqlalchemy import or_
 
     email_sub = _email_content_subq(workspace_id=workspace_id)
+    hiring_sub = _hiring_signal_subq(workspace_id=workspace_id)
     stmt = (
         select(
             Lead.id.label("id"),
@@ -292,6 +314,8 @@ def list_leads(
             Score.score,
             Enrichment.id.label("enrichment_id"),
             email_sub.c.any_delivered,
+            hiring_sub.c.hiring_strength,
+            hiring_sub.c.hiring_found,
             func.coalesce(
                 func.max(case((Engagement.replied.is_(True), 1), else_=0)), 0
             ).label("any_reply"),
@@ -300,6 +324,7 @@ def list_leads(
         .outerjoin(Score, Score.lead_id == Lead.id)
         .outerjoin(Enrichment, Enrichment.lead_id == Lead.id)
         .outerjoin(email_sub, email_sub.c.lead_id == Lead.id)
+        .outerjoin(hiring_sub, hiring_sub.c.lead_id == Lead.id)
         .outerjoin(
             GeneratedContent,
             and_(
@@ -319,11 +344,25 @@ def list_leads(
             Score.score,
             Enrichment.id,
             email_sub.c.any_delivered,
+            hiring_sub.c.hiring_strength,
+            hiring_sub.c.hiring_found,
         )
         .order_by(Lead.id.desc())  # newest first
     )
     if workspace_id is not None:
         stmt = stmt.where(Lead.workspace_id == workspace_id)
+
+    _hf = (hiring_filter or "any").lower()
+    if _hf in ("high", "medium", "low"):
+        stmt = stmt.where(hiring_sub.c.hiring_strength == _hf)
+    elif _hf == "none":
+        stmt = stmt.where(
+            or_(
+                hiring_sub.c.hiring_strength.is_(None),
+                hiring_sub.c.hiring_strength == "none",
+                hiring_sub.c.hiring_found.is_(False),
+            )
+        )
 
     if search and search.strip():
         q = f"%{search.strip()}%"
@@ -362,13 +401,18 @@ def list_leads(
                 "Tier": row.tier or "",
                 "Score": int(row.score) if row.score is not None else None,
                 "Enriched": bool(row.enrichment_id is not None),
+                "Hiring": (
+                    row.hiring_strength
+                    if (row.hiring_strength and row.hiring_found)
+                    else ""
+                ),
                 "Sent": bool(row.any_delivered),
                 "Replied": bool(row.any_reply),
             }
         )
     return pd.DataFrame.from_records(
         records,
-        columns=["id", "Name", "Email", "Company", "Title", "Tier", "Score", "Enriched", "Sent", "Replied"],
+        columns=["id", "Name", "Email", "Company", "Title", "Tier", "Score", "Enriched", "Hiring", "Sent", "Replied"],
     )
 
 
@@ -380,6 +424,7 @@ def count_leads(
     sent_only: bool = False,
     not_sent_only: bool = False,
     enriched_only: bool = False,
+    hiring_filter: str = "any",
 ) -> int:
     """COUNT(*) for the current filter set — used for pagination metadata."""
     from sqlalchemy import or_
@@ -395,6 +440,12 @@ def count_leads(
     if sent_only or not_sent_only:
         email_sub = _email_content_subq(workspace_id=workspace_id)
         stmt = stmt.outerjoin(email_sub, email_sub.c.lead_id == Lead.id)
+
+    _hf = (hiring_filter or "any").lower()
+    hiring_sub = None
+    if _hf != "any":
+        hiring_sub = _hiring_signal_subq(workspace_id=workspace_id)
+        stmt = stmt.outerjoin(hiring_sub, hiring_sub.c.lead_id == Lead.id)
 
     if workspace_id is not None:
         stmt = stmt.where(Lead.workspace_id == workspace_id)
@@ -417,6 +468,18 @@ def count_leads(
         stmt = stmt.where(
             or_(email_sub.c.any_delivered == 0, email_sub.c.any_delivered.is_(None))
         )
+
+    if hiring_sub is not None:
+        if _hf in ("high", "medium", "low"):
+            stmt = stmt.where(hiring_sub.c.hiring_strength == _hf)
+        elif _hf == "none":
+            stmt = stmt.where(
+                or_(
+                    hiring_sub.c.hiring_strength.is_(None),
+                    hiring_sub.c.hiring_strength == "none",
+                    hiring_sub.c.hiring_found.is_(False),
+                )
+            )
 
     with session_scope() as session:
         return int(session.execute(stmt).scalar() or 0)
@@ -693,12 +756,44 @@ def get_lead_full(
                     }
                 )
 
+        # Hiring signal (C-tier rescue layer). Best-effort: the table may not
+        # exist on a pre-migration DB, so a failure degrades to None.
+        hiring_signal_dict: dict[str, Any] | None = None
+        try:
+            from src.models import LeadSignal
+            sig = session.execute(
+                select(LeadSignal).where(
+                    LeadSignal.lead_id == lead_id,
+                    LeadSignal.signal_type == "hiring",
+                )
+            ).scalar_one_or_none()
+            if sig is not None:
+                hiring_signal_dict = {
+                    "signal_found": bool(sig.signal_found),
+                    "signal_strength": sig.signal_strength,
+                    "relevant_roles": list(sig.relevant_roles or []),
+                    "relevant_departments": list(sig.relevant_departments or []),
+                    "recency_estimate": sig.recency_estimate,
+                    "summary": sig.summary,
+                    "why_it_matters": sig.why_it_matters,
+                    "source_urls": list(sig.source_urls or []),
+                    "recommended_email_angle": sig.recommended_email_angle,
+                    "tier_uplift_recommendation": sig.tier_uplift_recommendation,
+                    "applied_uplift": sig.applied_uplift,
+                    "base_tier": sig.base_tier,
+                    "base_score": sig.base_score,
+                    "updated_at": sig.updated_at,
+                }
+        except Exception:
+            hiring_signal_dict = None
+
         return {
             "lead": lead_dict,
             "enrichment": enrichment_dict,
             "score": score_dict,
             "contents": contents_list,
             "engagements": engagements_list,
+            "hiring_signal": hiring_signal_dict,
         }
 
 

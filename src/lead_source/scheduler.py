@@ -103,16 +103,21 @@ async def process_imported_leads(
     Processing order per lead:
       1. Enrichment + buyer research (via enrich_lead waterfall) — idempotent:
          skipped if the lead already has an Enrichment row.
-      2. Scoring.
-      3. Content generation — idempotent: each generator skips if content exists.
+      2. Hiring-signal enrichment — idempotent: skipped if a signal exists.
+         Runs BEFORE scoring so the deterministic tier uplift is in effect
+         when the lead is scored.
+      3. Scoring (applies the hiring tier uplift).
+      4. Content generation — idempotent: each generator skips if content exists.
 
     Returns counts for logging/display.
     """
     from src.enrichment.waterfall import enrich_lead
     from src.lead_source.ingest import _update_import_log_processing
+    from src.signals.hiring import enrich_hiring_signal
 
     enriched = 0
     enrichment_skipped = 0
+    hiring_signals = 0
     scored = 0
     content = 0
 
@@ -131,11 +136,22 @@ async def process_imported_leads(
                     extra={"lead_id": lead_id, "workspace_id": workspace_id, "error": str(exc)},
                 )
 
-        # 2. Score
+        # 2. Hiring-signal enrichment (before scoring). Graceful: never raises.
+        try:
+            outcome = await enrich_hiring_signal(lead_id, workspace_id=workspace_id)
+            if not outcome.get("skipped") and not outcome.get("error"):
+                hiring_signals += 1
+        except Exception as exc:
+            log.warning(
+                "auto_hiring_signal_failed",
+                extra={"lead_id": lead_id, "workspace_id": workspace_id, "error": str(exc)},
+            )
+
+        # 3. Score (applies hiring uplift)
         if await _score_one(lead_id, workspace_id):
             scored += 1
 
-        # 3. Content
+        # 4. Content
         content += await _generate_content_one(lead_id, workspace_id)
 
     log.info(
@@ -145,6 +161,7 @@ async def process_imported_leads(
             "lead_count": len(lead_ids),
             "enriched": enriched,
             "enrichment_skipped": enrichment_skipped,
+            "hiring_signals": hiring_signals,
             "scored": scored,
             "content": content,
         },
@@ -161,6 +178,7 @@ async def process_imported_leads(
     return {
         "enriched_count": enriched,
         "enrichment_skipped_count": enrichment_skipped,
+        "hiring_signal_count": hiring_signals,
         "scored_count": scored,
         "content_generated_count": content,
     }
