@@ -17,6 +17,7 @@ from app.lib.components import fit_score_viz
 from app.lib.db_queries import get_lead_full
 from app.lib.workspace_state import get_current_workspace_id, render_workspace_banner
 from app.lib.formatters import fmt_duration_ms, fmt_timestamp, source_status_display
+from app.lib.research_display import research_display_state
 from app.lib.rating_runner import (
     delete_lead_sync,
     full_refresh_sync,
@@ -580,43 +581,6 @@ with tab_enrich:
                         + (f" · modes: {', '.join(_modes)}" if _modes else "")
                     )
 
-                    # ----- Tavily Company Research (research agent) -----
-                    st.markdown("**Tavily Company Research**")
-                    _r_used = bool(ba.get("research_used"))
-                    _r_status = ba.get("research_status") or "not_started"
-                    _r_useful = bool(ba.get("research_useful_signal_found"))
-                    if not _r_used:
-                        st.info("Tavily Company Research has not run for this lead.")
-                    elif _r_status == "failed":
-                        st.error(
-                            f"Tavily Company Research failed: {ba.get('research_error') or 'unknown error'}"
-                        )
-                    elif not _r_useful:
-                        st.warning(
-                            "Tavily Company Research completed, but no useful company "
-                            "signal was found."
-                            + (f"  \nReason: {ba.get('research_no_signal_reason')}"
-                               if ba.get("research_no_signal_reason") else "")
-                        )
-                    else:
-                        st.markdown(
-                            f"Status: `{_r_status}` · Used: yes · Useful signal: **yes**"
-                        )
-                        if ba.get("research_summary"):
-                            st.markdown(f"**Summary:** {ba['research_summary']}")
-                        _rfind = ba.get("research_findings") or []
-                        if _rfind:
-                            st.markdown("**Findings:**")
-                            for f in _rfind[:6]:
-                                st.markdown(f"- {f}")
-                        _rsrc = ba.get("research_sources") or []
-                        if _rsrc:
-                            with st.expander(f"Research source URLs ({len(_rsrc)})", expanded=False):
-                                for u in _rsrc:
-                                    st.markdown(f"- {u}")
-                    if ba.get("research_last_run_at"):
-                        st.caption(f"Research last run: {ba['research_last_run_at']}")
-
                     # Selected strongest signal (relevance-first, not newest).
                     _sel = ba.get("selected_signal")
                     if _sel:
@@ -735,6 +699,88 @@ with tab_enrich:
                                 "surfaced. Email generation will fall back to "
                                 "buyer segments + \"teams like that\" CTA."
                             )
+
+        # ---------- Tavily Company Research (always-visible section) ----------
+        # Separate from the Buyer account research card so the operator can
+        # always tell whether /research ran and whether it found anything
+        # useful. Reads the stored buyer_accounts JSON — never reruns Tavily.
+        st.subheader("Tavily Company Research")
+        _tcr = enrichment.get("buyer_accounts") or {}
+        _r_state = research_display_state(_tcr)
+
+        if _r_state == "not_run":
+            st.info("Tavily Company Research has not run for this lead.")
+        elif _r_state == "failed":
+            st.error(
+                "Tavily Company Research failed: "
+                f"{_tcr.get('research_error') or 'unknown error'}"
+            )
+        elif _r_state == "no_useful":
+            st.warning(
+                "Tavily Company Research completed, but no useful company signal "
+                "was found."
+            )
+            st.markdown("**Research status:** completed · **Useful signal found:** no")
+            if _tcr.get("research_no_signal_reason"):
+                st.markdown(f"**No-signal reason:** {_tcr['research_no_signal_reason']}")
+            _rsrc = _tcr.get("research_sources") or []
+            if _rsrc:
+                with st.expander(f"Sources checked ({len(_rsrc)})", expanded=False):
+                    for u in _rsrc:
+                        st.markdown(f"- {u}")
+        else:
+            st.success("Tavily Company Research completed — useful signal found.")
+            st.markdown("**Research status:** completed · **Useful signal found:** yes")
+            if _tcr.get("research_summary"):
+                st.markdown(f"**Research summary:** {_tcr['research_summary']}")
+            _sel = _tcr.get("selected_signal")
+            if _sel:
+                _rel = (_sel.get("signal_relevance") or "?").title()
+                _age = _sel.get("signal_recency_days")
+                _age_str = f"~{_age}d ago" if _age is not None else "age unknown"
+                st.markdown(
+                    f"**Strongest signal:** {_sel.get('signal_type') or 'signal'} "
+                    f"({_rel} relevance · {_age_str}) — {_sel.get('signal_summary') or ''}"
+                )
+                if _sel.get("reason"):
+                    st.markdown(f"**Why it matters:** {_sel['reason']}")
+            _rfind = _tcr.get("research_findings") or []
+            if _rfind:
+                st.markdown("**Findings:**")
+                for f in _rfind[:6]:
+                    st.markdown(f"- {f}")
+            _rsrc = _tcr.get("research_sources") or []
+            if _rsrc:
+                with st.expander(f"Source URLs ({len(_rsrc)})", expanded=False):
+                    for u in _rsrc:
+                        st.markdown(f"- {u}")
+
+        if _tcr.get("research_last_run_at"):
+            st.caption(f"Last run at: {_tcr['research_last_run_at']}")
+
+        # Tavily Research debug expander — the research call + raw payload.
+        _research_calls = [
+            c for c in (_tcr.get("tavily_calls") or []) if c.get("mode") == "research"
+        ]
+        if _research_calls or _tcr.get("research_raw_payload"):
+            with st.expander("Tavily Research Debug", expanded=False):
+                for call in _research_calls:
+                    st.markdown(
+                        f"- **mode=research** · window_days={call.get('window_days')} · "
+                        f"start=`{call.get('start_date')}` end=`{call.get('end_date')}` · "
+                        f"status=`{call.get('status')}` · "
+                        f"sources={call.get('source_count', call.get('result_count'))}"
+                        + (f" · error=`{call.get('error')}`" if call.get('error') else "")
+                    )
+                    if call.get("query"):
+                        st.caption(f"Instructions: {call['query']}")
+                    if call.get("source_urls"):
+                        st.markdown("Source URLs:")
+                        for u in call["source_urls"]:
+                            st.markdown(f"- {u}")
+                if _tcr.get("research_raw_payload"):
+                    st.markdown("**Raw research payload:**")
+                    st.json(_tcr["research_raw_payload"])
 
         st.subheader("Source payloads")
         any_payload = False
