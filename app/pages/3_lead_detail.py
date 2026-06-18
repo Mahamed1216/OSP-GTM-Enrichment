@@ -531,6 +531,29 @@ with tab_enrich:
                 )
 
             with st.container(border=True):
+                # Company research signal used — did Tavily research shape these
+                # buyer segments? (Distinct from the standalone research section.)
+                _crs_used = bool(ba.get("company_research_signal_used"))
+                st.markdown(
+                    "**Company research signal used:** "
+                    + (":green[**yes**]" if _crs_used else ":gray[no]")
+                )
+                if _crs_used:
+                    if ba.get("company_research_effect"):
+                        st.caption(f"Effect on buyer segments: {ba['company_research_effect']}")
+                    _crs_sel = ba.get("selected_signal") or {}
+                    if _crs_sel.get("signal_summary"):
+                        st.caption(f"Research signal: {_crs_sel['signal_summary']}")
+                    _crs_srcs = ba.get("research_sources") or []
+                    if _crs_srcs:
+                        with st.expander(f"Research source URLs ({len(_crs_srcs)})", expanded=False):
+                            for u in _crs_srcs:
+                                st.markdown(f"- {u}")
+                else:
+                    st.caption(
+                        "Tavily research did not produce a useful buyer-segmentation signal."
+                    )
+
                 # Fallback mode row (v3 rows)
                 if fallback_mode:
                     _MODE_LABELS = {

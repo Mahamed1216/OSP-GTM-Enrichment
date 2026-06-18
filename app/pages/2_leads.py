@@ -15,6 +15,7 @@ import streamlit as st
 
 from app.lib.async_runner import run_async
 from app.lib.badges import status_pill, tier_badge
+from app.lib.bulk_push import run_bulk_push
 from app.lib.db_queries import count_leads, list_leads
 from app.lib.push_confirm import (
     build_push_confirm_token,
@@ -422,6 +423,40 @@ if selected_lead_ids:
     skip_summary = summarize_skips(skipped)
 
     with st.container(border=True):
+        # ---------- Persistent push result (survives Streamlit reruns) ----------
+        # The push outcome is stored in session_state by the Confirm handler so
+        # it is still shown after the rerun that closes the confirmation dialog.
+        _last_push = st.session_state.get("last_instantly_push_result")
+        if _last_push:
+            _ps = _last_push.get("status")
+            if _ps == "completed":
+                st.success(
+                    f"Push completed: {_last_push.get('n_sent', 0)} succeeded, "
+                    f"{_last_push.get('n_failed', 0)} failed."
+                )
+                _fails = _last_push.get("failures") or []
+                if _fails:
+                    with st.expander(f"Failed / blocked leads ({len(_fails)})", expanded=False):
+                        for lid, reason in _fails:
+                            st.markdown(f"- lead `{lid}` — {reason}")
+            elif _ps == "blocked":
+                st.warning(f"Push blocked: {_last_push.get('error') or 'no eligible leads'}")
+                _br = _last_push.get("blocked_reasons") or {}
+                if _br:
+                    st.caption(
+                        "Blocked by: "
+                        + ", ".join(
+                            f"{cnt} {SKIP_LABELS.get(code, code)}" for code, cnt in _br.items()
+                        )
+                    )
+            elif _ps == "failed":
+                st.error(f"Push failed: {_last_push.get('error') or 'unknown error'}")
+            if _last_push.get("completed_at"):
+                st.caption(f"Last push: {_last_push['completed_at']}")
+            if st.button("Dismiss push result", key="dismiss_push_result"):
+                st.session_state.pop("last_instantly_push_result", None)
+                st.rerun()
+
         push_label = f"Push to Instantly ({n_eligible} eligible)"
         pc1, pc2 = st.columns([1.5, 5])
         push_clicked = pc1.button(
@@ -574,77 +609,27 @@ if selected_lead_ids:
                 cc3.caption(":gray[Check the box above to enable Confirm push.]")
 
             if confirm_clicked:
-                # Re-run the server-side safety filter NOW against the current
-                # selection so we only push leads that are still eligible
-                # (content/verification/tier/unsafe-content could have changed).
-                with session_scope() as _cs:
-                    fresh_eligible, _fresh_skipped = filter_eligible(selected_lead_ids, _cs)
-                push_ids = [lid for lid in fresh_eligible if lid in set(selected_lead_ids)]
-                blocked_count = len(selected_lead_ids) - len(push_ids)
-
+                # Run the push NOW, synchronously, BEFORE any state reset or
+                # rerun, via the testable run_bulk_push helper. The result is
+                # stored in session_state and rendered by the persistent panel
+                # above on the next render, so it never disappears.
+                log.info("push_confirm_clicked", extra={
+                    "workspace_id": _ws_id,
+                    "selected_count": n,
+                    "eligible_count": n_eligible,
+                    "campaign_id": settings.instantly_campaign_id,
+                    "confirmation_checked": bool(ack_checked),
+                })
+                with st.spinner("Push started — sending to Instantly…"):
+                    rec = run_async(run_bulk_push(
+                        list(selected_lead_ids), _ws_id,
+                        campaign_id=settings.instantly_campaign_id,
+                    ))
+                # Persist result + close the dialog ONLY now (after the push
+                # finished). The persistent panel renders it on the next run.
+                st.session_state["last_instantly_push_result"] = rec
                 st.session_state.pop(_TOKEN_KEY, None)
-                log.info(
-                    "push_started",
-                    extra={
-                        "workspace_id": _ws_id,
-                        "selected_count": n,
-                        "eligible_count": len(push_ids),
-                        "blocked_count": blocked_count,
-                        "confirmation_key": current_token,
-                    },
-                )
-
-                if not push_ids:
-                    st.warning(
-                        "No leads are still eligible — nothing was pushed. "
-                        "They may have changed state since you selected them."
-                    )
-                    st.stop()
-
-                progress = st.progress(0.0, text=f"Pushing {len(push_ids)} lead(s)…")
-                status = st.status("Sending…", expanded=True)
-                n_sent = n_failed = 0
-                with status:
-                    for i, lid in enumerate(push_ids, start=1):
-                        try:
-                            # deliver_email re-runs every pre-send guard
-                            # (unsafe content, missing content, verification,
-                            # tier, dedupe) server-side before sending.
-                            result = run_async(
-                                deliver_email(lid, dry_run=False, workspace_id=_ws_id)
-                            )
-                        except Exception as exc:
-                            n_failed += 1
-                            st.write(f"❌ lead {lid} — {type(exc).__name__}: {exc}")
-                        else:
-                            if result.delivered:
-                                n_sent += 1
-                                st.write(f"✅ lead {lid} — sent (id={result.delivery_id})")
-                            else:
-                                n_failed += 1
-                                st.write(
-                                    f"⚠️ lead {lid} — blocked: {result.skip_reason}"
-                                )
-                        progress.progress(
-                            i / len(push_ids),
-                            text=f"Pushed {i} of {len(push_ids)}…",
-                        )
-                status.update(
-                    label=f"Bulk push complete — {n_sent} sent, {n_failed} blocked/failed.",
-                    state="complete",
-                )
-                log.info(
-                    "push_completed",
-                    extra={
-                        "workspace_id": _ws_id,
-                        "n_sent": n_sent,
-                        "n_failed": n_failed,
-                        "blocked_count": blocked_count,
-                    },
-                )
-                st.toast(f"{n_sent} sent, {n_failed} blocked/failed.")
                 st.cache_data.clear()
-                st.session_state.pop("leads_table", None)
                 st.rerun()
 
     # ---------- Overwrite existing Instantly copy ----------

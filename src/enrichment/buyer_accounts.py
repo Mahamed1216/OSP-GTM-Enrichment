@@ -154,6 +154,12 @@ class BuyerAccountResult(BaseModel):
     research_raw_payload: dict | None = None
     research_error: str | None = None
     research_last_run_at: str | None = None
+    # Whether the Tavily research findings actually shaped the buyer-segmentation
+    # fields below (LLM-set), and a one-line note on HOW. Distinct from
+    # research_useful_signal_found (which is research-level): research can be
+    # useful for context yet not change the buyer segments.
+    company_research_signal_used: bool = False
+    company_research_effect: str = ""
 
 
 _SYSTEM_PROMPT = """\
@@ -1025,6 +1031,16 @@ async def discover_buyer_accounts(
             )
         # else: keep the LLM's research_useful_signal_found / no_signal_reason.
 
+        # company_research_signal_used can only be true if research was actually
+        # useful — keep the two consistent so the UI never claims research shaped
+        # the segments when it didn't.
+        if not res.research_useful_signal_found:
+            res.company_research_signal_used = False
+            if not res.company_research_effect:
+                res.company_research_effect = (
+                    "Tavily research did not produce a useful buyer-segmentation signal."
+                )
+
     if not any_results:
         empty = BuyerAccountResult(
             buyer_account_rationale=(
@@ -1068,9 +1084,24 @@ async def discover_buyer_accounts(
             "research_useful_signal_found=false and put a one-line "
             "research_no_signal_reason. Never invent a signal that is not in the "
             "research text.\n"
+            "USE the research to IMPROVE buyer segmentation, not just scoring: "
+            "ground likely_direct_buyers, likely_buyer_segments, "
+            "likely_partner_channels, trigger_based_buyer_segments, "
+            "lookalike_buyer_accounts and explicit_b2b_motion_evidence in what "
+            "the research actually says. Make segments SPECIFIC and grounded "
+            "(e.g. 'CPG brands sourcing private-label manufacturing', 'regional "
+            "grocery retailers expanding store-brand portfolios') — never vague "
+            "('businesses looking to grow'). When the research shaped these "
+            "fields, set company_research_signal_used=true and put a one-line "
+            "company_research_effect describing HOW it changed the segments; "
+            "otherwise set company_research_signal_used=false. Mention in "
+            "buyer_research_rationale whether company research was used and how. "
+            "Keep buyer_research_rationale consistent with the research signal. "
+            "Do NOT add a company to direct_buyer_accounts unless the research "
+            "CONFIRMS it as a real customer; never list a competitor as a buyer.\n"
             if research_summary else
             "No Tavily research summary is present; set "
-            "research_useful_signal_found=false.\n"
+            "research_useful_signal_found=false and company_research_signal_used=false.\n"
         )
         + "Then classify buyers per the rules. Output JSON only."
     )
