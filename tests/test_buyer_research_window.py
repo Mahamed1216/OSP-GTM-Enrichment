@@ -78,9 +78,17 @@ def _install_fakes(monkeypatch, *, news_results="default", general_results="defa
             ],
         )
 
+    def fake_research_sync(input_text, *, model="mini", timeout=60.0):
+        return {
+            "status": "completed",
+            "answer": "Acme sells RevOps tooling; raised Series B ~45 days ago.",
+            "sources": [{"url": "https://news.example.com/acme"}],
+        }
+
     monkeypatch.setattr(bac, "_tavily_search_sync", fake_search_sync)
     monkeypatch.setattr(bac, "_crawl_sync", fake_crawl_sync)
     monkeypatch.setattr(bac, "_extract_sync", fake_extract_sync)
+    monkeypatch.setattr(bac, "_research_sync", fake_research_sync)
     monkeypatch.setattr(bac, "generate_json", fake_gen)
     monkeypatch.setattr(bac.settings, "tavily_api_key", "tvly-test")
     monkeypatch.setattr(bac.settings, "anthropic_api_key", "anthropic-test")

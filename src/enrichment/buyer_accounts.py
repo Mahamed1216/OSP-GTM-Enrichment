@@ -138,8 +138,22 @@ class BuyerAccountResult(BaseModel):
     selected_signal: "CandidateSignal | None" = None
     company_context_summary: str = ""
     recommended_outreach_angle: str = ""
-    tavily_modes_used: list[str] = Field(default_factory=list)   # news|general|crawl|extract
+    tavily_modes_used: list[str] = Field(default_factory=list)   # research|news|general|crawl|extract
     tavily_calls: list[dict] = Field(default_factory=list)        # per-call debug records
+
+    # Tavily Research agent (Company Researcher) output + bookkeeping.
+    # research_useful_signal_found / research_no_signal_reason are LLM-set
+    # (it reads the research summary); the rest are code-set.
+    research_used: bool = False
+    research_status: str = "not_started"   # not_started | completed | skipped | failed
+    research_summary: str = ""
+    research_findings: list[str] = Field(default_factory=list)
+    research_sources: list[str] = Field(default_factory=list)
+    research_useful_signal_found: bool = False
+    research_no_signal_reason: str = ""
+    research_raw_payload: dict | None = None
+    research_error: str | None = None
+    research_last_run_at: str | None = None
 
 
 _SYSTEM_PROMPT = """\
@@ -555,6 +569,93 @@ async def _tavily_extract(urls: list[str]) -> list[dict]:
     return await asyncio.to_thread(_extract_sync, urls)
 
 
+# ----- Tavily Research agent (Company Researcher) --------------------------
+
+_RESEARCH_DONE = {"completed", "done", "success", "finished"}
+_RESEARCH_FAIL = {"failed", "error", "cancelled", "canceled"}
+
+
+def _research_sync(input_text: str, *, model: str = "mini", timeout: float = 60.0) -> dict:
+    resp = _client().research(input=input_text, model=model, timeout=timeout)
+    return resp if isinstance(resp, dict) else {}
+
+
+def _get_research_sync(request_id: str) -> dict:
+    resp = _client().get_research(request_id)
+    return resp if isinstance(resp, dict) else {}
+
+
+def _research_has_results(resp: dict) -> bool:
+    return bool(
+        resp.get("answer") or resp.get("summary") or resp.get("output")
+        or resp.get("result") or resp.get("content")
+    )
+
+
+@retry_api
+async def _tavily_research(
+    input_text: str,
+    *,
+    model: str = "mini",
+    max_polls: int = 6,
+    poll_interval: float = 5.0,
+) -> dict:
+    """Create a Tavily Research task and poll get_research until done/failed.
+
+    Bounded polling (default ≤30s) so the enrichment flow never hangs. Returns
+    the latest response dict; the caller classifies status. Never raises.
+    """
+    resp = await asyncio.to_thread(_research_sync, input_text, model=model)
+    status = (resp.get("status") or "").lower()
+    if status in _RESEARCH_DONE or status in _RESEARCH_FAIL or _research_has_results(resp):
+        return resp
+    request_id = resp.get("request_id") or resp.get("id")
+    if not request_id:
+        return resp
+    for _ in range(max_polls):
+        await asyncio.sleep(poll_interval)
+        polled = await asyncio.to_thread(_get_research_sync, request_id)
+        pstatus = (polled.get("status") or "").lower()
+        if pstatus in _RESEARCH_DONE or pstatus in _RESEARCH_FAIL or _research_has_results(polled):
+            return polled
+    return resp  # timed out — caller marks accordingly
+
+
+def parse_research_response(resp: dict) -> tuple[str, list[str], list[str]]:
+    """Return (summary, findings, source_urls) from a Tavily research response.
+
+    Defensive across response shapes — probes common keys; never raises.
+    """
+    resp = resp or {}
+    summary = (
+        resp.get("answer") or resp.get("summary") or resp.get("output")
+        or resp.get("result") or resp.get("content") or ""
+    )
+    if isinstance(summary, dict):
+        summary = summary.get("text") or summary.get("answer") or str(summary)
+    summary = str(summary).strip()
+
+    findings: list[str] = []
+    raw_findings = resp.get("findings") or resp.get("key_findings") or resp.get("highlights")
+    if isinstance(raw_findings, list):
+        findings = [str(f).strip() for f in raw_findings if str(f).strip()]
+
+    sources: list[str] = []
+    for key in ("sources", "results", "citations", "references"):
+        items = resp.get(key)
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict):
+                    u = (it.get("url") or it.get("link") or "").strip()
+                elif isinstance(it, str):
+                    u = it.strip()
+                else:
+                    u = ""
+                if u and u not in sources:
+                    sources.append(u)
+    return summary, findings, sources
+
+
 def _result_dates(results: list[dict]) -> tuple[str | None, str | None]:
     """Return (oldest, newest) published_date strings present in results, if any."""
     dates = sorted(
@@ -656,9 +757,11 @@ async def discover_buyer_accounts(
     industry: str | None = None,
     company_website: str | None = None,
     company_domain: str | None = None,
+    icp_context: str | None = None,
     news_window_days: int = 90,
     use_crawl: bool = True,
     use_extract: bool = True,
+    use_research: bool = True,
 ) -> BuyerAccountResult:
     """Identify likely buyer accounts + company signals for `company_name`.
 
@@ -814,10 +917,64 @@ async def discover_buyer_accounts(
             _record("extract", query=", ".join(top_urls), topic="extract",
                     max_results=len(top_urls), results=extract_results)
 
+    # ----- Tavily Research agent (Company Researcher) -----
+    research_used = False
+    research_status = "skipped"
+    research_summary = ""
+    research_findings: list[str] = []
+    research_sources: list[str] = []
+    research_raw: dict | None = None
+    research_error: str | None = None
+    research_last_run_at: str | None = None
+    if use_research and (company_name or company_domain):
+        research_used = True
+        research_last_run_at = datetime.now(timezone.utc).isoformat()
+        research_input = (
+            f'Research the company "{company_name}" for B2B outbound sales '
+            f"qualification. "
+            + (f"Company domain: {company_domain}. " if company_domain else "")
+            + (f"Company website: {company_website}. " if company_website else "")
+            + (f"Industry: {industry}. " if industry else "")
+            + (f"Our offering / ICP context: {icp_context}. " if icp_context else "")
+            + "Identify what the company does, who they sell to, customer "
+            "segments, relevant recent business signals from the last "
+            f"{int(news_window_days)} days ({start_date} to {end_date}), including "
+            "hiring, expansion, funding, partnership, product, and customer "
+            "signals; ICP fit, buyer relevance, and the strongest outreach "
+            "angle. Prefer relevance over recency. If no useful signal is "
+            "found, say so clearly."
+        )
+        try:
+            research_raw = await _tavily_research(research_input, model="mini")
+            rstatus = (research_raw.get("status") or "").lower()
+            research_summary, research_findings, research_sources = parse_research_response(research_raw)
+            if research_summary or research_findings:
+                research_status = "completed"
+            elif rstatus in _RESEARCH_FAIL:
+                research_status = "failed"
+                research_error = research_raw.get("error") or f"research status={rstatus or 'unknown'}"
+            else:
+                research_status = "completed"  # ran; usefulness decided by LLM/code below
+        except Exception as exc:
+            research_status = "failed"
+            research_error = f"{type(exc).__name__}: {exc}"
+        _record("research", query=research_input, topic="research",
+                sd=start_date, ed=end_date,
+                results=[{"url": u} for u in research_sources])
+        tavily_calls[-1]["status"] = research_status
+        tavily_calls[-1]["error"] = research_error
+        tavily_calls[-1]["window_days"] = int(news_window_days)
+        tavily_calls[-1]["source_count"] = len(research_sources)
+
     # ----- Assemble snippet blocks + aggregate metadata -----
     source_urls: list[str] = []
     result_count = 0
     snippet_blocks: list[str] = []
+    if research_summary:
+        snippet_blocks.append(
+            "## Tavily company research (agent summary)\n" + research_summary[:1500]
+        )
+        source_urls.extend(research_sources)
     for label, lst in (
         ("Customers", evidence_lists[0]),
         ("Case studies", evidence_lists[1]),
@@ -837,7 +994,36 @@ async def discover_buyer_accounts(
         result_count += len(extract_results)
         snippet_blocks.append(_format_doc_snippets("Extracted top sources", extract_results))
 
-    any_results = result_count > 0
+    any_results = result_count > 0 or bool(research_summary)
+
+    def _apply_research_meta(res: BuyerAccountResult) -> None:
+        """Stamp Tavily Research bookkeeping onto a result (code-set fields).
+
+        research_useful_signal_found / research_no_signal_reason are LLM-set
+        when a summary was available; otherwise forced False here so scoring /
+        content never invent a signal.
+        """
+        res.research_used = research_used
+        res.research_status = research_status if research_used else "skipped"
+        res.research_summary = research_summary
+        res.research_findings = research_findings
+        res.research_sources = research_sources
+        res.research_raw_payload = research_raw
+        res.research_error = research_error
+        res.research_last_run_at = research_last_run_at
+        if not research_used:
+            res.research_useful_signal_found = False
+            res.research_no_signal_reason = "Tavily Research disabled for this workspace."
+        elif research_status == "failed":
+            res.research_useful_signal_found = False
+            res.research_no_signal_reason = res.research_error or "Tavily Research failed."
+        elif not research_summary:
+            res.research_useful_signal_found = False
+            res.research_no_signal_reason = (
+                res.research_no_signal_reason
+                or "Tavily Research ran but returned no usable company signal."
+            )
+        # else: keep the LLM's research_useful_signal_found / no_signal_reason.
 
     if not any_results:
         empty = BuyerAccountResult(
@@ -853,6 +1039,7 @@ async def discover_buyer_accounts(
         empty.result_count = 0
         empty.tavily_calls = tavily_calls
         empty.tavily_modes_used = modes_used
+        _apply_research_meta(empty)
         return empty
 
     user_msg = (
@@ -873,6 +1060,18 @@ async def discover_buyer_accounts(
         + "article from the last few days. Do not prefer an article just because "
         + "it is newer; do not penalize the company for no news in the last few "
         + "days. Also set company_context_summary and recommended_outreach_angle.\n"
+        + (
+            "A '## Tavily company research (agent summary)' block may be present. "
+            "If it contains a genuinely useful, relevant company signal, set "
+            "research_useful_signal_found=true and leave research_no_signal_reason "
+            "empty. If it is empty, generic, or has no useful signal, set "
+            "research_useful_signal_found=false and put a one-line "
+            "research_no_signal_reason. Never invent a signal that is not in the "
+            "research text.\n"
+            if research_summary else
+            "No Tavily research summary is present; set "
+            "research_useful_signal_found=false.\n"
+        )
         + "Then classify buyers per the rules. Output JSON only."
     )
 
@@ -897,6 +1096,7 @@ async def discover_buyer_accounts(
         fail.news_end_date = end_date
         fail.tavily_calls = tavily_calls
         fail.tavily_modes_used = modes_used
+        _apply_research_meta(fail)
         return fail
 
     # Override buyer_fallback_mode deterministically — don't trust LLM self-assessment.
@@ -915,6 +1115,7 @@ async def discover_buyer_accounts(
     result.source_urls = list(dict.fromkeys(source_urls))
     result.tavily_calls = tavily_calls
     result.tavily_modes_used = modes_used
+    _apply_research_meta(result)
 
     log.info(
         "buyer_discovery_complete",

@@ -141,6 +141,19 @@ def format_lead_context(
         parts.append("\n## Buyer accounts (research)")
         parts.append(f"- buyer_motion: {motion}")
 
+        # Tavily company research — only surface the summary as usable evidence
+        # when a useful signal was actually found, so scoring + content never
+        # invent a signal that research did not support.
+        if ba.get("research_used"):
+            if ba.get("research_useful_signal_found") and (ba.get("research_summary") or "").strip():
+                summary = _truncate(ba.get("research_summary"), 700)
+                parts.append(f"- tavily_company_research: {summary}")
+            else:
+                parts.append(
+                    "- tavily_company_research: No useful Tavily company "
+                    "research signal found."
+                )
+
         # Surface v3 fallback ladder when fields are populated (new rows).
         if fallback_mode:
             parts.append(f"- buyer_fallback_mode: {fallback_mode}")

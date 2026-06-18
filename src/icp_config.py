@@ -86,6 +86,9 @@ class ICPConfig(BaseModel):
     # Default on; may use more Tavily credits.
     buyer_research_use_crawl: bool = True
     buyer_research_use_extract: bool = True
+    # Tavily Research agent (Company Researcher) for deeper company research.
+    # Default on; may increase Tavily usage (/research credits).
+    buyer_research_use_research: bool = True
 
 
 # ---------------------------------------------------------------------------
