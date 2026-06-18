@@ -35,20 +35,42 @@ def _parse(item: dict) -> Optional[NewsItem]:
     )
 
 
-def _search_sync(query: str, max_results: int) -> list[dict]:
-    return _client().search(
-        query=query,
-        topic="news",
-        max_results=max_results,
-        search_depth="basic",
-    ).get("results", [])
+def _search_sync(
+    query: str,
+    max_results: int,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[dict]:
+    # Date window (start_date/end_date) bounds company-news to the configured
+    # buyer-research window so this feed stops returning only the last few days.
+    # NEVER time_range=day/week. No window passed → unbounded (industry trends).
+    kwargs: dict = {
+        "query": query,
+        "topic": "news",
+        "max_results": max_results,
+        "search_depth": "basic",
+    }
+    if start_date:
+        kwargs["start_date"] = start_date
+    if end_date:
+        kwargs["end_date"] = end_date
+    return _client().search(**kwargs).get("results", [])
 
 
 @retry_api
-async def search_news(query: str, max_results: int = 5) -> list[NewsItem]:
+async def search_news(
+    query: str,
+    max_results: int = 5,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[NewsItem]:
     if not query:
         return []
-    raw = await asyncio.to_thread(_search_sync, query, max_results)
+    raw = await asyncio.to_thread(
+        _search_sync, query, max_results, start_date=start_date, end_date=end_date,
+    )
     return [n for n in (_parse(r) for r in raw) if n is not None]
 
 
@@ -78,10 +100,17 @@ async def fetch_company_news(
     max_results: int = 5,
     *,
     icp: "ICPConfig | None" = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> list[NewsItem]:
     if not company:
         return []
-    return await search_news(_company_news_query(company, icp), max_results=max_results)
+    return await search_news(
+        _company_news_query(company, icp),
+        max_results=max_results,
+        start_date=start_date,
+        end_date=end_date,
+    )
 
 
 async def fetch_industry_news(

@@ -81,6 +81,11 @@ class ICPConfig(BaseModel):
     # of only the last few days, so older-but-relevant funding/hiring/expansion
     # signals aren't missed. See src/enrichment/buyer_accounts.py.
     buyer_research_news_window_days: int = 90
+    # Layered Tavily research toggles (Company Researcher / Crawl2RAG style).
+    # Crawl the company website + extract top URLs for richer company context.
+    # Default on; may use more Tavily credits.
+    buyer_research_use_crawl: bool = True
+    buyer_research_use_extract: bool = True
 
 
 # ---------------------------------------------------------------------------

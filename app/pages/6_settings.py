@@ -730,6 +730,17 @@ with st.expander("Buyer research", expanded=False):
                 "fresh signals."
             ),
         )
+        st.caption("Crawl and extract improve research quality but may use more Tavily credits.")
+        buyer_use_crawl = st.checkbox(
+            "Use Tavily company crawl for buyer research",
+            value=cfg.buyer_research_use_crawl,
+            key="s_buyer_use_crawl",
+        )
+        buyer_use_extract = st.checkbox(
+            "Use Tavily extract for top URLs",
+            value=cfg.buyer_research_use_extract,
+            key="s_buyer_use_extract",
+        )
         save_buyer_research = st.form_submit_button("Save buyer research", type="primary")
 
 # ---------- Content generation types ----------
@@ -828,6 +839,8 @@ if save_news:
 
 if save_buyer_research:
     cfg.buyer_research_news_window_days = int(buyer_news_window)
+    cfg.buyer_research_use_crawl = bool(buyer_use_crawl)
+    cfg.buyer_research_use_extract = bool(buyer_use_extract)
     _persist(cfg, "Buyer research")
 
 if save_content_types:

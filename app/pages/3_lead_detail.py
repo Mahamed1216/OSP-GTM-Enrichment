@@ -571,17 +571,78 @@ with tab_enrich:
                 if _nw:
                     _topic = ba.get("tavily_topic_used") or "—"
                     _rc = ba.get("result_count")
+                    _modes = ba.get("tavily_modes_used") or []
                     st.caption(
                         f"News window: last {_nw} days "
                         f"({ba.get('news_start_date') or '?'} → {ba.get('news_end_date') or '?'}) "
                         f"· Tavily topic: {_topic}"
                         + (f" · {_rc} results" if _rc is not None else "")
+                        + (f" · modes: {', '.join(_modes)}" if _modes else "")
                     )
+
+                    # Selected strongest signal (relevance-first, not newest).
+                    _sel = ba.get("selected_signal")
+                    if _sel:
+                        _rel = (_sel.get("signal_relevance") or "?").title()
+                        _age = _sel.get("signal_recency_days")
+                        _age_str = f"~{_age}d ago" if _age is not None else "age unknown"
+                        st.markdown(
+                            f"**Strongest signal:** {_sel.get('signal_type') or 'signal'} "
+                            f"({_rel} relevance · {_age_str}) — {_sel.get('signal_summary') or ''}"
+                        )
+                        if _sel.get("reason"):
+                            st.caption(f"Why selected: {_sel['reason']}")
+                        if _sel.get("source_url"):
+                            st.caption(f"Source: {_sel['source_url']}")
+                    elif _nw:
+                        st.caption(
+                            f":gray[No strong company signal found within the configured {_nw}-day window.]"
+                        )
+
+                    if ba.get("recommended_outreach_angle"):
+                        st.markdown(
+                            f"**Recommended outreach angle:** _{ba['recommended_outreach_angle']}_"
+                        )
+
+                    # All candidate signals (expandable).
+                    _cands = ba.get("candidate_signals") or []
+                    if _cands:
+                        with st.expander(f"All candidate signals ({len(_cands)})", expanded=False):
+                            for c in _cands:
+                                _cage = c.get("signal_recency_days")
+                                st.markdown(
+                                    f"- **{c.get('signal_type') or 'signal'}** "
+                                    f"({(c.get('signal_relevance') or '?')}, "
+                                    f"{('~' + str(_cage) + 'd') if _cage is not None else 'age?'}): "
+                                    f"{c.get('signal_summary') or ''}"
+                                    + (f"  [{c.get('source_url')}]" if c.get('source_url') else "")
+                                )
+
                     _surls = ba.get("source_urls") or []
                     if _surls:
                         with st.expander(f"Research source URLs ({len(_surls)})", expanded=False):
                             for u in _surls:
                                 st.markdown(f"- {u}")
+
+                    # Tavily call debug metadata — verify the date window per call.
+                    _calls = ba.get("tavily_calls") or []
+                    if _calls:
+                        with st.expander(f"Tavily call debug metadata ({len(_calls)} calls)", expanded=False):
+                            st.caption(
+                                "Each buyer/company research Tavily call with its "
+                                "actual parameters (start_date/end_date confirm the window)."
+                            )
+                            for call in _calls:
+                                st.markdown(
+                                    f"- **{call.get('mode')}** · topic=`{call.get('topic')}` · "
+                                    f"depth=`{call.get('search_depth')}` · max={call.get('max_results')} · "
+                                    f"start=`{call.get('start_date')}` end=`{call.get('end_date')}` "
+                                    f"time_range=`{call.get('time_range')}` · "
+                                    f"{call.get('result_count')} results "
+                                    f"(oldest {call.get('oldest_result_date') or '?'}, "
+                                    f"newest {call.get('newest_result_date') or '?'})"
+                                )
+                            st.json(_calls)
 
                 # v3 fields (shown when present)
                 if fallback_mode:

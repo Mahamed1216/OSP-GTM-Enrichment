@@ -100,6 +100,7 @@ async def enrich_lead(lead_id: int, *, workspace_id: int | None = None) -> dict:
             "linkedin_url": lead.linkedin_url,
             "company_linkedin_url": lead.company_linkedin_url,
             "company": lead.company,
+            "company_domain": lead.company_domain,
             "industry": lead.industry,
         }
 
@@ -108,6 +109,11 @@ async def enrich_lead(lead_id: int, *, workspace_id: int | None = None) -> dict:
     # Load ICP once per enrichment so both news fetchers see the same snapshot.
     # Phase 5: uses the selected workspace's ICP (news_search_terms, company context).
     icp = load_workspace_icp_config(workspace_id)
+    # Company-news search is bounded to the buyer-research window so this feed
+    # (which flows into scoring + content context) stops returning only the
+    # last few days. Industry news stays unbounded (forward-looking trends).
+    from src.enrichment.buyer_accounts import compute_news_window
+    _news_start, _news_end = compute_news_window(icp.buyer_research_news_window_days)
     # Industry news is now "input_present" as long as the user has news_search_terms
     # configured, even if the lead has no industry field — terms drive the query.
     industry_input_present = bool(snapshot["industry"]) or bool(icp.news_search_terms)
@@ -116,7 +122,7 @@ async def enrich_lead(lead_id: int, *, workspace_id: int | None = None) -> dict:
     sources: list[tuple[str, Awaitable[Any], bool]] = [
         ("linkedin_profile", fetch_linkedin_profile(snapshot["linkedin_url"] or ""), bool(snapshot["linkedin_url"])),
         ("company_details", fetch_company_details(snapshot["company_linkedin_url"] or ""), bool(snapshot["company_linkedin_url"])),
-        ("company_news", fetch_company_news(snapshot["company"] or "", icp=icp), bool(snapshot["company"])),
+        ("company_news", fetch_company_news(snapshot["company"] or "", icp=icp, start_date=_news_start, end_date=_news_end), bool(snapshot["company"])),
         ("industry_news", fetch_industry_news(snapshot["industry"] or "", icp=icp), industry_input_present),
         # Buyer-account discovery uses company name + industry, so input
         # is "present" iff we have a company name. The discover function
@@ -128,7 +134,10 @@ async def enrich_lead(lead_id: int, *, workspace_id: int | None = None) -> dict:
             discover_buyer_accounts(
                 snapshot["company"] or "",
                 industry=snapshot["industry"],
+                company_domain=snapshot.get("company_domain"),
                 news_window_days=icp.buyer_research_news_window_days,
+                use_crawl=icp.buyer_research_use_crawl,
+                use_extract=icp.buyer_research_use_extract,
             ),
             bool(snapshot["company"]),
         ),
