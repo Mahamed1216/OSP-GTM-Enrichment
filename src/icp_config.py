@@ -76,6 +76,11 @@ class ICPConfig(BaseModel):
     generate_email_enabled: bool = True
     generate_call_script_enabled: bool = False
     generate_linkedin_dm_enabled: bool = False
+    # Buyer-research Tavily news window. Buyer/company-news research searches
+    # for relevant company signals within this many days (default 90) instead
+    # of only the last few days, so older-but-relevant funding/hiring/expansion
+    # signals aren't missed. See src/enrichment/buyer_accounts.py.
+    buyer_research_news_window_days: int = 90
 
 
 # ---------------------------------------------------------------------------

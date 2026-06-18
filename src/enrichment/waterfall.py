@@ -128,6 +128,7 @@ async def enrich_lead(lead_id: int, *, workspace_id: int | None = None) -> dict:
             discover_buyer_accounts(
                 snapshot["company"] or "",
                 industry=snapshot["industry"],
+                news_window_days=icp.buyer_research_news_window_days,
             ),
             bool(snapshot["company"]),
         ),

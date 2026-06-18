@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -104,6 +105,15 @@ class BuyerAccountResult(BaseModel):
     ] = "needs_review"
     buyer_research_confidence: Literal["low", "medium", "high"] = "low"
     buyer_research_rationale: str = ""
+
+    # Research metadata (set by code, not the LLM) so the operator can verify
+    # the Tavily date window that was actually used. See discover_buyer_accounts.
+    news_window_days: int | None = None
+    news_start_date: str | None = None   # YYYY-MM-DD
+    news_end_date: str | None = None     # YYYY-MM-DD
+    tavily_topic_used: str | None = None  # "news" | "general" | "news+general"
+    result_count: int = 0
+    source_urls: list[str] = Field(default_factory=list)
 
 
 _SYSTEM_PROMPT = """\
@@ -292,6 +302,13 @@ Critical rules:
   5. NEVER use broad team labels as buyer segments. "Sales teams" or
      "founders" sound obvious and AI-written. Always pair a vertical with
      a trigger event.
+  6. RANK BY RELEVANCE FIRST, THEN RECENCY. The company-signals snippets
+     cover the last 90 days (or the configured window), not just the last
+     few days. A relevant funding / hiring / expansion / partnership /
+     product-launch signal from weeks ago BEATS an irrelevant article from
+     the last few days. Do not prefer an article just because it is the most
+     recent, and do not ignore a relevant signal just because it is not from
+     this week.
 
 Output schema (JSON, no prose):
 {
@@ -426,19 +443,59 @@ def _client() -> TavilyClient:
     return TavilyClient(api_key=settings.tavily_api_key)
 
 
-def _tavily_search_sync(query: str, max_results: int) -> list[dict]:
-    return _client().search(
-        query=query,
-        max_results=max_results,
-        search_depth="basic",
-    ).get("results", [])
+def compute_news_window(news_window_days: int) -> tuple[str, str]:
+    """Return (start_date, end_date) as YYYY-MM-DD for an N-day UTC window.
+
+    end_date is today (UTC); start_date is today minus `news_window_days`.
+    Pure + UTC-based so buyer research reads relevant signals from the last 90
+    days by default rather than only the last few days.
+    """
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=max(1, int(news_window_days)))
+    return start.isoformat(), end.isoformat()
+
+
+def _tavily_search_sync(
+    query: str,
+    max_results: int,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    topic: str | None = None,
+    search_depth: str = "basic",
+) -> list[dict]:
+    # Build kwargs so date-windowed news searches pass start_date/end_date
+    # (NEVER time_range=day/week — those over-restrict to the last few days).
+    kwargs: dict = {
+        "query": query,
+        "max_results": max_results,
+        "search_depth": search_depth,
+    }
+    if topic:
+        kwargs["topic"] = topic
+    if start_date:
+        kwargs["start_date"] = start_date
+    if end_date:
+        kwargs["end_date"] = end_date
+    return _client().search(**kwargs).get("results", [])
 
 
 @retry_api
-async def _tavily_search(query: str, max_results: int = 4) -> list[dict]:
+async def _tavily_search(
+    query: str,
+    max_results: int = 4,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    topic: str | None = None,
+    search_depth: str = "basic",
+) -> list[dict]:
     if not query.strip():
         return []
-    return await asyncio.to_thread(_tavily_search_sync, query, max_results)
+    return await asyncio.to_thread(
+        _tavily_search_sync, query, max_results,
+        start_date=start_date, end_date=end_date, topic=topic, search_depth=search_depth,
+    )
 
 
 def _format_snippets(label: str, results: list[dict]) -> str:
@@ -460,6 +517,7 @@ async def discover_buyer_accounts(
     *,
     company_description: str | None = None,
     industry: str | None = None,
+    news_window_days: int = 90,
 ) -> BuyerAccountResult:
     """Identify likely buyer accounts for `company_name`.
 
@@ -468,6 +526,12 @@ async def discover_buyer_accounts(
     low-confidence result with a rationale explaining why so the
     enrichment status surfaces "no_results" rather than masking the
     issue as success.
+
+    `news_window_days` (default 90) bounds the company-news/signals search to
+    the last N days via Tavily start_date/end_date — so relevant funding /
+    hiring / expansion signals from weeks ago are found, not just the last few
+    days. Customer / case-study queries are intentionally NOT date-bounded
+    (an older case study is still valid buyer evidence).
     """
     if not company_name or not company_name.strip():
         return BuyerAccountResult(
@@ -482,8 +546,10 @@ async def discover_buyer_accounts(
             buyer_account_rationale="Anthropic not configured — buyer discovery skipped."
         )
 
-    # Three short queries. Customers + case studies are the two highest
-    # signal-to-noise searches; the "what does X sell" query gives the
+    start_date, end_date = compute_news_window(news_window_days)
+
+    # Buyer-evidence queries (NOT date-bounded). Customers + case studies are
+    # the two highest signal-to-noise searches; "what does X sell" gives the
     # LLM context to tell buyers from competitors.
     queries = [
         f'"{company_name}" customers',
@@ -504,30 +570,78 @@ async def discover_buyer_accounts(
             buyer_account_rationale=f"Tavily search failed: {type(exc).__name__}"
         )
 
+    # Date-windowed company-signals query. Asks for relevant signals across the
+    # whole window — not "today" / "this week". topic="news" first; if it
+    # returns nothing, fall back to topic="general" with the SAME date window.
+    news_query = (
+        f'"{company_name}" company news announcements hiring expansion funding '
+        f'partnerships leadership changes product launches customer wins and '
+        f'operational signals from the last {int(news_window_days)} days'
+    )
+    topic_used: str | None = None
+    news_results: list[dict] = []
+    try:
+        news_results = await _tavily_search(
+            news_query, max_results=10,
+            start_date=start_date, end_date=end_date, topic="news",
+        )
+        topic_used = "news"
+        if not news_results:
+            news_results = await _tavily_search(
+                news_query, max_results=10,
+                start_date=start_date, end_date=end_date, topic="general",
+            )
+            topic_used = "general" if news_results else "news"
+    except Exception as exc:
+        # News search failing must not abort buyer discovery — the evidence
+        # queries above may still carry the lead.
+        log.warning(
+            "buyer_discovery_news_search_failed",
+            extra={"company": company_name, "error": f"{type(exc).__name__}: {exc}"},
+        )
+
     snippet_blocks: list[str] = []
+    source_urls: list[str] = []
+    result_count = 0
     any_results = False
-    for label, lst in zip(("Customers", "Case studies", "What they sell"), result_lists):
+    labeled = list(zip(("Customers", "Case studies", "What they sell"), result_lists))
+    labeled.append((f"Company signals (last {int(news_window_days)} days)", news_results))
+    for label, lst in labeled:
         if isinstance(lst, Exception):
             continue
         if lst:
             any_results = True
+            result_count += len(lst)
+            source_urls.extend(
+                (r.get("url") or "").strip() for r in lst if (r.get("url") or "").strip()
+            )
         snippet_blocks.append(_format_snippets(label, lst))
 
     if not any_results:
-        return BuyerAccountResult(
+        empty = BuyerAccountResult(
             buyer_account_rationale=(
                 f"Tavily returned no results for '{company_name}' — "
                 "falling back to segments only."
             )
         )
+        empty.news_window_days = int(news_window_days)
+        empty.news_start_date = start_date
+        empty.news_end_date = end_date
+        empty.tavily_topic_used = topic_used
+        empty.result_count = 0
+        return empty
 
     user_msg = (
         f"# Target company\n- Name: {company_name}\n"
         + (f"- Description: {company_description}\n" if company_description else "")
         + (f"- Industry: {industry}\n" if industry else "")
+        + f"\n# Company-signals search window: {start_date} to {end_date} "
+        + f"(last {int(news_window_days)} days)\n"
         + "\n# Research snippets\n"
         + "\n\n".join(snippet_blocks)
-        + "\n\nClassify per the rules. Output JSON only."
+        + "\n\nClassify per the rules. Rank signals by RELEVANCE first, then "
+        + "recency — a relevant hiring/funding/expansion signal from weeks ago "
+        + "beats an irrelevant article from the last few days. Output JSON only."
     )
 
     try:
@@ -552,6 +666,15 @@ async def discover_buyer_accounts(
     # Override buyer_fallback_mode with a deterministic computation based
     # on the actual classified fields — don't trust the LLM's self-assessment.
     _compute_buyer_fallback_mode(result)
+
+    # Stamp research metadata (code-set, not LLM) so the operator can verify
+    # the date window actually used. dedupe source URLs, preserve order.
+    result.news_window_days = int(news_window_days)
+    result.news_start_date = start_date
+    result.news_end_date = end_date
+    result.tavily_topic_used = topic_used
+    result.result_count = result_count
+    result.source_urls = list(dict.fromkeys(source_urls))
 
     log.info(
         "buyer_discovery_complete",

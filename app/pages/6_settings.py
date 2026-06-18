@@ -714,6 +714,24 @@ with st.expander("News search terms (Tavily queries)", expanded=False):
         )
         save_news = st.form_submit_button("Save news terms", type="primary")
 
+# ---------- Buyer research ----------
+with st.expander("Buyer research", expanded=False):
+    with st.form("settings_buyer_research_form", clear_on_submit=False):
+        buyer_news_window = st.number_input(
+            "Buyer research news window days",
+            min_value=1,
+            max_value=365,
+            value=int(cfg.buyer_research_news_window_days or 90),
+            step=15,
+            key="s_buyer_news_window",
+            help=(
+                "Buyer research will search for relevant company signals within "
+                "this many days. Higher values may find more relevant but less "
+                "fresh signals."
+            ),
+        )
+        save_buyer_research = st.form_submit_button("Save buyer research", type="primary")
+
 # ---------- Content generation types ----------
 with st.expander("Content generation types", expanded=True):
     with st.form("settings_content_types_form", clear_on_submit=False):
@@ -807,6 +825,10 @@ if save_signals:
 if save_news:
     cfg.news_search_terms = _lines(news_search_terms)
     _persist(cfg, "News search terms")
+
+if save_buyer_research:
+    cfg.buyer_research_news_window_days = int(buyer_news_window)
+    _persist(cfg, "Buyer research")
 
 if save_content_types:
     cfg.generate_email_enabled = bool(gen_email)

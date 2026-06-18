@@ -566,6 +566,23 @@ with tab_enrich:
                             + (" …" if len(b2b_evidence) > 3 else "")
                         )
 
+                # Research date window + Tavily metadata (set by code).
+                _nw = ba.get("news_window_days")
+                if _nw:
+                    _topic = ba.get("tavily_topic_used") or "—"
+                    _rc = ba.get("result_count")
+                    st.caption(
+                        f"News window: last {_nw} days "
+                        f"({ba.get('news_start_date') or '?'} → {ba.get('news_end_date') or '?'}) "
+                        f"· Tavily topic: {_topic}"
+                        + (f" · {_rc} results" if _rc is not None else "")
+                    )
+                    _surls = ba.get("source_urls") or []
+                    if _surls:
+                        with st.expander(f"Research source URLs ({len(_surls)})", expanded=False):
+                            for u in _surls:
+                                st.markdown(f"- {u}")
+
                 # v3 fields (shown when present)
                 if fallback_mode:
                     st.markdown(
