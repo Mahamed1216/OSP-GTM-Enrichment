@@ -148,7 +148,11 @@ def _run_pipeline_thread(
         elif u.phase == "content":
             regenerated = list(payload.get("regenerated_kinds") or [])
             skipped_kinds = list(payload.get("skipped_kinds") or [])
+            disabled_kinds = list(payload.get("disabled_kinds") or [])
             failed_kinds = list(payload.get("failed_kinds") or [])
+            # Content types disabled by the workspace toggle (cost saving).
+            for _dk in disabled_kinds:
+                per[_dk] = {"status": "skipped_disabled", "detail": "disabled in settings"}
             if "email" in regenerated:
                 per["email"] = {
                     "status": "regenerated" if payload.get("forced") else "generated",
@@ -902,6 +906,7 @@ if running:
             "generated": "✅",
             "completed": "✅",
             "skipped": "⏭",
+            "skipped_disabled": "🚫",
             "delivered": "📬",
             "dry-run": "🧪",
             "failed": "❌",

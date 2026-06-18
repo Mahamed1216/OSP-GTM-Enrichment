@@ -88,7 +88,15 @@ async def generate_email(
     *,
     regeneration_feedback: str | None = None,
     workspace_id: int | None = None,
-) -> EmailResult:
+) -> EmailResult | None:
+    # Cost gate (defense-in-depth). Email is ON by default, so this is a no-op
+    # in normal operation; it only skips when a workspace explicitly disables
+    # email generation. Returns None so callers treat it as "skipped_disabled".
+    from src.icp_config import is_content_type_enabled
+    if not is_content_type_enabled("email", workspace_id):
+        log.info("email_skipped_disabled", extra={"lead_id": lead_id, "workspace_id": workspace_id})
+        return None
+
     with session_scope() as session:
         lead = session.get(Lead, lead_id)
         if not lead:

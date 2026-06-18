@@ -58,6 +58,7 @@ async def _generate_content_one(lead_id: int, workspace_id: int) -> int:
     from src.content.email import generate_email
     from src.content.call_script import generate_call_script
     from src.content.linkedin_msg import generate_linkedin_msg
+    from src.icp_config import is_content_type_enabled
 
     generated = 0
     for fn, name in [
@@ -65,6 +66,13 @@ async def _generate_content_one(lead_id: int, workspace_id: int) -> int:
         (generate_call_script, "call_script"),
         (generate_linkedin_msg, "linkedin_msg"),
     ]:
+        # Content-type cost gate. Call scripts + LinkedIn DMs default OFF.
+        if not is_content_type_enabled(name, workspace_id):
+            log.info(
+                "auto_content_skipped_disabled",
+                extra={"lead_id": lead_id, "workspace_id": workspace_id, "kind": name},
+            )
+            continue
         try:
             await fn(lead_id, workspace_id=workspace_id)
             generated += 1

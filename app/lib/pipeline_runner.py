@@ -225,38 +225,51 @@ async def _phase_content(
         get_content_lead_ids(lead_ids, "linkedin_msg")
         if run_linkedin_msg and not force_refresh else set()
     )
+    # Workspace content-type cost gates, computed once for the batch. Call
+    # scripts + LinkedIn DMs default OFF; a disabled kind is never generated.
+    from src.icp_config import is_content_type_enabled
+    enabled_kind = {
+        "email": is_content_type_enabled("email", workspace_id),
+        "call_script": is_content_type_enabled("call_script", workspace_id),
+        "linkedin_msg": is_content_type_enabled("linkedin_msg", workspace_id),
+    }
+
     for idx, lid in enumerate(lead_ids, start=1):
         # Track which kinds we'll actually generate so we can wire supersede
         # pointers and report per-kind status after the gather.
         kinds_to_run: list[str] = []
         skipped_kinds: list[str] = []
+        disabled_kinds: list[str] = []
         if not run_email:
             skipped_kinds.append("email")
+        elif not enabled_kind["email"]:
+            disabled_kinds.append("email")
         elif lid in already_email:
             skipped_kinds.append("email")
         else:
             kinds_to_run.append("email")
         if not run_call_script:
             skipped_kinds.append("call_script")
+        elif not enabled_kind["call_script"]:
+            disabled_kinds.append("call_script")
         elif lid in already_call:
             skipped_kinds.append("call_script")
         else:
             kinds_to_run.append("call_script")
         if not run_linkedin_msg:
             skipped_kinds.append("linkedin_msg")
+        elif not enabled_kind["linkedin_msg"]:
+            disabled_kinds.append("linkedin_msg")
         elif lid in already_li:
             skipped_kinds.append("linkedin_msg")
         else:
             kinds_to_run.append("linkedin_msg")
 
         if not kinds_to_run:
-            _emit(
-                on_update,
-                PhaseUpdate(
-                    "content", lid, idx, total, True,
-                    payload={"skipped": True, "reason": "all kinds already complete"},
-                ),
-            )
+            payload: dict[str, Any] = {"skipped": True, "reason": "all kinds already complete"}
+            if disabled_kinds:
+                payload["disabled_kinds"] = disabled_kinds
+            _emit(on_update, PhaseUpdate("content", lid, idx, total, True, payload=payload))
             continue
 
         tasks = [_KIND_GENERATOR[k](lid, workspace_id=workspace_id) for k in kinds_to_run]
@@ -293,11 +306,13 @@ async def _phase_content(
         err_msg = (
             "; ".join(f"{type(e).__name__}: {e}" for e in errors) if errors else None
         )
-        payload: dict[str, Any] = {}
+        payload = {}
         if regenerated_kinds:
             payload["regenerated_kinds"] = regenerated_kinds
         if skipped_kinds:
             payload["skipped_kinds"] = skipped_kinds
+        if disabled_kinds:
+            payload["disabled_kinds"] = disabled_kinds
         if failed_kinds:
             payload["failed_kinds"] = failed_kinds
         if force_refresh:

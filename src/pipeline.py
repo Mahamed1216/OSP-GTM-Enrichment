@@ -74,14 +74,27 @@ async def run_pipeline_for_lead(lead_id: int, *, dry_run: bool = True) -> Pipeli
                 log.info("pipeline_tier_override_active", extra={
                     "lead_id": lead_id, "tier": result.score.tier, "score": result.score.score,
                 })
-            email, call_script, dm = await asyncio.gather(
-                generate_email(lead_id),
-                generate_call_script(lead_id),
-                generate_linkedin_msg(lead_id),
-            )
-            result.email = email
-            result.call_script = call_script
-            result.linkedin_msg = dm
+            # Content-type cost gates: only run generators the workspace has
+            # enabled. Call scripts + LinkedIn DMs default OFF to save LLM cost.
+            from src.icp_config import is_content_type_enabled
+            gen_tasks = [generate_email(lead_id)]
+            kinds = ["email"]
+            if is_content_type_enabled("call_script"):
+                gen_tasks.append(generate_call_script(lead_id))
+                kinds.append("call_script")
+            else:
+                log.info("pipeline_call_script_skipped_disabled", extra={"lead_id": lead_id})
+            if is_content_type_enabled("linkedin_msg"):
+                gen_tasks.append(generate_linkedin_msg(lead_id))
+                kinds.append("linkedin_msg")
+            else:
+                log.info("pipeline_linkedin_msg_skipped_disabled", extra={"lead_id": lead_id})
+
+            gen_results = await asyncio.gather(*gen_tasks)
+            by_kind = dict(zip(kinds, gen_results))
+            result.email = by_kind.get("email")
+            result.call_script = by_kind.get("call_script")
+            result.linkedin_msg = by_kind.get("linkedin_msg")
 
             # Delivery stays gated on SEND_MIN_TIER — the override only
             # unlocks content generation, never sends to an out-of-tier prospect.

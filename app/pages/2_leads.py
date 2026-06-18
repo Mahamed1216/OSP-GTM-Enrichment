@@ -1,6 +1,7 @@
 """Leads — filterable, sortable table; select rows for bulk actions or open detail."""
 from __future__ import annotations
 
+import logging
 import sys
 import time
 from pathlib import Path
@@ -15,6 +16,11 @@ import streamlit as st
 from app.lib.async_runner import run_async
 from app.lib.badges import status_pill, tier_badge
 from app.lib.db_queries import count_leads, list_leads
+from app.lib.push_confirm import (
+    build_push_confirm_token,
+    confirm_button_enabled,
+    push_confirmation_active,
+)
 from app.lib.workspace_state import get_current_workspace_id, render_workspace_banner
 from app.styles import inject_styles
 from src.config import settings
@@ -31,7 +37,9 @@ from src.leads import delete_lead, reset_lead_sequence
 
 inject_styles()
 
-_CONFIRM_TTL = 5.0  # seconds for two-click confirm window
+log = logging.getLogger(__name__)
+
+_CONFIRM_TTL = 5.0  # seconds for two-click confirm window (delete only)
 _BULK_PUSH_HARD_LIMIT = 10  # over this requires "I understand" checkbox
 _PAGE_SIZES = [25, 50, 100, 250]
 _DEFAULT_PAGE_SIZE = 50
@@ -400,7 +408,8 @@ if selected_lead_ids:
         if ac4.button("Clear selection", key="clear_selection"):
             st.session_state.pop("leads_table", None)
             st.session_state.pop(_del_key, None)
-            st.session_state.pop("push_selected_pending", None)
+            st.session_state.pop("push_confirm_token", None)
+            st.session_state.pop("bulk_push_big_ack", None)
             st.rerun()
 
         if confirming:
@@ -451,15 +460,46 @@ if selected_lead_ids:
                 f"Full breakdown: {skip_summary}."
             )
 
-        _push_key = "push_selected_pending"
+        # ---------- Confirmation flow: stable token, no time race ----------
+        # The dialog is shown while a stored token matches a freshly-computed
+        # one scoped to (workspace, selected ids, eligible ids, campaign). When
+        # any of those change, the token mismatches and we auto-clear the
+        # confirmation + the safety checkbox. No 5-second window — checking the
+        # box (which reruns) can never make the dialog disappear.
+        _TOKEN_KEY = "push_confirm_token"
+        _ACK_KEY = "bulk_push_big_ack"
+        current_token = build_push_confirm_token(
+            workspace_id=_ws_id,
+            selected_ids=selected_lead_ids,
+            eligible_ids=eligible_ids,
+            campaign_id=settings.instantly_campaign_id,
+        )
+        stored_token = st.session_state.get(_TOKEN_KEY)
+
+        # Scope changed (selection / workspace / eligibility / campaign) →
+        # reset the confirmation + clear the checkbox before it renders.
+        if stored_token and stored_token != current_token:
+            st.session_state.pop(_TOKEN_KEY, None)
+            st.session_state.pop(_ACK_KEY, None)
+            stored_token = None
+
         if push_clicked and n_eligible:
-            st.session_state[_push_key] = time.time()
+            # Enter confirmation mode for THIS scope. Clear any stale checkbox
+            # value here (before the widget renders) so it starts unchecked.
+            st.session_state[_TOKEN_KEY] = current_token
+            st.session_state.pop(_ACK_KEY, None)
+            log.info(
+                "push_confirm_started",
+                extra={
+                    "workspace_id": _ws_id,
+                    "selected_count": n,
+                    "eligible_count": n_eligible,
+                    "confirmation_key": current_token,
+                },
+            )
             st.rerun()
 
-        push_pending_at = st.session_state.get(_push_key)
-        confirming_push = (
-            bool(push_pending_at) and (time.time() - push_pending_at) < _CONFIRM_TTL
-        )
+        confirming_push = push_confirmation_active(stored_token, current_token)
 
         if confirming_push and n_eligible:
             # Lazy-fetch campaign info; cache 5min in session_state.
@@ -472,7 +512,7 @@ if selected_lead_ids:
                     st.session_state["push_campaign_cache"] = campaign_cache
                 except Exception as exc:
                     st.error(f"Could not fetch Instantly campaign info: {exc}")
-                    st.session_state.pop(_push_key, None)
+                    st.session_state.pop(_TOKEN_KEY, None)
                     st.stop()
             campaign = campaign_cache.get("data") or {}
 
@@ -495,27 +535,81 @@ if selected_lead_ids:
             st.caption(f"Sender(s): {', '.join(senders)}")
             st.caption(f"Daily send rate: {daily_limit}")
 
-            big_batch_ok = True
+            # Safety checkbox. Stable key → its checked state persists across
+            # the rerun that checking it triggers. Required for any batch over
+            # the hard limit; smaller batches still confirm via the button.
+            ack_checked = True
             if n_eligible > _BULK_PUSH_HARD_LIMIT:
-                big_batch_ok = st.checkbox(
+                ack_checked = st.checkbox(
                     f"I understand this will send {n_eligible} real emails.",
-                    key="bulk_push_big_ack",
+                    key=_ACK_KEY,
                 )
 
-            cc1, cc2 = st.columns([1.5, 5])
-            if cc1.button(
+            button_enabled = confirm_button_enabled(
+                n_eligible, bool(ack_checked), _BULK_PUSH_HARD_LIMIT
+            )
+            log.info(
+                "push_confirm_render",
+                extra={
+                    "workspace_id": _ws_id,
+                    "selected_count": n,
+                    "eligible_count": n_eligible,
+                    "confirmation_key": current_token,
+                    "checkbox_state": bool(ack_checked),
+                    "button_enabled": button_enabled,
+                },
+            )
+
+            cc1, cc2, cc3 = st.columns([1.5, 1.5, 4])
+            confirm_clicked = cc1.button(
                 f"Confirm push ({n_eligible})",
                 type="primary",
                 key="confirm_push",
-                disabled=not big_batch_ok,
-            ):
-                st.session_state.pop(_push_key, None)
-                progress = st.progress(0.0, text=f"Pushing {n_eligible} lead(s)…")
+                disabled=not button_enabled,
+            )
+            if cc2.button("Cancel", key="cancel_push", type="secondary"):
+                st.session_state.pop(_TOKEN_KEY, None)
+                st.rerun()
+            if not button_enabled:
+                cc3.caption(":gray[Check the box above to enable Confirm push.]")
+
+            if confirm_clicked:
+                # Re-run the server-side safety filter NOW against the current
+                # selection so we only push leads that are still eligible
+                # (content/verification/tier/unsafe-content could have changed).
+                with session_scope() as _cs:
+                    fresh_eligible, _fresh_skipped = filter_eligible(selected_lead_ids, _cs)
+                push_ids = [lid for lid in fresh_eligible if lid in set(selected_lead_ids)]
+                blocked_count = len(selected_lead_ids) - len(push_ids)
+
+                st.session_state.pop(_TOKEN_KEY, None)
+                log.info(
+                    "push_started",
+                    extra={
+                        "workspace_id": _ws_id,
+                        "selected_count": n,
+                        "eligible_count": len(push_ids),
+                        "blocked_count": blocked_count,
+                        "confirmation_key": current_token,
+                    },
+                )
+
+                if not push_ids:
+                    st.warning(
+                        "No leads are still eligible — nothing was pushed. "
+                        "They may have changed state since you selected them."
+                    )
+                    st.stop()
+
+                progress = st.progress(0.0, text=f"Pushing {len(push_ids)} lead(s)…")
                 status = st.status("Sending…", expanded=True)
                 n_sent = n_failed = 0
                 with status:
-                    for i, lid in enumerate(eligible_ids, start=1):
+                    for i, lid in enumerate(push_ids, start=1):
                         try:
+                            # deliver_email re-runs every pre-send guard
+                            # (unsafe content, missing content, verification,
+                            # tier, dedupe) server-side before sending.
                             result = run_async(
                                 deliver_email(lid, dry_run=False, workspace_id=_ws_id)
                             )
@@ -529,21 +623,29 @@ if selected_lead_ids:
                             else:
                                 n_failed += 1
                                 st.write(
-                                    f"⚠️ lead {lid} — skipped: {result.skip_reason}"
+                                    f"⚠️ lead {lid} — blocked: {result.skip_reason}"
                                 )
                         progress.progress(
-                            i / n_eligible,
-                            text=f"Pushed {i} of {n_eligible}…",
+                            i / len(push_ids),
+                            text=f"Pushed {i} of {len(push_ids)}…",
                         )
                 status.update(
-                    label=f"Bulk push complete — {n_sent} sent, {n_failed} failed.",
+                    label=f"Bulk push complete — {n_sent} sent, {n_failed} blocked/failed.",
                     state="complete",
                 )
-                st.toast(f"{n_sent} sent, {n_failed} failed.")
+                log.info(
+                    "push_completed",
+                    extra={
+                        "workspace_id": _ws_id,
+                        "n_sent": n_sent,
+                        "n_failed": n_failed,
+                        "blocked_count": blocked_count,
+                    },
+                )
+                st.toast(f"{n_sent} sent, {n_failed} blocked/failed.")
                 st.cache_data.clear()
                 st.session_state.pop("leads_table", None)
                 st.rerun()
-            cc2.caption(":red[Click \"Confirm push\" within 5s to proceed.]")
 
     # ---------- Overwrite existing Instantly copy ----------
     # For when bad copy was already pushed and the local content has been

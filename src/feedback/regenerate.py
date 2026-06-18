@@ -72,6 +72,15 @@ async def regenerate_direct(
     if generator is None:
         raise RegenerateRefused(f"Unknown content kind: {kind!r}")
 
+    # Content-type cost gate: refuse to regenerate a disabled content type so a
+    # manual "Redo" never re-enables call-script / LinkedIn-DM LLM spend.
+    from src.icp_config import is_content_type_enabled
+    if not is_content_type_enabled(kind, workspace_id):
+        raise RegenerateRefused(
+            f"{kind} generation is disabled for this workspace "
+            "(enable it in Settings → Content generation types to regenerate)."
+        )
+
     log.info(
         "regenerate_direct_started",
         extra={"content_id": generated_content_id, "kind": kind, "lead_id": lead_id},
@@ -161,6 +170,15 @@ async def regenerate_with_feedback(generated_content_id: int) -> int:
     generator = _KIND_DISPATCH.get(kind)
     if generator is None:
         raise RegenerateRefused(f"Unknown content kind: {kind!r}")
+
+    # Content-type cost gate: refuse to regenerate a disabled content type so a
+    # manual "Redo" never re-enables call-script / LinkedIn-DM LLM spend.
+    from src.icp_config import is_content_type_enabled
+    if not is_content_type_enabled(kind, workspace_id):
+        raise RegenerateRefused(
+            f"{kind} generation is disabled for this workspace "
+            "(enable it in Settings → Content generation types to regenerate)."
+        )
 
     log.info(
         "regenerate_started",

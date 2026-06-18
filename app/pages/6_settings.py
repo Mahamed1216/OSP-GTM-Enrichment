@@ -714,6 +714,32 @@ with st.expander("News search terms (Tavily queries)", expanded=False):
         )
         save_news = st.form_submit_button("Save news terms", type="primary")
 
+# ---------- Content generation types ----------
+with st.expander("Content generation types", expanded=True):
+    with st.form("settings_content_types_form", clear_on_submit=False):
+        st.caption(
+            "Turning off call scripts and LinkedIn DMs reduces LLM cost. "
+            "Only checked types are generated; unchecked types are skipped "
+            "cleanly (no LLM call, no placeholder record). Existing saved "
+            "content is never deleted."
+        )
+        gen_email = st.checkbox(
+            "Generate emails",
+            value=cfg.generate_email_enabled,
+            key="s_gen_email",
+        )
+        gen_call = st.checkbox(
+            "Generate call scripts",
+            value=cfg.generate_call_script_enabled,
+            key="s_gen_call_script",
+        )
+        gen_dm = st.checkbox(
+            "Generate LinkedIn DMs",
+            value=cfg.generate_linkedin_dm_enabled,
+            key="s_gen_linkedin_dm",
+        )
+        save_content_types = st.form_submit_button("Save content types", type="primary")
+
 # ---------- Demo / testing ----------
 with st.expander("Demo / testing", expanded=False):
     with st.form("settings_demo_form", clear_on_submit=False):
@@ -781,6 +807,12 @@ if save_signals:
 if save_news:
     cfg.news_search_terms = _lines(news_search_terms)
     _persist(cfg, "News search terms")
+
+if save_content_types:
+    cfg.generate_email_enabled = bool(gen_email)
+    cfg.generate_call_script_enabled = bool(gen_call)
+    cfg.generate_linkedin_dm_enabled = bool(gen_dm)
+    _persist(cfg, "Content generation types")
 
 if save_demo:
     cfg.generate_content_for_all_tiers = bool(generate_for_all)
