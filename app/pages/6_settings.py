@@ -736,8 +736,8 @@ with st.expander("Buyer research", expanded=False):
             value=cfg.buyer_research_use_research,
             key="s_buyer_use_research",
             help=(
-                "Uses Tavily's research agent to produce deeper company research. "
-                "This may increase Tavily usage."
+                "Uses Tavily's research agent for deeper company research. "
+                "This is expensive. Leave off unless needed."
             ),
         )
         buyer_use_crawl = st.checkbox(

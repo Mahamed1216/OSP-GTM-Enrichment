@@ -87,8 +87,10 @@ class ICPConfig(BaseModel):
     buyer_research_use_crawl: bool = True
     buyer_research_use_extract: bool = True
     # Tavily Research agent (Company Researcher) for deeper company research.
-    # Default on; may increase Tavily usage (/research credits).
-    buyer_research_use_research: bool = True
+    # Default OFF: /research is expensive and was the main driver of a Tavily
+    # cost spike. Cheaper Search/Crawl/Extract layers stay on. Turn this on per
+    # workspace only when deeper research is worth the credits.
+    buyer_research_use_research: bool = False
 
 
 # ---------------------------------------------------------------------------

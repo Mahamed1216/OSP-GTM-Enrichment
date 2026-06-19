@@ -932,7 +932,20 @@ async def discover_buyer_accounts(
     research_raw: dict | None = None
     research_error: str | None = None
     research_last_run_at: str | None = None
-    if use_research and (company_name or company_domain):
+    if not use_research:
+        # Disabled by the workspace setting (buyer_research_use_research=False).
+        # /research is the expensive Tavily layer, so we never call it here and
+        # never spend research credits. Record debug metadata so Lead Detail can
+        # explain the skip, but DON'T add "research" to tavily_modes_used (no
+        # call actually ran).
+        research_status = "skipped_disabled"
+        tavily_calls.append({
+            "mode": "research",
+            "status": "skipped_disabled",
+            "reason": "buyer_research_use_research_false",
+            "window_days": int(news_window_days),
+        })
+    elif company_name or company_domain:
         research_used = True
         research_last_run_at = datetime.now(timezone.utc).isoformat()
         research_input = (
@@ -1010,7 +1023,9 @@ async def discover_buyer_accounts(
         content never invent a signal.
         """
         res.research_used = research_used
-        res.research_status = research_status if research_used else "skipped"
+        # research_status is already correct on every path:
+        #   completed | failed | skipped (ran-but-no-company) | skipped_disabled.
+        res.research_status = research_status
         res.research_summary = research_summary
         res.research_findings = research_findings
         res.research_sources = research_sources
@@ -1019,7 +1034,12 @@ async def discover_buyer_accounts(
         res.research_last_run_at = research_last_run_at
         if not research_used:
             res.research_useful_signal_found = False
-            res.research_no_signal_reason = "Tavily Research disabled for this workspace."
+            res.research_no_signal_reason = (
+                "Tavily Research is disabled for this workspace "
+                "(buyer_research_use_research=false)."
+                if research_status == "skipped_disabled"
+                else "Tavily Research skipped — no company name or domain."
+            )
         elif research_status == "failed":
             res.research_useful_signal_found = False
             res.research_no_signal_reason = res.research_error or "Tavily Research failed."

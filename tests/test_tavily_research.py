@@ -83,10 +83,47 @@ def test_research_runs_when_enabled(monkeypatch):
 def test_research_skipped_when_disabled(monkeypatch):
     inputs = _install(monkeypatch)
     result = _run(use_research=False)
-    assert inputs == []  # research never called
+    assert inputs == []  # research never called — no /research credits spent
     assert result.research_used is False
-    assert result.research_status == "skipped"
+    assert result.research_status == "skipped_disabled"
     assert "research" not in result.tavily_modes_used
+
+
+def test_research_skipped_disabled_debug_metadata(monkeypatch):
+    """When disabled, a research debug record explains why it was skipped."""
+    _install(monkeypatch)
+    result = _run(use_research=False)
+    research_calls = [c for c in result.tavily_calls if c.get("mode") == "research"]
+    assert research_calls, "expected a skipped_disabled debug record"
+    c = research_calls[0]
+    assert c["mode"] == "research"
+    assert c["status"] == "skipped_disabled"
+    assert c["reason"] == "buyer_research_use_research_false"
+
+
+def test_research_disabled_no_useful_signal(monkeypatch):
+    """Disabled research never surfaces a useful signal to scoring/content."""
+    _install(monkeypatch)
+    result = _run(use_research=False)
+    assert result.research_useful_signal_found is False
+    assert "disabled" in result.research_no_signal_reason.lower()
+
+
+def test_search_crawl_extract_run_when_research_disabled(monkeypatch):
+    """Cheaper Tavily layers keep working even with /research turned off."""
+    _install(monkeypatch)
+    result = _run(use_research=False, use_crawl=True, use_extract=True)
+    # Search (news/general), crawl, and extract all still execute...
+    for mode in ("news", "general", "crawl", "extract"):
+        assert mode in result.tavily_modes_used, f"{mode} should still run"
+    # ...while /research does not.
+    assert "research" not in result.tavily_modes_used
+    assert result.research_used is False
+
+
+def test_use_research_config_default_is_false():
+    """The expensive /research layer is OFF by default for every workspace."""
+    assert ICPConfig().buyer_research_use_research is False
 
 
 # ---------------------------------------------------------------------------
@@ -273,4 +310,4 @@ def test_call_script_and_dm_disabled_by_default():
     assert c.generate_call_script_enabled is False
     assert c.generate_linkedin_dm_enabled is False
     assert c.generate_email_enabled is True
-    assert c.buyer_research_use_research is True  # research default on
+    assert c.buyer_research_use_research is False  # /research default OFF (cost)

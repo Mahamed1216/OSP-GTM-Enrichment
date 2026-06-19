@@ -731,7 +731,11 @@ with tab_enrich:
         _tcr = enrichment.get("buyer_accounts") or {}
         _r_state = research_display_state(_tcr)
 
-        if _r_state == "not_run":
+        if _r_state == "skipped_disabled":
+            st.info(
+                "Tavily Company Research skipped because the setting is disabled."
+            )
+        elif _r_state == "not_run":
             st.info("Tavily Company Research has not run for this lead.")
         elif _r_state == "failed":
             st.error(
@@ -793,6 +797,7 @@ with tab_enrich:
                         f"start=`{call.get('start_date')}` end=`{call.get('end_date')}` · "
                         f"status=`{call.get('status')}` · "
                         f"sources={call.get('source_count', call.get('result_count'))}"
+                        + (f" · reason=`{call.get('reason')}`" if call.get('reason') else "")
                         + (f" · error=`{call.get('error')}`" if call.get('error') else "")
                     )
                     if call.get("query"):

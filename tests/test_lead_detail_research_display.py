@@ -116,6 +116,27 @@ def test_state_failed():
     }) == "failed"
 
 
+def test_state_skipped_disabled():
+    # When /research is disabled, Lead Detail shows a "skipped because disabled"
+    # message rather than "has not run".
+    assert research_display_state({
+        "research_used": False, "research_status": "skipped_disabled",
+        "research_no_signal_reason": "Tavily Research is disabled for this workspace.",
+    }) == "skipped_disabled"
+
+
+def test_existing_saved_research_still_displays_when_disabled():
+    # A lead enriched earlier (useful research saved) keeps showing that
+    # research even though the workspace setting is now off — the saved row
+    # carries research_status="completed", not "skipped_disabled".
+    osp = _seed_osp()
+    lid = _make_lead_with_buyer_accounts(osp, _USEFUL_BA)
+    bundle = get_lead_full(lid, workspace_id=osp)
+    ba = bundle["enrichment"]["buyer_accounts"]
+    assert research_display_state(ba) == "useful"
+    assert ba["research_summary"].startswith("Acme raised")
+
+
 # ---------------------------------------------------------------------------
 # 7. Debug metadata includes mode=research (loaded via get_lead_full)
 # ---------------------------------------------------------------------------
