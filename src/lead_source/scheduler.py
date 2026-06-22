@@ -13,7 +13,10 @@ background jobs. Use one of:
 Hard constraints (never relaxed):
   - No emails are auto-sent.
   - No Instantly push.
-  - POST /api/v1/clients/{slug}/runs is never called.
+  - POST /api/v1/clients/{slug}/runs is called ONLY when the workspace
+    explicitly sets trigger_run_before_import=true. It is never called on the
+    default contacts-polling path. A failed/timeout/errored run blocks the
+    import (no silent import).
   - Only enabled workspaces are touched.
   - Dedup prevents re-importing existing contacts.
   - Content generation is idempotent — skips leads that already have content.
@@ -208,6 +211,7 @@ async def run_workspace_auto_import(
     from src.lead_source.settings import (
         load_lead_source_config,
         update_auto_run_metadata,
+        update_run_metadata,
         advance_import_cursor,
     )
     from src.lead_source.ingest import run_import
@@ -247,11 +251,64 @@ async def run_workspace_auto_import(
         "content_generated_count": 0,
         "enrichment_skipped_count": 0,
         "next_offset": current_offset,
+        # Signal-first trigger/poll flow bookkeeping.
+        "triggered_run": cfg.trigger_run_before_import,
+        "triggered_run_id": None,
+        "triggered_run_status": None,
     }
 
     if dry_run:
         log.info("scheduler_dry_run", extra={"workspace_id": workspace_id})
         return summary
+
+    # --- Optional: trigger a sourcing run and poll it to completion BEFORE
+    # importing. Only when the workspace explicitly enables it. A run that
+    # fails / times out / errors blocks the import — never import silently.
+    triggered_run_id: str | None = None
+    triggered_run_status: str | None = None
+    if cfg.trigger_run_before_import:
+        from src.lead_source.client import LeadSourceClient
+        from src.lead_source.runs import trigger_and_poll_run
+
+        client = LeadSourceClient(cfg.api_base_url, cfg.api_key)
+        run_outcome = trigger_and_poll_run(
+            client,
+            cfg.client_slug,
+            poll_interval_seconds=cfg.run_poll_interval_seconds,
+            max_wait_seconds=cfg.run_max_wait_seconds,
+        )
+        triggered_run_id = run_outcome.run_id
+        triggered_run_status = run_outcome.status
+        summary["triggered_run_id"] = run_outcome.run_id
+        summary["triggered_run_status"] = run_outcome.status
+
+        update_run_metadata(
+            workspace_id,
+            run_id=run_outcome.run_id,
+            status=run_outcome.status,
+            error=run_outcome.error,
+        )
+
+        if not run_outcome.completed:
+            # Failed / timeout / error — DO NOT import.
+            summary["skipped"] = True
+            summary["reason"] = f"run_{run_outcome.status}"
+            summary["error_detail"] = run_outcome.error
+            log.warning(
+                "scheduler_run_not_completed",
+                extra={
+                    "workspace_id": workspace_id,
+                    "run_id": run_outcome.run_id,
+                    "run_status": run_outcome.status,
+                    "error": run_outcome.error,
+                },
+            )
+            update_auto_run_metadata(
+                workspace_id,
+                status=f"run_{run_outcome.status}",
+                created=0, scored=0, content=0, fetched=0, skipped=0,
+            )
+            return summary
 
     try:
         import_result = run_import(
@@ -265,6 +322,8 @@ async def run_workspace_auto_import(
             include_suppressed=cfg.include_suppressed,
             auto_run=True,
             initial_offset=current_offset,
+            triggered_run_id=triggered_run_id,
+            triggered_run_status=triggered_run_status,
         )
         summary["fetched"] = import_result.fetched
         summary["created"] = import_result.created

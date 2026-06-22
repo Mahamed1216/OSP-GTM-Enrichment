@@ -7,10 +7,14 @@ matched ICPs, a source tier/score, and source metadata.
 This module is PURE (no DB, no I/O) so it's easy to unit-test against real
 and degenerate payloads. Persistence lives in src.signals.store.
 
-Normalized per-signal shape:
-  signal_type, signal_name, signal_strength (none|low|medium|high),
-  signal_summary, signal_evidence, signal_source_url, signal_detected_at,
-  raw_signal
+Dele's confirmed per-signal payload shape (signal-first sourcing):
+  type, value, confidence, source, source_url, detected_at
+plus contact-level: signal_count, matched_icps, tier, tier_score, source_metadata.
+
+Normalized per-signal shape (superset — tolerant of older/looser payloads):
+  signal_type, signal_name, signal_value, signal_confidence,
+  signal_strength (none|low|medium|high), signal_source, signal_summary,
+  signal_evidence, signal_source_url, signal_detected_at, raw_signal
 """
 from __future__ import annotations
 
@@ -20,8 +24,14 @@ from typing import Any
 # Keys we probe for each normalized field — payloads vary, so try several.
 _TYPE_KEYS = ("signal_type", "type", "category", "kind")
 _NAME_KEYS = ("signal_name", "name", "title", "label", "signal", "headline")
+_VALUE_KEYS = ("signal_value", "value", "observed_value", "detail_value")
 _STRENGTH_KEYS = ("signal_strength", "strength", "confidence", "severity", "level")
+_CONFIDENCE_KEYS = ("confidence", "signal_confidence", "confidence_score")
 _SCORE_KEYS = ("score", "confidence_score", "signal_score", "weight")
+# Per-signal provenance (where THIS signal was observed, e.g. "linkedin").
+# Distinct from the contact-level `source` (the source SYSTEM, e.g.
+# "osp_lead_engine") read in parse_source_signals().
+_SIGNAL_SOURCE_KEYS = ("signal_source", "source", "provider", "origin", "channel")
 _SUMMARY_KEYS = ("signal_summary", "summary", "description", "detail", "text", "message")
 _EVIDENCE_KEYS = ("signal_evidence", "evidence", "details", "snippet", "context", "proof")
 _URL_KEYS = ("signal_source_url", "source_url", "url", "link", "href")
@@ -68,7 +78,10 @@ def _normalize_strength(raw_strength: Any, raw_score: Any) -> str:
 class NormalizedSignal:
     signal_type: str | None = None
     signal_name: str | None = None
-    signal_strength: str = "low"
+    signal_value: str | None = None
+    signal_confidence: float | str | None = None   # raw confidence, kept for display
+    signal_strength: str = "low"                    # derived bucket: none|low|medium|high
+    signal_source: str | None = None                # per-signal provenance, e.g. "linkedin"
     signal_summary: str | None = None
     signal_evidence: str | None = None
     signal_source_url: str | None = None
@@ -81,9 +94,12 @@ def _normalize_one(sig: Any) -> NormalizedSignal:
         strength = _normalize_strength(_first(sig, _STRENGTH_KEYS), _first(sig, _SCORE_KEYS))
         name = _first(sig, _NAME_KEYS) or _first(sig, _TYPE_KEYS)
         return NormalizedSignal(
-            signal_type=_first(sig, _TYPE_KEYS),
+            signal_type=_opt_str(_first(sig, _TYPE_KEYS)),
             signal_name=str(name) if name is not None else None,
+            signal_value=_opt_str(_first(sig, _VALUE_KEYS)),
+            signal_confidence=_coerce_confidence(_first(sig, _CONFIDENCE_KEYS)),
             signal_strength=strength,
+            signal_source=_opt_str(_first(sig, _SIGNAL_SOURCE_KEYS)),
             signal_summary=_opt_str(_first(sig, _SUMMARY_KEYS)),
             signal_evidence=_opt_str(_first(sig, _EVIDENCE_KEYS)),
             signal_source_url=_opt_str(_first(sig, _URL_KEYS)),
@@ -94,6 +110,7 @@ def _normalize_one(sig: Any) -> NormalizedSignal:
     text = str(sig).strip()
     return NormalizedSignal(
         signal_name=text or None,
+        signal_value=text or None,
         signal_strength="low",
         signal_summary=text or None,
         raw_signal=sig,
@@ -107,12 +124,24 @@ def _opt_str(value: Any) -> str | None:
     return s or None
 
 
+def _coerce_confidence(value: Any) -> float | str | None:
+    """Keep the raw confidence for display: a float when numeric, else the
+    trimmed label (e.g. "high"), else None. Strength bucketing is separate."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return _opt_str(value)
+
+
 _STRENGTH_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3}
 
 
 @dataclass
 class ParsedSourceSignals:
     has_signals: bool = False
+    signal_count: int = 0                                    # payload signal_count, else len(signals)
     signals: list[dict] = field(default_factory=list)        # normalized
     raw_signals: Any = None                                  # original payload.signals
     matched_icps: list[str] = field(default_factory=list)
@@ -138,6 +167,15 @@ class ParsedSourceSignals:
 def _coerce_float(value: Any) -> float | None:
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return None
 
@@ -188,8 +226,14 @@ def parse_source_signals(contact: dict[str, Any]) -> ParsedSourceSignals:
     source_tier = _opt_str(contact.get("tier"))
     source_tier_score = _coerce_float(contact.get("tier_score"))
 
+    # Prefer the payload's explicit signal_count (Dele's authoritative count);
+    # fall back to the number of normalized signals when it's absent/invalid.
+    payload_count = _coerce_int(contact.get("signal_count"))
+    signal_count = payload_count if payload_count is not None else len(normalized)
+
     parsed = ParsedSourceSignals(
         has_signals=bool(normalized),
+        signal_count=signal_count,
         signals=[asdict(n) for n in normalized],
         raw_signals=raw_signals,
         matched_icps=matched_icps,

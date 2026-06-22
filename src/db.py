@@ -170,6 +170,10 @@ _RUNTIME_COLUMN_ADDS: list[tuple[str, str, str]] = [
     # payload, stored separately from our local Score.tier.
     ("leads", "source_tier", "VARCHAR(16)"),
     ("leads", "source_tier_score", "FLOAT"),
+    # Signal-first run trigger/poll flow — import-log bookkeeping.
+    ("lead_source_imports", "triggered_run_id", "VARCHAR(128)"),
+    ("lead_source_imports", "triggered_run_status", "VARCHAR(32)"),
+    ("lead_source_imports", "source_signal_count", "INTEGER DEFAULT 0"),
 ]
 
 # Postgres-only column widenings. SQLite ignores VARCHAR length caps so

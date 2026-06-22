@@ -814,6 +814,7 @@ def get_lead_full(
                 )
             ).scalar_one_or_none()
             if src_sig is not None:
+                _src_raw = src_sig.raw_payload or {}
                 source_signal_dict = {
                     "signal_found": bool(src_sig.signal_found),
                     "signal_strength": src_sig.signal_strength,
@@ -824,6 +825,14 @@ def get_lead_full(
                     "recommended_email_angle": src_sig.recommended_email_angle,
                     "tier_uplift_recommendation": src_sig.tier_uplift_recommendation,
                     "applied_uplift": src_sig.applied_uplift,
+                    # Full normalized per-signal rows (type/value/confidence/
+                    # source/source_url/detected_at) + count, pulled from the
+                    # stored ParsedSourceSignals payload so Lead Detail can show
+                    # the exact Dele signal shape.
+                    "signal_count": _src_raw.get("signal_count"),
+                    "signals": list(_src_raw.get("signals") or []),
+                    "source_system": _src_raw.get("source_system"),
+                    "source_metadata": _src_raw.get("source_metadata") or {},
                     "raw_payload": src_sig.raw_payload,
                     "updated_at": src_sig.updated_at,
                 }

@@ -428,12 +428,40 @@ with tab_lead:
             # Signals
             if source_signal and source_signal.get("signal_found"):
                 color = _STRENGTH_COLOR.get((_src_strength or "none").lower(), ":gray")
+                _count = source_signal.get("signal_count")
+                _count_bit = f"  ·  **Signal count:** {_count}" if _count is not None else ""
                 st.markdown(
                     f"**Signal strength:** {color}[**{(_src_strength or 'unknown').title()}**]"
+                    + _count_bit
                 )
                 names = source_signal.get("signal_names") or []
                 if names:
                     st.markdown("**Signals:** " + "  ".join(pill(str(n), "violet") for n in names))
+
+                # Per-signal table — the exact Dele payload shape:
+                # type · value · confidence · source · source_url · detected_at
+                _sig_rows = source_signal.get("signals") or []
+                if _sig_rows:
+                    st.dataframe(
+                        [
+                            {
+                                "Type": s.get("signal_type") or "—",
+                                "Value": s.get("signal_value") or s.get("signal_name") or "—",
+                                "Confidence": (
+                                    s.get("signal_confidence")
+                                    if s.get("signal_confidence") is not None
+                                    else (s.get("signal_strength") or "—")
+                                ),
+                                "Source": s.get("signal_source") or "—",
+                                "Source URL": s.get("signal_source_url") or "",
+                                "Detected at": s.get("signal_detected_at") or "—",
+                            }
+                            for s in _sig_rows
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
                 if source_signal.get("summary"):
                     st.markdown(f"**Signal summary:** {source_signal['summary']}")
                 if source_signal.get("recommended_email_angle"):

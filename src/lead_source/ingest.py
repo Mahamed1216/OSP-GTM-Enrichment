@@ -53,6 +53,8 @@ class ImportResult:
         # Source-signal layer: contacts whose payload carried signals vs not.
         self.with_source_signals: int = 0
         self.without_source_signals: int = 0
+        # Total normalized source signals across all contacts in this batch.
+        self.source_signal_count: int = 0
 
     def bump_skip(self, reason: str) -> None:
         self.skipped += 1
@@ -71,6 +73,7 @@ class ImportResult:
             "unverified_email_count": self.unverified_email_count,
             "with_source_signals": self.with_source_signals,
             "without_source_signals": self.without_source_signals,
+            "source_signal_count": self.source_signal_count,
         }
 
 
@@ -204,6 +207,7 @@ def import_contacts(
             parsed = parse_source_signals(raw_contact)
             if parsed.has_signals:
                 result.with_source_signals += 1
+                result.source_signal_count += parsed.signal_count
             else:
                 result.without_source_signals += 1
 
@@ -329,6 +333,8 @@ def start_import_log(
     status_filter: str | None = None,
     include_suppressed: bool = False,
     auto_run: bool = False,
+    triggered_run_id: str | None = None,
+    triggered_run_status: str | None = None,
 ) -> int:
     """Create a LeadSourceImport row and return its id."""
     from src.models import LeadSourceImport
@@ -342,6 +348,8 @@ def start_import_log(
             status_filter=status_filter or None,
             include_suppressed=include_suppressed,
             auto_run=auto_run,
+            triggered_run_id=triggered_run_id,
+            triggered_run_status=triggered_run_status,
             started_at=datetime.now(timezone.utc).replace(tzinfo=None),
             status="running",
             requested_limit=requested_limit,
@@ -364,6 +372,7 @@ def _finish_import(import_id: int, result: ImportResult) -> None:
                 imp.updated_count = result.updated
                 imp.skipped_count = result.skipped
                 imp.error_count = result.errors
+                imp.source_signal_count = result.source_signal_count
                 imp.raw_summary = result.to_summary()
     except Exception as exc:
         log.warning(
@@ -427,6 +436,8 @@ def run_import(
     created_before: str | None = None,
     auto_run: bool = False,
     initial_offset: int = 0,
+    triggered_run_id: str | None = None,
+    triggered_run_status: str | None = None,
 ) -> ImportResult:
     """Full import flow: log → paginated fetch → ingest → update workspace metadata.
 
@@ -447,6 +458,8 @@ def run_import(
         status_filter=status_filter,
         include_suppressed=include_suppressed,
         auto_run=auto_run,
+        triggered_run_id=triggered_run_id,
+        triggered_run_status=triggered_run_status,
     )
 
     try:
@@ -550,6 +563,10 @@ def get_recent_imports(workspace_id: int, limit: int = 10) -> list[dict[str, Any
                 "skipped_count": r.skipped_count,
                 "error_count": r.error_count,
                 "error_message": r.error_message,
+                "auto_run": r.auto_run,
+                "triggered_run_id": r.triggered_run_id,
+                "triggered_run_status": r.triggered_run_status,
+                "source_signal_count": r.source_signal_count,
                 "raw_summary": r.raw_summary,
             }
             for r in rows

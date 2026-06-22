@@ -61,6 +61,44 @@ class LeadSourceClient:
         return resp.json()
 
     # ------------------------------------------------------------------
+    # Sourcing runs — with auth (signal-first trigger/poll flow)
+    # ------------------------------------------------------------------
+
+    def trigger_run(self, slug: str) -> dict[str, Any]:
+        """POST /api/v1/clients/{slug}/runs — start a sourcing run.
+
+        Returns the RunOut dict (expected to carry an id/run_id and status).
+        Only ever called when the workspace explicitly enables
+        trigger_run_before_import — never on the default polling path.
+        Raises on HTTP errors so the caller can record a failed run.
+        """
+        log.info(
+            "lead_source_trigger_run",
+            extra={"base": self._base, "slug": slug},
+        )
+        resp = httpx.post(
+            f"{self._base}/api/v1/clients/{slug}/runs",
+            headers=self._auth_headers,
+            timeout=_DEFAULT_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_run(self, run_id: str) -> dict[str, Any]:
+        """GET /api/v1/runs/{run_id} — poll the status of a sourcing run.
+
+        Returns the RunOut dict (expected to carry a status field). Raises on
+        HTTP errors so the poller can surface a clear failure.
+        """
+        resp = httpx.get(
+            f"{self._base}/api/v1/runs/{run_id}",
+            headers=self._auth_headers,
+            timeout=_DEFAULT_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    # ------------------------------------------------------------------
     # Contacts — with auth
     # ------------------------------------------------------------------
 

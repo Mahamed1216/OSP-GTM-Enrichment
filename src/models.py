@@ -609,3 +609,9 @@ class LeadSourceImport(Base):
     scored_count: Mapped[int] = mapped_column(Integer, default=0)
     content_generated_count: Mapped[int] = mapped_column(Integer, default=0)
     enrichment_skipped_count: Mapped[int] = mapped_column(Integer, default=0)
+    # Signal-first trigger/poll flow. NULL on imports that used the normal
+    # contacts-polling path (trigger_run_before_import disabled).
+    triggered_run_id: Mapped[Optional[str]] = mapped_column(String(128))
+    triggered_run_status: Mapped[Optional[str]] = mapped_column(String(32))
+    # Total normalized source signals across all imported contacts in this run.
+    source_signal_count: Mapped[int] = mapped_column(Integer, default=0)

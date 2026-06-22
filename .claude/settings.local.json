@@ -49,7 +49,9 @@
       "Read(//tmp/**)",
       "Bash(echo \"exit=$?\")",
       "Bash(ps -W)",
-      "Bash(tasklist)"
+      "Bash(tasklist)",
+      "PowerShell(py *)",
+      "Bash(py -m pytest -p no:cacheprovider -q)"
     ]
   }
 }
