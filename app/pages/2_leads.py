@@ -33,6 +33,7 @@ from src.delivery.instantly import (
     get_campaign,
     overwrite_lead_copy,
 )
+from src.delivery.instantly_config import resolve_instantly_config
 from src.db import session_scope as _delete_session_scope
 from src.leads import delete_lead, reset_lead_sequence
 
@@ -503,11 +504,19 @@ if selected_lead_ids:
         # box (which reruns) can never make the dialog disappear.
         _TOKEN_KEY = "push_confirm_token"
         _ACK_KEY = "bulk_push_big_ack"
+        # Resolve the campaign id for the ACTIVE workspace (not the env-only
+        # value). API key comes from env/secrets via the same resolver downstream
+        # in deliver_email; here we only need the campaign id for the token,
+        # campaign-info preview, and the bulk push call.
+        _push_cfg = resolve_instantly_config(
+            _ws_id, allow_campaign_env_fallback=(_ws_id is None)
+        )
+        _push_campaign_id = _push_cfg.campaign_id
         current_token = build_push_confirm_token(
             workspace_id=_ws_id,
             selected_ids=selected_lead_ids,
             eligible_ids=eligible_ids,
-            campaign_id=settings.instantly_campaign_id,
+            campaign_id=_push_campaign_id,
         )
         stored_token = st.session_state.get(_TOKEN_KEY)
 
@@ -542,7 +551,7 @@ if selected_lead_ids:
             cached_at = campaign_cache.get("at", 0)
             if time.time() - cached_at > 300:
                 try:
-                    campaign = run_async(get_campaign(settings.instantly_campaign_id))
+                    campaign = run_async(get_campaign(_push_campaign_id))
                     campaign_cache = {"at": time.time(), "data": campaign}
                     st.session_state["push_campaign_cache"] = campaign_cache
                 except Exception as exc:
@@ -617,13 +626,13 @@ if selected_lead_ids:
                     "workspace_id": _ws_id,
                     "selected_count": n,
                     "eligible_count": n_eligible,
-                    "campaign_id": settings.instantly_campaign_id,
+                    "campaign_id": _push_campaign_id,
                     "confirmation_checked": bool(ack_checked),
                 })
                 with st.spinner("Push started — sending to Instantly…"):
                     rec = run_async(run_bulk_push(
                         list(selected_lead_ids), _ws_id,
-                        campaign_id=settings.instantly_campaign_id,
+                        campaign_id=_push_campaign_id,
                     ))
                 # Persist result + close the dialog ONLY now (after the push
                 # finished). The persistent panel renders it on the next run.

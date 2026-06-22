@@ -22,6 +22,7 @@ import streamlit as st
 
 from app.lib.workspace_state import get_current_workspace, get_current_workspace_id, render_workspace_banner, set_current_workspace
 from app.styles import inject_styles
+from src.delivery.instantly_config import resolve_instantly_config
 from src.workspace import (
     backfill_osp_icp_config,
     create_workspace,
@@ -140,6 +141,44 @@ if _selected_ws:
     sd3.metric("Active", "Yes" if _selected_ws.get("is_active") else "No")
     sd4.metric("Default", "Yes" if _selected_ws.get("is_default") else "No")
 
+    # --- Instantly push configuration (what the Push-to-Instantly flow uses) ---
+    # API key = shared env/Streamlit secret (never per-workspace); campaign id =
+    # this workspace's value (env fallback only when no workspace is selected).
+    _inst_cfg = resolve_instantly_config(
+        _selected_ws_id, allow_campaign_env_fallback=(_selected_ws_id is None)
+    )
+    _API_SRC_LABELS = {
+        "env": "Environment (INSTANTLY_API_KEY)",
+        "streamlit_secrets": "Streamlit secrets",
+        "config": "App config (.env)",
+        "missing": "Missing",
+    }
+    _CAMP_SRC_LABELS = {
+        "workspace_column": "Workspace",
+        "workspace_config": "Workspace config",
+        "env": "Environment (INSTANTLY_CAMPAIGN_ID)",
+        "streamlit_secrets": "Streamlit secrets",
+        "missing": "Missing",
+    }
+    st.markdown("**Instantly push configuration**")
+    ic1, ic2, ic3, ic4 = st.columns(4)
+    ic1.metric("API key configured", "Yes" if _inst_cfg.api_key else "No")
+    ic2.metric("API key source", _API_SRC_LABELS.get(_inst_cfg.api_key_source, _inst_cfg.api_key_source))
+    ic3.metric("Campaign ID configured", "Yes" if _inst_cfg.campaign_id else "No")
+    ic4.metric("Campaign ID source", _CAMP_SRC_LABELS.get(_inst_cfg.campaign_id_source, _inst_cfg.campaign_id_source))
+    if _inst_cfg.missing_reasons:
+        st.warning(
+            "Instantly push not ready — " + ", ".join(_inst_cfg.missing_reasons)
+            + ".  API key must be set via the INSTANTLY_API_KEY environment "
+            "variable or Streamlit secret; campaign ID is set per workspace."
+        )
+    else:
+        st.caption(
+            "Instantly push is configured: API key from "
+            f"{_API_SRC_LABELS.get(_inst_cfg.api_key_source, _inst_cfg.api_key_source)}, "
+            f"campaign ID from {_CAMP_SRC_LABELS.get(_inst_cfg.campaign_id_source, _inst_cfg.campaign_id_source)}."
+        )
+
 with st.expander("Workspace foundation (read-only)", expanded=False):
     try:
         _ws = get_default_workspace()
@@ -225,11 +264,15 @@ with st.expander("Workspace management", expanded=False):
             help="Required. Used for engagement sync for this workspace.",
         )
         _new_api_key = st.text_input(
-            "Instantly API key (optional)",
-            placeholder="Leave blank to use the environment default",
+            "Instantly API key (optional — not used for Push)",
+            placeholder="Leave blank — Push uses INSTANTLY_API_KEY from env/secrets",
             key="ws_new_api_key",
             type="password",
-            help="Optional. If blank, falls back to the INSTANTLY_API_KEY env var.",
+            help=(
+                "Optional and NOT required. Push to Instantly always uses the "
+                "INSTANTLY_API_KEY environment variable / Streamlit secret, never "
+                "a per-workspace key. This field is retained only for other flows."
+            ),
         )
         _new_notes = st.text_area(
             "Notes (optional)",

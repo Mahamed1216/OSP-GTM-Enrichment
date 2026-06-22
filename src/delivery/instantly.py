@@ -31,6 +31,8 @@ SkipReason = Literal[
     "no_email_content",
     "unsafe_internal_review_content",
     "workspace_not_configured",
+    "missing_instantly_api_key",
+    "missing_instantly_campaign_id",
 ]
 
 
@@ -284,15 +286,21 @@ async def deliver_email(
         return await _record_skip(content_id, "email_invalid", lead_id, tier_snapshot, verify_status=verify.status)
 
     # All guards passed — build payload + send.
-    # Phase 6: resolve campaign_id and api_key from workspace.
-    # When an explicit workspace is selected, never fall back to the env/default
-    # account — a missing workspace config must skip, not send through the wrong
-    # campaign. workspace_id=None keeps the single-workspace env fallback.
-    from src.workspace import get_campaign_id_for_workspace, get_api_key_for_workspace
-    _allow_env_fallback = workspace_id is None
-    _campaign_id = get_campaign_id_for_workspace(workspace_id, allow_env_fallback=_allow_env_fallback)
-    _api_key = get_api_key_for_workspace(workspace_id, allow_env_fallback=_allow_env_fallback)
-    if workspace_id is not None and (not _campaign_id or not _api_key):
+    # Credentials: API key always from env/secrets/config (shared infra, never
+    # per-workspace); campaign id from the workspace. An explicitly-selected
+    # workspace never falls back to the env/default campaign (would send through
+    # the wrong account); workspace_id=None keeps the single-workspace env fallback.
+    from src.delivery.instantly_config import resolve_instantly_config
+    cfg = resolve_instantly_config(
+        workspace_id, allow_campaign_env_fallback=(workspace_id is None)
+    )
+    _campaign_id = cfg.campaign_id
+    _api_key = cfg.api_key
+    # Specific, non-leaky skip reasons (API key is global config; campaign is
+    # workspace routing). API-key check first so a key-less environment is clear.
+    if not _api_key:
+        return await _record_skip(content_id, "missing_instantly_api_key", lead_id, tier_snapshot)
+    if not _campaign_id:
         return await _record_skip(content_id, "workspace_not_configured", lead_id, tier_snapshot)
     with session_scope() as session:
         lead = session.get(Lead, lead_id)
@@ -500,19 +508,21 @@ async def overwrite_lead_copy(
     delivered_at/delivery_status on existing rows (so the engagement
     sync continues to be the source of truth for "actually sent").
     """
-    from src.workspace import get_api_key_for_workspace, get_campaign_id_for_workspace
+    from src.delivery.instantly_config import resolve_instantly_config
 
-    # When an explicit workspace is selected, never fall back to the env/default
-    # account — a missing workspace config must fail, not send through the wrong
-    # campaign. workspace_id=None keeps the single-workspace env fallback.
-    _allow_env_fallback = workspace_id is None
-    campaign_id = get_campaign_id_for_workspace(workspace_id, allow_env_fallback=_allow_env_fallback)
-    api_key = get_api_key_for_workspace(workspace_id, allow_env_fallback=_allow_env_fallback)
+    # API key from env/secrets/config (shared infra); campaign id from workspace.
+    # An explicitly-selected workspace never falls back to the env/default
+    # campaign; workspace_id=None keeps the single-workspace env fallback.
+    cfg = resolve_instantly_config(
+        workspace_id, allow_campaign_env_fallback=(workspace_id is None)
+    )
+    campaign_id = cfg.campaign_id
+    api_key = cfg.api_key
     if not api_key or not campaign_id:
         return OverwriteResult(
             lead_id=lead_id,
             status="failed",
-            detail="Instantly API key or campaign ID not configured for this workspace",
+            detail=", ".join(cfg.missing_reasons),
         )
 
     lead, content = _latest_email_content_for(lead_id)
@@ -705,12 +715,15 @@ async def debug_overwrite_one_lead(lead_id: int, *, workspace_id: int | None = N
 
     Always returns a dict (never raises). Caller renders it in the UI.
     """
-    from src.workspace import get_api_key_for_workspace, get_campaign_id_for_workspace
+    from src.delivery.instantly_config import resolve_instantly_config
 
-    # Explicit workspace → no env fallback (see overwrite_lead_copy).
-    _allow_env_fallback = workspace_id is None
-    campaign_id = get_campaign_id_for_workspace(workspace_id, allow_env_fallback=_allow_env_fallback)
-    api_key = get_api_key_for_workspace(workspace_id, allow_env_fallback=_allow_env_fallback)
+    # API key from env/secrets/config (shared infra); campaign id from workspace.
+    # Explicit workspace → no env campaign fallback (see overwrite_lead_copy).
+    cfg = resolve_instantly_config(
+        workspace_id, allow_campaign_env_fallback=(workspace_id is None)
+    )
+    campaign_id = cfg.campaign_id
+    api_key = cfg.api_key
 
     out: dict = {
         "local_lead_id": lead_id,
@@ -732,7 +745,7 @@ async def debug_overwrite_one_lead(lead_id: int, *, workspace_id: int | None = N
     }
 
     if not api_key or not campaign_id:
-        out["verdict"] = "Instantly API key or campaign ID not configured for this workspace"
+        out["verdict"] = ", ".join(cfg.missing_reasons)
         return out
 
     lead, content = _latest_email_content_for(lead_id)

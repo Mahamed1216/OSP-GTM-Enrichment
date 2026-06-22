@@ -89,6 +89,10 @@ def test_deliver_email_blocks_needs_review_content(monkeypatch):
 
 
 def test_deliver_email_sends_valid_content(monkeypatch):
+    # API key + campaign come from env/secret (shared infra) for the
+    # single-workspace (workspace_id=None) path.
+    monkeypatch.setenv("INSTANTLY_API_KEY", "test-key")
+    monkeypatch.setenv("INSTANTLY_CAMPAIGN_ID", "test-camp")
     lid = _seed_lead(None, "ok@example.com", body=VALID_BODY)
 
     async def fake_verify(_id, **k):
@@ -110,7 +114,8 @@ def test_deliver_email_sends_valid_content(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_overwrite_blocks_needs_review_content(monkeypatch):
-    ws = create_workspace("Safe One", "safe-one", "camp-1", instantly_api_key="key-1")
+    monkeypatch.setenv("INSTANTLY_API_KEY", "test-key")  # shared env/secret key
+    ws = create_workspace("Safe One", "safe-one", "camp-1")
     lid = _seed_lead(ws["id"], "nr2@example.com", body=NEEDS_REVIEW_BODY)
 
     called = {"hit": False}
@@ -130,7 +135,8 @@ def test_overwrite_blocks_needs_review_content(monkeypatch):
 
 
 def test_overwrite_proceeds_for_valid_content(monkeypatch):
-    ws = create_workspace("Safe Two", "safe-two", "camp-2", instantly_api_key="key-2")
+    monkeypatch.setenv("INSTANTLY_API_KEY", "test-key")  # shared env/secret key
+    ws = create_workspace("Safe Two", "safe-two", "camp-2")
     lid = _seed_lead(ws["id"], "ok2@example.com", body=VALID_BODY)
 
     async def fake_find(*a, **k):
