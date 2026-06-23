@@ -301,20 +301,29 @@ roles).
   (`<TASK_ROLE_ARN>`) — runtime AWS permissions for the container.
 - **CloudWatch log group** matching `<AWSLOGS_GROUP>` /
   `<AWSLOGS_STREAM_PREFIX>` in the task definition.
-- **Secrets / env vars** — fill in the `aws/ecs-task-definition-api.json`
-  placeholders. App secrets are referenced **by name** via `secrets[].valueFrom`
-  SSM parameters (e.g. `/osp-gtm/DATABASE_URL`); no secret values live in the
-  repo. Create them once, e.g.:
+- **Secrets / env vars** — app secrets are referenced **by SSM parameter name**
+  (not full ARNs) via `secrets[].valueFrom` in `aws/ecs-task-definition-api.json`
+  (e.g. `/osp-gtm/DATABASE_URL`); no secret values live in the repo. Using the
+  parameter **name** (rather than an ARN) makes ECS resolve each parameter in the
+  **task's own account and region**, which avoids the "Systems Manager parameter
+  ARN has a different account ID" registration error. The parameters must
+  therefore exist in **AWS account `802589444494`**, **region `us-east-2`** (the
+  account/region this service deploys to). Create them once, e.g.:
   ```bash
   aws ssm put-parameter --name /osp-gtm/DATABASE_URL --type SecureString \
     --value "<value>" --region us-east-2
   ```
+  Required parameter names: `/osp-gtm/DATABASE_URL`, `/osp-gtm/ANTHROPIC_API_KEY`,
+  `/osp-gtm/TAVILY_API_KEY`, `/osp-gtm/APIFY_API_TOKEN`, `/osp-gtm/INSTANTLY_API_KEY`,
+  `/osp-gtm/INSTANTLY_WEBHOOK_SECRET`, `/osp-gtm/LEAD_SOURCE_JOB_SECRET`,
+  `/osp-gtm/INTERNAL_API_KEY`. The task execution role needs
+  `ssm:GetParameters` on these (plus `kms:Decrypt` for `SecureString`).
   `SALESOS_INTEGRATION_MODE` is a non-secret config flag (defaults to `false`).
 
 ### First deploy flow
 
 ```
-edit aws/ecs-task-definition-api.json placeholders (roles, log group, SSM ARNs, account id)
+edit aws/ecs-task-definition-api.json placeholders (roles, log group)
   → create ECR repo + ECS cluster/service + roles + log group + SSM params (one time)
   → set GitHub secrets (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY [, AWS_REGION])
   → git push main
@@ -322,8 +331,11 @@ edit aws/ecs-task-definition-api.json placeholders (roles, log group, SSM ARNs, 
 ```
 
 > The placeholders in the task definition (`<EXECUTION_ROLE_ARN>`,
-> `<TASK_ROLE_ARN>`, `<AWS_ACCOUNT_ID>`, `<AWSLOGS_GROUP>`, `<AWSLOGS_REGION>`,
+> `<TASK_ROLE_ARN>`, `<AWSLOGS_GROUP>`, `<AWSLOGS_REGION>`,
 > `<AWSLOGS_STREAM_PREFIX>`) must be filled in before the first successful deploy.
+> The SSM secrets are referenced by parameter **name** (e.g. `/osp-gtm/DATABASE_URL`),
+> so no account id is needed in the task definition — but the parameters must
+> exist in account `802589444494` / `us-east-2`.
 
 ---
 
