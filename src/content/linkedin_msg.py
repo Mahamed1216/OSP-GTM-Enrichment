@@ -30,7 +30,14 @@ async def generate_linkedin_msg(
     *,
     regeneration_feedback: str | None = None,
     workspace_id: int | None = None,
-) -> LinkedInMessage:
+) -> LinkedInMessage | None:
+    # Defense-in-depth cost gate: skip cleanly when LinkedIn DM generation is
+    # disabled for the workspace — no LLM call, no placeholder/failed record.
+    from src.icp_config import is_content_type_enabled
+    if not is_content_type_enabled("linkedin_msg", workspace_id):
+        log.info("linkedin_msg_skipped_disabled", extra={"lead_id": lead_id, "workspace_id": workspace_id})
+        return None
+
     with session_scope() as session:
         lead = session.get(Lead, lead_id)
         if not lead:

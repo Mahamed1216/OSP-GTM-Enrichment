@@ -37,6 +37,17 @@ class LeadSourceConfig(BaseModel):
     auto_import_enabled: bool = False
     auto_process_enabled: bool = False
     schedule_frequency: str = "daily"   # "manual" | "hourly" | "daily"
+    # Signal-first trigger/poll flow. OFF by default so the normal contacts-
+    # polling path is unchanged. When ON, a scheduled run first POSTs a sourcing
+    # run, polls it to completion, then pulls contacts.  POST /runs is NEVER
+    # called unless this is explicitly true.
+    trigger_run_before_import: bool = False
+    run_poll_interval_seconds: int = 10   # seconds between GET /runs/{id} polls
+    run_max_wait_seconds: int = 600       # hard cap before a run is declared timed-out
+    # Last triggered-run bookkeeping (for UI + audit). NULL until the first run.
+    last_run_id: Optional[str] = None
+    last_run_status: Optional[str] = None     # completed | failed | timeout | error
+    last_run_error: Optional[str] = None
     last_auto_run_at: Optional[str] = None
     last_auto_run_status: Optional[str] = None
     last_auto_run_created: Optional[int] = None
@@ -139,6 +150,28 @@ def update_auto_run_metadata(
     except Exception as exc:
         log.warning(
             "update_auto_run_metadata_failed",
+            extra={"workspace_id": workspace_id, "error": str(exc)},
+        )
+
+
+def update_run_metadata(
+    workspace_id: int,
+    *,
+    run_id: Optional[str],
+    status: Optional[str],
+    error: Optional[str] = None,
+) -> None:
+    """Persist last_run_* fields after a trigger/poll cycle without touching
+    other settings. Best-effort: never raises."""
+    try:
+        cfg = load_lead_source_config(workspace_id)
+        cfg.last_run_id = run_id
+        cfg.last_run_status = status
+        cfg.last_run_error = (error or None)
+        save_lead_source_config(cfg, workspace_id)
+    except Exception as exc:
+        log.warning(
+            "update_run_metadata_failed",
             extra={"workspace_id": workspace_id, "error": str(exc)},
         )
 

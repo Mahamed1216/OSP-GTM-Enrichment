@@ -17,6 +17,7 @@ from sqlalchemy import select
 
 from src.config import settings
 from src.db import session_scope
+from src.delivery.eligibility import is_unsafe_internal_content
 from src.delivery.verify_email import verify_email
 from src.models import GeneratedContent, Lead, Score, now_utc
 from src.retry import retry_api
@@ -28,7 +29,12 @@ SkipReason = Literal[
     "already_delivered",
     "email_invalid",
     "no_email_content",
+    "unsafe_internal_review_content",
     "workspace_not_configured",
+    "missing_instantly_api_key",
+    "missing_instantly_campaign_id",
+    # SalesOS integration mode only — a CSM approval is required before any send.
+    "missing_salesos_csm_approval",
 ]
 
 
@@ -252,6 +258,8 @@ async def deliver_email(
         # expires attributes; later access would raise DetachedInstanceError).
         lead_email = lead.email
         content_id = content.id if content else None
+        content_subject = content.subject if content else None
+        content_body = content.body if content else None
         tier_snapshot: str | None = score.tier if score else None
         already_delivered_flag = already_delivered is not None
         has_content = content is not None
@@ -268,21 +276,42 @@ async def deliver_email(
     if not has_content:
         return await _record_skip(None, "no_email_content", lead_id, tier_snapshot)
 
+    # Guard 3b: content safety — never send internal review / placeholder text
+    # (e.g. the "NEEDS REVIEW: ..." buyer-research marker). Runs before the
+    # verification API call and before any send.
+    if is_unsafe_internal_content(content_subject, content_body):
+        return await _record_skip(content_id, "unsafe_internal_review_content", lead_id, tier_snapshot)
+
     # Guard 4: email verification
     verify = await verify_email(lead_id)
     if not _accept_verification(verify.status, strict=strict_verification):
         return await _record_skip(content_id, "email_invalid", lead_id, tier_snapshot, verify_status=verify.status)
 
+    # Guard 5: SalesOS CSM approval (integration mode only). Runs LAST — tier
+    # alone is never enough in integration mode. Standalone mode is unchanged.
+    if settings.salesos_integration_mode:
+        from src.integrations.salesos.approvals import is_engine_content_approved
+        if not is_engine_content_approved(content_id):
+            return await _record_skip(
+                content_id, "missing_salesos_csm_approval", lead_id, tier_snapshot
+            )
+
     # All guards passed — build payload + send.
-    # Phase 6: resolve campaign_id and api_key from workspace.
-    # When an explicit workspace is selected, never fall back to the env/default
-    # account — a missing workspace config must skip, not send through the wrong
-    # campaign. workspace_id=None keeps the single-workspace env fallback.
-    from src.workspace import get_campaign_id_for_workspace, get_api_key_for_workspace
-    _allow_env_fallback = workspace_id is None
-    _campaign_id = get_campaign_id_for_workspace(workspace_id, allow_env_fallback=_allow_env_fallback)
-    _api_key = get_api_key_for_workspace(workspace_id, allow_env_fallback=_allow_env_fallback)
-    if workspace_id is not None and (not _campaign_id or not _api_key):
+    # Credentials: API key always from env/secrets/config (shared infra, never
+    # per-workspace); campaign id from the workspace. An explicitly-selected
+    # workspace never falls back to the env/default campaign (would send through
+    # the wrong account); workspace_id=None keeps the single-workspace env fallback.
+    from src.delivery.instantly_config import resolve_instantly_config
+    cfg = resolve_instantly_config(
+        workspace_id, allow_campaign_env_fallback=(workspace_id is None)
+    )
+    _campaign_id = cfg.campaign_id
+    _api_key = cfg.api_key
+    # Specific, non-leaky skip reasons (API key is global config; campaign is
+    # workspace routing). API-key check first so a key-less environment is clear.
+    if not _api_key:
+        return await _record_skip(content_id, "missing_instantly_api_key", lead_id, tier_snapshot)
+    if not _campaign_id:
         return await _record_skip(content_id, "workspace_not_configured", lead_id, tier_snapshot)
     with session_scope() as session:
         lead = session.get(Lead, lead_id)
@@ -490,19 +519,21 @@ async def overwrite_lead_copy(
     delivered_at/delivery_status on existing rows (so the engagement
     sync continues to be the source of truth for "actually sent").
     """
-    from src.workspace import get_api_key_for_workspace, get_campaign_id_for_workspace
+    from src.delivery.instantly_config import resolve_instantly_config
 
-    # When an explicit workspace is selected, never fall back to the env/default
-    # account — a missing workspace config must fail, not send through the wrong
-    # campaign. workspace_id=None keeps the single-workspace env fallback.
-    _allow_env_fallback = workspace_id is None
-    campaign_id = get_campaign_id_for_workspace(workspace_id, allow_env_fallback=_allow_env_fallback)
-    api_key = get_api_key_for_workspace(workspace_id, allow_env_fallback=_allow_env_fallback)
+    # API key from env/secrets/config (shared infra); campaign id from workspace.
+    # An explicitly-selected workspace never falls back to the env/default
+    # campaign; workspace_id=None keeps the single-workspace env fallback.
+    cfg = resolve_instantly_config(
+        workspace_id, allow_campaign_env_fallback=(workspace_id is None)
+    )
+    campaign_id = cfg.campaign_id
+    api_key = cfg.api_key
     if not api_key or not campaign_id:
         return OverwriteResult(
             lead_id=lead_id,
             status="failed",
-            detail="Instantly API key or campaign ID not configured for this workspace",
+            detail=", ".join(cfg.missing_reasons),
         )
 
     lead, content = _latest_email_content_for(lead_id)
@@ -512,6 +543,17 @@ async def overwrite_lead_copy(
         return OverwriteResult(lead_id=lead_id, status="skipped", detail="lead has no email")
     if content is None or not (content.body or "").strip():
         return OverwriteResult(lead_id=lead_id, status="skipped", detail="no email content generated")
+
+    # Hard content-safety gate: never overwrite/push internal review or
+    # placeholder text (e.g. the "NEEDS REVIEW: ..." marker). Returns BEFORE
+    # any Instantly lookup/PATCH/POST, so existing valid Instantly copy is
+    # never clobbered with internal text.
+    if is_unsafe_internal_content(content.subject, content.body):
+        return OverwriteResult(
+            lead_id=lead_id,
+            status="skipped",
+            detail="unsafe_internal_review_content: content needs review/regeneration",
+        )
 
     expected_subject = content.subject or ""
     expected_body = content.body
@@ -684,12 +726,15 @@ async def debug_overwrite_one_lead(lead_id: int, *, workspace_id: int | None = N
 
     Always returns a dict (never raises). Caller renders it in the UI.
     """
-    from src.workspace import get_api_key_for_workspace, get_campaign_id_for_workspace
+    from src.delivery.instantly_config import resolve_instantly_config
 
-    # Explicit workspace → no env fallback (see overwrite_lead_copy).
-    _allow_env_fallback = workspace_id is None
-    campaign_id = get_campaign_id_for_workspace(workspace_id, allow_env_fallback=_allow_env_fallback)
-    api_key = get_api_key_for_workspace(workspace_id, allow_env_fallback=_allow_env_fallback)
+    # API key from env/secrets/config (shared infra); campaign id from workspace.
+    # Explicit workspace → no env campaign fallback (see overwrite_lead_copy).
+    cfg = resolve_instantly_config(
+        workspace_id, allow_campaign_env_fallback=(workspace_id is None)
+    )
+    campaign_id = cfg.campaign_id
+    api_key = cfg.api_key
 
     out: dict = {
         "local_lead_id": lead_id,
@@ -711,7 +756,7 @@ async def debug_overwrite_one_lead(lead_id: int, *, workspace_id: int | None = N
     }
 
     if not api_key or not campaign_id:
-        out["verdict"] = "Instantly API key or campaign ID not configured for this workspace"
+        out["verdict"] = ", ".join(cfg.missing_reasons)
         return out
 
     lead, content = _latest_email_content_for(lead_id)
@@ -721,6 +766,18 @@ async def debug_overwrite_one_lead(lead_id: int, *, workspace_id: int | None = N
     if content is None:
         out["verdict"] = "no email content generated locally for this lead"
         out["local_email"] = lead.email
+        return out
+
+    # Content-safety gate: the diagnostic PATCHes Instantly with this content,
+    # so it must also refuse internal review / placeholder text before any push.
+    if is_unsafe_internal_content(content.subject, content.body):
+        out["local_email"] = lead.email
+        out["local_latest_subject"] = content.subject
+        out["local_latest_body"] = content.body or ""
+        out["verdict"] = (
+            "unsafe_internal_review_content: content needs review/regeneration — "
+            "refusing to push internal text to Instantly."
+        )
         return out
 
     out["local_email"] = lead.email

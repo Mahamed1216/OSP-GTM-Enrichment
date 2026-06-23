@@ -13,7 +13,10 @@ background jobs. Use one of:
 Hard constraints (never relaxed):
   - No emails are auto-sent.
   - No Instantly push.
-  - POST /api/v1/clients/{slug}/runs is never called.
+  - POST /api/v1/clients/{slug}/runs is called ONLY when the workspace
+    explicitly sets trigger_run_before_import=true. It is never called on the
+    default contacts-polling path. A failed/timeout/errored run blocks the
+    import (no silent import).
   - Only enabled workspaces are touched.
   - Dedup prevents re-importing existing contacts.
   - Content generation is idempotent — skips leads that already have content.
@@ -58,6 +61,7 @@ async def _generate_content_one(lead_id: int, workspace_id: int) -> int:
     from src.content.email import generate_email
     from src.content.call_script import generate_call_script
     from src.content.linkedin_msg import generate_linkedin_msg
+    from src.icp_config import is_content_type_enabled
 
     generated = 0
     for fn, name in [
@@ -65,6 +69,13 @@ async def _generate_content_one(lead_id: int, workspace_id: int) -> int:
         (generate_call_script, "call_script"),
         (generate_linkedin_msg, "linkedin_msg"),
     ]:
+        # Content-type cost gate. Call scripts + LinkedIn DMs default OFF.
+        if not is_content_type_enabled(name, workspace_id):
+            log.info(
+                "auto_content_skipped_disabled",
+                extra={"lead_id": lead_id, "workspace_id": workspace_id, "kind": name},
+            )
+            continue
         try:
             await fn(lead_id, workspace_id=workspace_id)
             generated += 1
@@ -103,16 +114,21 @@ async def process_imported_leads(
     Processing order per lead:
       1. Enrichment + buyer research (via enrich_lead waterfall) — idempotent:
          skipped if the lead already has an Enrichment row.
-      2. Scoring.
-      3. Content generation — idempotent: each generator skips if content exists.
+      2. Hiring-signal enrichment — idempotent: skipped if a signal exists.
+         Runs BEFORE scoring so the deterministic tier uplift is in effect
+         when the lead is scored.
+      3. Scoring (applies the hiring tier uplift).
+      4. Content generation — idempotent: each generator skips if content exists.
 
     Returns counts for logging/display.
     """
     from src.enrichment.waterfall import enrich_lead
     from src.lead_source.ingest import _update_import_log_processing
+    from src.signals.hiring import enrich_hiring_signal
 
     enriched = 0
     enrichment_skipped = 0
+    hiring_signals = 0
     scored = 0
     content = 0
 
@@ -131,11 +147,22 @@ async def process_imported_leads(
                     extra={"lead_id": lead_id, "workspace_id": workspace_id, "error": str(exc)},
                 )
 
-        # 2. Score
+        # 2. Hiring-signal enrichment (before scoring). Graceful: never raises.
+        try:
+            outcome = await enrich_hiring_signal(lead_id, workspace_id=workspace_id)
+            if not outcome.get("skipped") and not outcome.get("error"):
+                hiring_signals += 1
+        except Exception as exc:
+            log.warning(
+                "auto_hiring_signal_failed",
+                extra={"lead_id": lead_id, "workspace_id": workspace_id, "error": str(exc)},
+            )
+
+        # 3. Score (applies hiring uplift)
         if await _score_one(lead_id, workspace_id):
             scored += 1
 
-        # 3. Content
+        # 4. Content
         content += await _generate_content_one(lead_id, workspace_id)
 
     log.info(
@@ -145,6 +172,7 @@ async def process_imported_leads(
             "lead_count": len(lead_ids),
             "enriched": enriched,
             "enrichment_skipped": enrichment_skipped,
+            "hiring_signals": hiring_signals,
             "scored": scored,
             "content": content,
         },
@@ -161,6 +189,7 @@ async def process_imported_leads(
     return {
         "enriched_count": enriched,
         "enrichment_skipped_count": enrichment_skipped,
+        "hiring_signal_count": hiring_signals,
         "scored_count": scored,
         "content_generated_count": content,
     }
@@ -182,6 +211,7 @@ async def run_workspace_auto_import(
     from src.lead_source.settings import (
         load_lead_source_config,
         update_auto_run_metadata,
+        update_run_metadata,
         advance_import_cursor,
     )
     from src.lead_source.ingest import run_import
@@ -221,11 +251,64 @@ async def run_workspace_auto_import(
         "content_generated_count": 0,
         "enrichment_skipped_count": 0,
         "next_offset": current_offset,
+        # Signal-first trigger/poll flow bookkeeping.
+        "triggered_run": cfg.trigger_run_before_import,
+        "triggered_run_id": None,
+        "triggered_run_status": None,
     }
 
     if dry_run:
         log.info("scheduler_dry_run", extra={"workspace_id": workspace_id})
         return summary
+
+    # --- Optional: trigger a sourcing run and poll it to completion BEFORE
+    # importing. Only when the workspace explicitly enables it. A run that
+    # fails / times out / errors blocks the import — never import silently.
+    triggered_run_id: str | None = None
+    triggered_run_status: str | None = None
+    if cfg.trigger_run_before_import:
+        from src.lead_source.client import LeadSourceClient
+        from src.lead_source.runs import trigger_and_poll_run
+
+        client = LeadSourceClient(cfg.api_base_url, cfg.api_key)
+        run_outcome = trigger_and_poll_run(
+            client,
+            cfg.client_slug,
+            poll_interval_seconds=cfg.run_poll_interval_seconds,
+            max_wait_seconds=cfg.run_max_wait_seconds,
+        )
+        triggered_run_id = run_outcome.run_id
+        triggered_run_status = run_outcome.status
+        summary["triggered_run_id"] = run_outcome.run_id
+        summary["triggered_run_status"] = run_outcome.status
+
+        update_run_metadata(
+            workspace_id,
+            run_id=run_outcome.run_id,
+            status=run_outcome.status,
+            error=run_outcome.error,
+        )
+
+        if not run_outcome.completed:
+            # Failed / timeout / error — DO NOT import.
+            summary["skipped"] = True
+            summary["reason"] = f"run_{run_outcome.status}"
+            summary["error_detail"] = run_outcome.error
+            log.warning(
+                "scheduler_run_not_completed",
+                extra={
+                    "workspace_id": workspace_id,
+                    "run_id": run_outcome.run_id,
+                    "run_status": run_outcome.status,
+                    "error": run_outcome.error,
+                },
+            )
+            update_auto_run_metadata(
+                workspace_id,
+                status=f"run_{run_outcome.status}",
+                created=0, scored=0, content=0, fetched=0, skipped=0,
+            )
+            return summary
 
     try:
         import_result = run_import(
@@ -239,6 +322,8 @@ async def run_workspace_auto_import(
             include_suppressed=cfg.include_suppressed,
             auto_run=True,
             initial_offset=current_offset,
+            triggered_run_id=triggered_run_id,
+            triggered_run_status=triggered_run_status,
         )
         summary["fetched"] = import_result.fetched
         summary["created"] = import_result.created

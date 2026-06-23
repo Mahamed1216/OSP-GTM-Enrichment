@@ -76,6 +76,43 @@ async def _phase_enrich(
             _emit(on_update, PhaseUpdate("enrichment", lid, idx, total, False, str(exc)))
 
 
+async def _phase_hiring_signal(
+    lead_ids: list[int],
+    on_update: Callable[[PhaseUpdate], None] | None,
+    *,
+    force_refresh: bool = False,
+    workspace_id: int | None = None,
+) -> None:
+    """Hiring-signal enrichment phase (runs BEFORE scoring).
+
+    Idempotent: skips a lead that already has a signal unless force_refresh.
+    Never raises — enrich_hiring_signal returns a status dict and records
+    failures itself; any unexpected error still surfaces as PhaseUpdate(ok).
+    """
+    from src.signals.hiring import enrich_hiring_signal
+
+    total = len(lead_ids)
+    for idx, lid in enumerate(lead_ids, start=1):
+        try:
+            outcome = await enrich_hiring_signal(
+                lid, workspace_id=workspace_id, force=force_refresh,
+            )
+            status = outcome.get("status") or ("skipped" if outcome.get("skipped") else "completed")
+            ok = status != "failed"
+            _emit(on_update, PhaseUpdate(
+                "hiring_signal", lid, idx, total, ok,
+                error=outcome.get("error"),
+                payload={
+                    "status": status,
+                    "skipped": bool(outcome.get("skipped")),
+                    "strength": outcome.get("strength"),
+                    "found": outcome.get("found"),
+                },
+            ))
+        except Exception as exc:
+            _emit(on_update, PhaseUpdate("hiring_signal", lid, idx, total, False, str(exc)))
+
+
 async def _phase_score(
     lead_ids: list[int],
     on_update: Callable[[PhaseUpdate], None] | None,
@@ -188,38 +225,51 @@ async def _phase_content(
         get_content_lead_ids(lead_ids, "linkedin_msg")
         if run_linkedin_msg and not force_refresh else set()
     )
+    # Workspace content-type cost gates, computed once for the batch. Call
+    # scripts + LinkedIn DMs default OFF; a disabled kind is never generated.
+    from src.icp_config import is_content_type_enabled
+    enabled_kind = {
+        "email": is_content_type_enabled("email", workspace_id),
+        "call_script": is_content_type_enabled("call_script", workspace_id),
+        "linkedin_msg": is_content_type_enabled("linkedin_msg", workspace_id),
+    }
+
     for idx, lid in enumerate(lead_ids, start=1):
         # Track which kinds we'll actually generate so we can wire supersede
         # pointers and report per-kind status after the gather.
         kinds_to_run: list[str] = []
         skipped_kinds: list[str] = []
+        disabled_kinds: list[str] = []
         if not run_email:
             skipped_kinds.append("email")
+        elif not enabled_kind["email"]:
+            disabled_kinds.append("email")
         elif lid in already_email:
             skipped_kinds.append("email")
         else:
             kinds_to_run.append("email")
         if not run_call_script:
             skipped_kinds.append("call_script")
+        elif not enabled_kind["call_script"]:
+            disabled_kinds.append("call_script")
         elif lid in already_call:
             skipped_kinds.append("call_script")
         else:
             kinds_to_run.append("call_script")
         if not run_linkedin_msg:
             skipped_kinds.append("linkedin_msg")
+        elif not enabled_kind["linkedin_msg"]:
+            disabled_kinds.append("linkedin_msg")
         elif lid in already_li:
             skipped_kinds.append("linkedin_msg")
         else:
             kinds_to_run.append("linkedin_msg")
 
         if not kinds_to_run:
-            _emit(
-                on_update,
-                PhaseUpdate(
-                    "content", lid, idx, total, True,
-                    payload={"skipped": True, "reason": "all kinds already complete"},
-                ),
-            )
+            payload: dict[str, Any] = {"skipped": True, "reason": "all kinds already complete"}
+            if disabled_kinds:
+                payload["disabled_kinds"] = disabled_kinds
+            _emit(on_update, PhaseUpdate("content", lid, idx, total, True, payload=payload))
             continue
 
         tasks = [_KIND_GENERATOR[k](lid, workspace_id=workspace_id) for k in kinds_to_run]
@@ -256,11 +306,13 @@ async def _phase_content(
         err_msg = (
             "; ".join(f"{type(e).__name__}: {e}" for e in errors) if errors else None
         )
-        payload: dict[str, Any] = {}
+        payload = {}
         if regenerated_kinds:
             payload["regenerated_kinds"] = regenerated_kinds
         if skipped_kinds:
             payload["skipped_kinds"] = skipped_kinds
+        if disabled_kinds:
+            payload["disabled_kinds"] = disabled_kinds
         if failed_kinds:
             payload["failed_kinds"] = failed_kinds
         if force_refresh:
@@ -541,6 +593,7 @@ def process_single_lead(
     *,
     dry_run: bool,
     run_enrichment: bool = True,
+    run_hiring_signal: bool = True,
     run_scoring: bool = True,
     run_email: bool = True,
     run_call_script: bool = True,
@@ -549,7 +602,7 @@ def process_single_lead(
     on_update: Callable[[PhaseUpdate], None] | None = None,
     workspace_id: int | None = None,
 ) -> None:
-    """Run enrich → score → content → deliver for a single lead, in order.
+    """Run enrich → hiring → score → content → deliver for a single lead, in order.
 
     Each phase is gated by its own flag. The three content kinds (email,
     call script, LinkedIn DM) are each individually gated. Eligibility
@@ -557,12 +610,18 @@ def process_single_lead(
     is gated on ``run_email`` — only the email kind feeds the Instantly
     deliver step, so if email isn't generated there's nothing to deliver.
 
+    Hiring-signal enrichment runs BEFORE scoring so any tier uplift is in
+    effect when the lead is scored (matters most for C-tier rescue).
+
     Per-phase errors are surfaced via ``on_update`` (when provided) by the
     underlying ``_phase_*`` coroutines. This function itself does not raise
     — caller can rely on it returning even if a phase failed for this lead.
     """
     if run_enrichment:
         run_async(_phase_enrich([lead_id], on_update, force_refresh=force_refresh, workspace_id=workspace_id))
+
+    if run_hiring_signal:
+        run_async(_phase_hiring_signal([lead_id], on_update, force_refresh=force_refresh, workspace_id=workspace_id))
 
     if run_scoring:
         run_async(_phase_score([lead_id], on_update, force_refresh=force_refresh, workspace_id=workspace_id))
@@ -591,6 +650,7 @@ def run_phased_pipeline(
     dry_run: bool,
     on_update: Callable[[PhaseUpdate], None] | None = None,
     run_enrichment: bool = True,
+    run_hiring_signal: bool = True,
     run_scoring: bool = True,
     run_email: bool = True,
     run_call_script: bool = True,
@@ -620,6 +680,7 @@ def run_phased_pipeline(
             lid,
             dry_run=dry_run,
             run_enrichment=run_enrichment,
+            run_hiring_signal=run_hiring_signal,
             run_scoring=run_scoring,
             run_email=run_email,
             run_call_script=run_call_script,

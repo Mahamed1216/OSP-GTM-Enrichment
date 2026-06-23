@@ -98,6 +98,11 @@ def test_deliver_email_persists_sent_status_on_success(file_db, monkeypatch):
     from src.delivery import instantly as inst
     from src.delivery.verify_email import VerifyResult
 
+    # API key + campaign resolve from env/secret (shared infra) for the
+    # single-workspace (workspace_id=None) delivery path.
+    monkeypatch.setenv("INSTANTLY_API_KEY", "test-key")
+    monkeypatch.setenv("INSTANTLY_CAMPAIGN_ID", "test-camp")
+
     with session_scope() as session:
         lead_id = _seed_eligible_lead(session)
 
@@ -139,6 +144,9 @@ def test_deliver_email_persists_error_status_on_http_failure(file_db, monkeypatc
     from src.db import session_scope
     from src.delivery import instantly as inst
     from src.delivery.verify_email import VerifyResult
+
+    monkeypatch.setenv("INSTANTLY_API_KEY", "test-key")
+    monkeypatch.setenv("INSTANTLY_CAMPAIGN_ID", "test-camp")
 
     with session_scope() as session:
         lead_id = _seed_eligible_lead(session)

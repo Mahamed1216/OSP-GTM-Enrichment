@@ -22,6 +22,7 @@ import streamlit as st
 
 from app.lib.workspace_state import get_current_workspace, get_current_workspace_id, render_workspace_banner, set_current_workspace
 from app.styles import inject_styles
+from src.delivery.instantly_config import build_instantly_diagnostic, resolve_instantly_config
 from src.workspace import (
     backfill_osp_icp_config,
     create_workspace,
@@ -140,6 +141,67 @@ if _selected_ws:
     sd3.metric("Active", "Yes" if _selected_ws.get("is_active") else "No")
     sd4.metric("Default", "Yes" if _selected_ws.get("is_default") else "No")
 
+    # --- Instantly push configuration (what the Push-to-Instantly flow uses) ---
+    # API key = shared env/Streamlit secret (never per-workspace); campaign id =
+    # this workspace's value (env fallback only when no workspace is selected).
+    _inst_cfg = resolve_instantly_config(
+        _selected_ws_id, allow_campaign_env_fallback=(_selected_ws_id is None)
+    )
+    _API_SRC_LABELS = {
+        "env": "Environment (INSTANTLY_API_KEY)",
+        "streamlit_secrets": "Streamlit secrets",
+        "config": "App config (.env)",
+        "missing": "Missing",
+    }
+    _CAMP_SRC_LABELS = {
+        "workspace_column": "Workspace",
+        "workspace_config": "Workspace config",
+        "env": "Environment (INSTANTLY_CAMPAIGN_ID)",
+        "streamlit_secrets": "Streamlit secrets",
+        "missing": "Missing",
+    }
+    st.markdown("**Instantly push configuration**")
+    ic1, ic2, ic3, ic4 = st.columns(4)
+    ic1.metric("API key configured", "Yes" if _inst_cfg.api_key else "No")
+    ic2.metric("API key source", _API_SRC_LABELS.get(_inst_cfg.api_key_source, _inst_cfg.api_key_source))
+    ic3.metric("Campaign ID configured", "Yes" if _inst_cfg.campaign_id else "No")
+    ic4.metric("Campaign ID source", _CAMP_SRC_LABELS.get(_inst_cfg.campaign_id_source, _inst_cfg.campaign_id_source))
+    if _inst_cfg.missing_reasons:
+        st.warning(
+            "Instantly push not ready — " + ", ".join(_inst_cfg.missing_reasons)
+            + ".  API key must be set via the INSTANTLY_API_KEY environment "
+            "variable or Streamlit secret; campaign ID is set per workspace."
+        )
+    else:
+        st.caption(
+            "Instantly push is configured: API key from "
+            f"{_API_SRC_LABELS.get(_inst_cfg.api_key_source, _inst_cfg.api_key_source)}, "
+            f"campaign ID from {_CAMP_SRC_LABELS.get(_inst_cfg.campaign_id_source, _inst_cfg.campaign_id_source)}."
+        )
+
+    # --- Temporary runtime diagnostic: which runtime/source exposes creds? ---
+    # Booleans + masked prefix only — the full API key is never shown/logged.
+    with st.expander("Instantly runtime diagnostic (temporary)", expanded=bool(_inst_cfg.missing_reasons)):
+        _diag = build_instantly_diagnostic(
+            _selected_ws_id, allow_campaign_env_fallback=(_selected_ws_id is None)
+        )
+        dg1, dg2 = st.columns(2)
+        with dg1:
+            st.markdown(f"**workspace_id:** `{_diag['workspace_id']}`")
+            st.markdown(f"**workspace_slug:** `{_diag['workspace_slug']}`")
+            st.markdown(f"**api_key_found:** {'yes' if _diag['api_key_found'] else 'no'}")
+            st.markdown(f"**api_key_source:** `{_diag['api_key_source']}`")
+            st.markdown(f"**api_key (masked):** `{_diag['api_key_masked']}`")
+        with dg2:
+            st.markdown(f"**campaign_id_found:** {'yes' if _diag['campaign_id_found'] else 'no'}")
+            st.markdown(f"**campaign_id_source:** `{_diag['campaign_id_source']}`")
+            st.markdown(
+                "**missing_reasons:** "
+                + (", ".join(_diag["missing_reasons"]) if _diag["missing_reasons"] else "none")
+            )
+        st.markdown("**Per-source probes** (presence only — values never shown):")
+        st.json(_diag["probes"])
+
 with st.expander("Workspace foundation (read-only)", expanded=False):
     try:
         _ws = get_default_workspace()
@@ -225,11 +287,15 @@ with st.expander("Workspace management", expanded=False):
             help="Required. Used for engagement sync for this workspace.",
         )
         _new_api_key = st.text_input(
-            "Instantly API key (optional)",
-            placeholder="Leave blank to use the environment default",
+            "Instantly API key (optional — not used for Push)",
+            placeholder="Leave blank — Push uses INSTANTLY_API_KEY from env/secrets",
             key="ws_new_api_key",
             type="password",
-            help="Optional. If blank, falls back to the INSTANTLY_API_KEY env var.",
+            help=(
+                "Optional and NOT required. Push to Instantly always uses the "
+                "INSTANTLY_API_KEY environment variable / Streamlit secret, never "
+                "a per-workspace key. This field is retained only for other flows."
+            ),
         )
         _new_notes = st.text_area(
             "Notes (optional)",
@@ -714,6 +780,70 @@ with st.expander("News search terms (Tavily queries)", expanded=False):
         )
         save_news = st.form_submit_button("Save news terms", type="primary")
 
+# ---------- Buyer research ----------
+with st.expander("Buyer research", expanded=False):
+    with st.form("settings_buyer_research_form", clear_on_submit=False):
+        buyer_news_window = st.number_input(
+            "Buyer research news window days",
+            min_value=1,
+            max_value=365,
+            value=int(cfg.buyer_research_news_window_days or 90),
+            step=15,
+            key="s_buyer_news_window",
+            help=(
+                "Buyer research will search for relevant company signals within "
+                "this many days. Higher values may find more relevant but less "
+                "fresh signals."
+            ),
+        )
+        st.caption("Crawl and extract improve research quality but may use more Tavily credits.")
+        buyer_use_research = st.checkbox(
+            "Use Tavily Research for company research",
+            value=cfg.buyer_research_use_research,
+            key="s_buyer_use_research",
+            help=(
+                "Uses Tavily's research agent for deeper company research. "
+                "This is expensive. Leave off unless needed."
+            ),
+        )
+        buyer_use_crawl = st.checkbox(
+            "Use Tavily company crawl for buyer research",
+            value=cfg.buyer_research_use_crawl,
+            key="s_buyer_use_crawl",
+        )
+        buyer_use_extract = st.checkbox(
+            "Use Tavily extract for top URLs",
+            value=cfg.buyer_research_use_extract,
+            key="s_buyer_use_extract",
+        )
+        save_buyer_research = st.form_submit_button("Save buyer research", type="primary")
+
+# ---------- Content generation types ----------
+with st.expander("Content generation types", expanded=True):
+    with st.form("settings_content_types_form", clear_on_submit=False):
+        st.caption(
+            "Turning off call scripts and LinkedIn DMs reduces LLM cost. "
+            "Only checked types are generated; unchecked types are skipped "
+            "cleanly (no LLM call, no placeholder record). Existing saved "
+            "content is never deleted."
+        )
+        gen_email = st.checkbox(
+            "Generate emails",
+            value=cfg.generate_email_enabled,
+            key="s_gen_email",
+        )
+        gen_call = st.checkbox(
+            "Generate call scripts",
+            value=cfg.generate_call_script_enabled,
+            key="s_gen_call_script",
+        )
+        gen_dm = st.checkbox(
+            "Generate LinkedIn DMs",
+            value=cfg.generate_linkedin_dm_enabled,
+            key="s_gen_linkedin_dm",
+        )
+        save_content_types = st.form_submit_button("Save content types", type="primary")
+
 # ---------- Demo / testing ----------
 with st.expander("Demo / testing", expanded=False):
     with st.form("settings_demo_form", clear_on_submit=False):
@@ -781,6 +911,19 @@ if save_signals:
 if save_news:
     cfg.news_search_terms = _lines(news_search_terms)
     _persist(cfg, "News search terms")
+
+if save_buyer_research:
+    cfg.buyer_research_news_window_days = int(buyer_news_window)
+    cfg.buyer_research_use_research = bool(buyer_use_research)
+    cfg.buyer_research_use_crawl = bool(buyer_use_crawl)
+    cfg.buyer_research_use_extract = bool(buyer_use_extract)
+    _persist(cfg, "Buyer research")
+
+if save_content_types:
+    cfg.generate_email_enabled = bool(gen_email)
+    cfg.generate_call_script_enabled = bool(gen_call)
+    cfg.generate_linkedin_dm_enabled = bool(gen_dm)
+    _persist(cfg, "Content generation types")
 
 if save_demo:
     cfg.generate_content_for_all_tiers = bool(generate_for_all)

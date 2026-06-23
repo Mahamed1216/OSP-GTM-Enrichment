@@ -359,10 +359,23 @@ else:
             cols[1].metric("Created", imp["created_count"])
             cols[2].metric("Updated", imp["updated_count"])
             cols[3].metric("Skipped", imp["skipped_count"])
+            _summary = imp.get("raw_summary") or {}
+            # Source-signal + email-verification breakdown from the import.
+            scols = st.columns(4)
+            scols[0].metric("With source signals", _summary.get("with_source_signals", 0))
+            scols[1].metric("Without source signals", _summary.get("without_source_signals", 0))
+            scols[2].metric("Verified emails", _summary.get("verified_email_count", 0))
+            scols[3].metric("Unverified emails", _summary.get("unverified_email_count", 0))
+            # Signal-first trigger/poll flow: show the run that produced this import.
+            if imp.get("triggered_run_id") or imp.get("triggered_run_status"):
+                tcols = st.columns(3)
+                tcols[0].metric("Triggered run id", imp.get("triggered_run_id") or "—")
+                tcols[1].metric("Run status", imp.get("triggered_run_status") or "—")
+                tcols[2].metric("Total source signals", imp.get("source_signal_count", 0))
             if imp.get("error_message"):
                 st.error(imp["error_message"])
-            if imp.get("raw_summary", {}) and imp["raw_summary"].get("skip_reasons"):
-                st.caption("Skip reasons: " + str(imp["raw_summary"]["skip_reasons"]))
+            if _summary.get("skip_reasons"):
+                st.caption("Skip reasons: " + str(_summary["skip_reasons"]))
 
 st.divider()
 
@@ -395,6 +408,32 @@ with st.form("automation_settings_form"):
             cfg.schedule_frequency if cfg.schedule_frequency in ("manual", "daily", "hourly") else "daily"
         ),
     )
+
+    st.markdown("**Trigger a sourcing run before importing** (signal-first flow)")
+    st.caption(
+        "When enabled, a scheduled run first POSTs a sourcing run to the source "
+        "system, polls it to completion, then pulls the resulting contacts. "
+        "Leave OFF to keep the normal contacts-polling behavior. "
+        "POST /runs is never called unless this is enabled."
+    )
+    trigger_run = st.checkbox(
+        "Trigger run before import",
+        value=cfg.trigger_run_before_import,
+        help="POST /api/v1/clients/{slug}/runs, then poll GET /api/v1/runs/{run_id} until complete.",
+    )
+    tcol1, tcol2 = st.columns(2)
+    with tcol1:
+        poll_interval = st.number_input(
+            "Run poll interval (seconds)",
+            min_value=1, max_value=300, value=int(cfg.run_poll_interval_seconds), step=1,
+            help="Seconds between run-status polls.",
+        )
+    with tcol2:
+        max_wait = st.number_input(
+            "Run max wait (seconds)",
+            min_value=5, max_value=3600, value=int(cfg.run_max_wait_seconds), step=5,
+            help="Hard cap before a run is declared timed-out (import is skipped).",
+        )
     auto_save = st.form_submit_button("Save automation settings")
 
 if auto_save:
@@ -404,6 +443,9 @@ if auto_save:
             "auto_import_enabled": auto_import,
             "auto_process_enabled": auto_process,
             "schedule_frequency": freq,
+            "trigger_run_before_import": trigger_run,
+            "run_poll_interval_seconds": int(poll_interval),
+            "run_max_wait_seconds": int(max_wait),
         }
     )
     try:
@@ -420,6 +462,17 @@ if cfg.last_auto_run_at:
     ac2.metric("Status", cfg.last_auto_run_status or "—")
     ac3.metric("Created", cfg.last_auto_run_created or 0)
     ac4.metric("Scored / Content", f"{cfg.last_auto_run_scored or 0} / {cfg.last_auto_run_content or 0}")
+
+# Last triggered sourcing-run status (signal-first flow)
+if cfg.trigger_run_before_import or cfg.last_run_id or cfg.last_run_status:
+    rc1, rc2, rc3 = st.columns(3)
+    rc1.metric("Last run id", cfg.last_run_id or "—")
+    _rstatus = cfg.last_run_status or "—"
+    _rbadge = {"completed": "✅", "failed": "❌", "timeout": "⏱️", "error": "⚠️"}.get(_rstatus, "")
+    rc2.metric("Run status", f"{_rbadge} {_rstatus}".strip())
+    rc3.metric("Poll / max wait", f"{cfg.run_poll_interval_seconds}s / {cfg.run_max_wait_seconds}s")
+    if cfg.last_run_error:
+        st.warning(f"Last run error: {cfg.last_run_error}")
 
 # ---------- Import cursor ----------
 st.markdown("**Import cursor** — tracks progress through the remote contact list")

@@ -21,6 +21,8 @@ def format_lead_context(
     *,
     include_score: bool = True,
     max_news: int = 5,
+    hiring_signal: Optional[dict] = None,
+    source_signal: Optional[dict] = None,
 ) -> str:
     parts: list[str] = [
         "# Lead",
@@ -37,6 +39,43 @@ def format_lead_context(
         parts.append(f"Rationale: {score.rationale}")
         if score.signals_used:
             parts.append(f"Signals: {', '.join(score.signals_used)}")
+
+    # Hiring signal (from the C-tier rescue layer). Surfaced so content
+    # generators can lead with a hiring angle when one was actually found.
+    # Only real roles/sources are passed through — never invent certainty.
+    if hiring_signal and hiring_signal.get("signal_found"):
+        roles = [r for r in (hiring_signal.get("relevant_roles") or []) if r]
+        parts.append("\n## Hiring signal")
+        parts.append(f"- Strength: {hiring_signal.get('signal_strength') or 'unknown'}")
+        if roles:
+            parts.append(f"- Open roles found: {', '.join(roles)}")
+        depts = [d for d in (hiring_signal.get("relevant_departments") or []) if d]
+        if depts:
+            parts.append(f"- Departments: {', '.join(depts)}")
+        if hiring_signal.get("why_it_matters"):
+            parts.append(f"- Why it matters: {hiring_signal['why_it_matters']}")
+        angle = hiring_signal.get("recommended_email_angle")
+        if angle:
+            parts.append(f"- Suggested angle (use only the roles above): {angle}")
+
+    # Imported source signal (from the OSP Lead Engine — the colleague's
+    # signal-first sourcing). Surfaced so content can lead with the ORIGINAL
+    # signal that caused the lead to be captured. Use only what's listed —
+    # never invent details.
+    if source_signal and source_signal.get("signal_found"):
+        parts.append("\n## Source signal (imported from lead engine)")
+        parts.append(f"- Strength: {source_signal.get('signal_strength') or 'unknown'}")
+        names = [n for n in (source_signal.get("relevant_roles") or []) if n]
+        if names:
+            parts.append(f"- Signals: {', '.join(names)}")
+        icps = [i for i in (source_signal.get("relevant_departments") or []) if i]
+        if icps:
+            parts.append(f"- Matched ICPs: {', '.join(icps)}")
+        if source_signal.get("summary"):
+            parts.append(f"- Summary: {source_signal['summary']}")
+        s_angle = source_signal.get("recommended_email_angle")
+        if s_angle:
+            parts.append(f"- Suggested angle (use only real signals above): {s_angle}")
 
     if not enrichment:
         return "\n".join(parts)
@@ -101,6 +140,19 @@ def format_lead_context(
 
         parts.append("\n## Buyer accounts (research)")
         parts.append(f"- buyer_motion: {motion}")
+
+        # Tavily company research — only surface the summary as usable evidence
+        # when a useful signal was actually found, so scoring + content never
+        # invent a signal that research did not support.
+        if ba.get("research_used"):
+            if ba.get("research_useful_signal_found") and (ba.get("research_summary") or "").strip():
+                summary = _truncate(ba.get("research_summary"), 700)
+                parts.append(f"- tavily_company_research: {summary}")
+            else:
+                parts.append(
+                    "- tavily_company_research: No useful Tavily company "
+                    "research signal found."
+                )
 
         # Surface v3 fallback ladder when fields are populated (new rows).
         if fallback_mode:

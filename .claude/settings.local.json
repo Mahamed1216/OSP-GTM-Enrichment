@@ -42,7 +42,25 @@
       "WebFetch(domain:leads.osp.tools)",
       "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\moham\\\\Documents\\\\OSP-GTM-Enrichment\" -Force)",
       "Bash(Select-Object Name, Mode)",
-      "Bash(Format-Table -AutoSize)"
+      "Bash(Format-Table -AutoSize)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(py -m pytest tests/ -q --ignore=tests/test_llm_live.py --ignore=tests/test_ingest_writer.py -p no:cacheprovider)",
+      "Read(//tmp/**)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(ps -W)",
+      "Bash(tasklist)",
+      "PowerShell(py *)",
+      "Bash(py -m pytest -p no:cacheprovider -q)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(docker --version)",
+      "Bash(taskkill //F //IM python.exe)",
+      "Bash(git *)",
+      "Bash(docker build *)",
+      "Bash(echo \"BUILD_EXIT=$?\")",
+      "Bash(py -m pytest tests/ -q -p no:cacheprovider --ignore=tests/test_llm_live.py --ignore=tests/test_ingest_writer.py)",
+      "Bash(echo \"PYTEST_EXIT=$?\")"
     ]
   }
 }

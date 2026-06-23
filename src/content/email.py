@@ -39,6 +39,44 @@ from src.prompts.sanitize import (
 log = logging.getLogger(__name__)
 
 
+def _load_signal(session, lead_id: int, signal_type: str) -> dict | None:
+    """Read a LeadSignal of the given type for a lead as a plain dict (in-session).
+
+    Returns None when there is no signal or the table doesn't exist yet
+    (pre-migration DB) — content generation must never break on its absence.
+    """
+    try:
+        from src.models import LeadSignal
+        row = session.execute(
+            select(LeadSignal).where(
+                LeadSignal.lead_id == lead_id,
+                LeadSignal.signal_type == signal_type,
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        return {
+            "signal_found": bool(row.signal_found),
+            "signal_strength": row.signal_strength,
+            "relevant_roles": list(row.relevant_roles or []),
+            "relevant_departments": list(row.relevant_departments or []),
+            "summary": row.summary,
+            "why_it_matters": row.why_it_matters,
+            "recommended_email_angle": row.recommended_email_angle,
+        }
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("signal_load_failed", extra={"lead_id": lead_id, "type": signal_type, "error": str(exc)})
+        return None
+
+
+def _load_hiring_signal(session, lead_id: int) -> dict | None:
+    return _load_signal(session, lead_id, "hiring")
+
+
+def _load_source_signal(session, lead_id: int) -> dict | None:
+    return _load_signal(session, lead_id, "source_import")
+
+
 class EmailResult(BaseModel):
     subject: str = Field(min_length=1, max_length=200)
     body: str = Field(min_length=1)
@@ -50,7 +88,15 @@ async def generate_email(
     *,
     regeneration_feedback: str | None = None,
     workspace_id: int | None = None,
-) -> EmailResult:
+) -> EmailResult | None:
+    # Cost gate (defense-in-depth). Email is ON by default, so this is a no-op
+    # in normal operation; it only skips when a workspace explicitly disables
+    # email generation. Returns None so callers treat it as "skipped_disabled".
+    from src.icp_config import is_content_type_enabled
+    if not is_content_type_enabled("email", workspace_id):
+        log.info("email_skipped_disabled", extra={"lead_id": lead_id, "workspace_id": workspace_id})
+        return None
+
     with session_scope() as session:
         lead = session.get(Lead, lead_id)
         if not lead:
@@ -65,7 +111,14 @@ async def generate_email(
         # leads. Snapshot the flag here so we can short-circuit AFTER the
         # session closes (no detached-attribute access on the score row).
         is_icp_skip = bool(score and getattr(score, "tier", None) == "D")
-        user_msg = format_lead_context(lead, enrichment, score)
+        # Hiring signal (C-tier rescue layer) + imported source signal — read
+        # inside the session so the email prompt can lead with either angle.
+        hiring_signal = _load_hiring_signal(session, lead_id)
+        source_signal = _load_source_signal(session, lead_id)
+        user_msg = format_lead_context(
+            lead, enrichment, score,
+            hiring_signal=hiring_signal, source_signal=source_signal,
+        )
         user_msg += "\n\nWrite the email now. Output JSON only."
         # Snapshot buyer-account fields for the post-generation validators.
         # Read INSIDE the session so we never touch detached attributes.

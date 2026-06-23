@@ -17,6 +17,7 @@ from app.lib.components import fit_score_viz
 from app.lib.db_queries import get_lead_full
 from app.lib.workspace_state import get_current_workspace_id, render_workspace_banner
 from app.lib.formatters import fmt_duration_ms, fmt_timestamp, source_status_display
+from app.lib.research_display import research_display_state
 from app.lib.rating_runner import (
     delete_lead_sync,
     full_refresh_sync,
@@ -26,6 +27,7 @@ from app.lib.rating_runner import (
     regenerate_sync,
     rerun_enrichment_sync,
     rerun_scoring_sync,
+    research_hiring_signal_sync,
 )
 from app.styles import inject_styles
 from src.feedback.ratings import get_rating
@@ -170,6 +172,8 @@ enrichment = bundle["enrichment"]
 score = bundle["score"]
 contents = bundle["contents"]
 engagements = bundle["engagements"]
+hiring_signal = bundle.get("hiring_signal")
+source_signal = bundle.get("source_signal")
 
 render_workspace_banner()
 
@@ -322,11 +326,34 @@ with _action_cols[3]:
                 if "score" in scoring
                 else ""
             )
+            # Stash per-step status so it survives the rerun below and is
+            # rendered as a "Last pipeline run" panel (requirement: pipeline
+            # run logs must be visible, including hiring signal enrichment).
+            st.session_state[f"ld_last_refresh_{_action_lead_id}"] = (result or {}).get("steps") or {}
             st.success(
                 f"Full refresh complete{score_bit}. "
                 "No Instantly push, no campaign activation."
             )
             st.rerun()
+
+# ---------- Last pipeline run panel ----------
+# Renders the per-step status from the most recent "Run full refresh" so the
+# operator can confirm every step ran — including hiring signal enrichment.
+_last_refresh = st.session_state.get(f"ld_last_refresh_{_action_lead_id}")
+if _last_refresh:
+    with st.container(border=True):
+        st.markdown("**Last pipeline run**")
+        _glyph = {"completed": "✅", "skipped": "⏭", "failed": "❌"}
+        _order = [
+            ("enrichment", "Enrichment"),
+            ("buyer_research", "Buyer research"),
+            ("hiring_signal", "Hiring signal enrichment"),
+            ("scoring", "Scoring"),
+            ("content", "Content generation"),
+        ]
+        for k, label in _order:
+            if k in _last_refresh:
+                st.markdown(f"{_glyph.get(_last_refresh[k], '•')} {label}: `{_last_refresh[k]}`")
 
 st.divider()
 
@@ -363,6 +390,102 @@ with tab_lead:
         c1, c2 = st.columns([1, 3])
         c1.markdown(f"**{label}**")
         c2.write(value)
+
+    # ---------- Source Signal / Imported Enrichment ----------
+    st.divider()
+    st.subheader("Source Signal / Imported Enrichment")
+    _raw = lead.get("lead_source_raw") or {}
+    _has_any_source = bool(_raw) or source_signal is not None
+    if not _has_any_source:
+        st.caption("This lead was not imported from the OSP Lead Engine.")
+    else:
+        _src_strength = (source_signal or {}).get("signal_strength")
+        _STRENGTH_COLOR = {"high": ":green", "medium": ":orange", "low": ":gray", "none": ":gray"}
+        with st.container(border=True):
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                st.markdown(f"**Source system:** {lead.get('external_source') or '—'}")
+                st.markdown(f"**External contact id:** `{lead.get('external_contact_id') or '—'}`")
+                st.markdown(f"**Source tier:** {lead.get('source_tier') or '—'}")
+                _score = lead.get("source_tier_score")
+                st.markdown(f"**Source tier score:** {_score if _score is not None else '—'}")
+            with sc2:
+                st.markdown(f"**Enrichment status:** {_raw.get('enrichment_status') or '—'}")
+                _ev = (
+                    "verified" if _raw.get("email_verified")
+                    else (lead.get("email_verification_status") or "—")
+                )
+                st.markdown(f"**Email verification:** {_ev}")
+                if _raw.get("email_bounce_risk") is not None:
+                    st.markdown(f"**Email bounce risk:** {_raw.get('email_bounce_risk')}")
+                _icps = (source_signal or {}).get("matched_icps") or _raw.get("matched_icps") or []
+                if _icps:
+                    st.markdown(
+                        "**Matched ICPs:** "
+                        + ", ".join(str(i) for i in (_icps if isinstance(_icps, list) else [_icps]))
+                    )
+
+            # Signals
+            if source_signal and source_signal.get("signal_found"):
+                color = _STRENGTH_COLOR.get((_src_strength or "none").lower(), ":gray")
+                _count = source_signal.get("signal_count")
+                _count_bit = f"  ·  **Signal count:** {_count}" if _count is not None else ""
+                st.markdown(
+                    f"**Signal strength:** {color}[**{(_src_strength or 'unknown').title()}**]"
+                    + _count_bit
+                )
+                names = source_signal.get("signal_names") or []
+                if names:
+                    st.markdown("**Signals:** " + "  ".join(pill(str(n), "violet") for n in names))
+
+                # Per-signal table — the exact Dele payload shape:
+                # type · value · confidence · source · source_url · detected_at
+                _sig_rows = source_signal.get("signals") or []
+                if _sig_rows:
+                    st.dataframe(
+                        [
+                            {
+                                "Type": s.get("signal_type") or "—",
+                                "Value": s.get("signal_value") or s.get("signal_name") or "—",
+                                "Confidence": (
+                                    s.get("signal_confidence")
+                                    if s.get("signal_confidence") is not None
+                                    else (s.get("signal_strength") or "—")
+                                ),
+                                "Source": s.get("signal_source") or "—",
+                                "Source URL": s.get("signal_source_url") or "",
+                                "Detected at": s.get("signal_detected_at") or "—",
+                            }
+                            for s in _sig_rows
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                if source_signal.get("summary"):
+                    st.markdown(f"**Signal summary:** {source_signal['summary']}")
+                if source_signal.get("recommended_email_angle"):
+                    st.markdown(
+                        f"**Suggested angle:** _{source_signal['recommended_email_angle']}_"
+                    )
+                _surls = source_signal.get("source_urls") or []
+                if _surls:
+                    with st.expander(f"Signal source URLs ({len(_surls)})", expanded=False):
+                        for u in _surls:
+                            st.markdown(f"- {u}")
+            else:
+                st.info("No source signals were included in the imported payload.")
+
+            # Source metadata
+            _meta = _raw.get("source_metadata")
+            if _meta:
+                with st.expander("Source metadata", expanded=False):
+                    st.json(_meta)
+
+            # Full raw payload (audit)
+            if _raw:
+                with st.expander("Raw imported payload (JSON)", expanded=False):
+                    st.json(_raw)
 
 # === Tab 2: Enrichment ===
 with tab_enrich:
@@ -436,6 +559,29 @@ with tab_enrich:
                 )
 
             with st.container(border=True):
+                # Company research signal used — did Tavily research shape these
+                # buyer segments? (Distinct from the standalone research section.)
+                _crs_used = bool(ba.get("company_research_signal_used"))
+                st.markdown(
+                    "**Company research signal used:** "
+                    + (":green[**yes**]" if _crs_used else ":gray[no]")
+                )
+                if _crs_used:
+                    if ba.get("company_research_effect"):
+                        st.caption(f"Effect on buyer segments: {ba['company_research_effect']}")
+                    _crs_sel = ba.get("selected_signal") or {}
+                    if _crs_sel.get("signal_summary"):
+                        st.caption(f"Research signal: {_crs_sel['signal_summary']}")
+                    _crs_srcs = ba.get("research_sources") or []
+                    if _crs_srcs:
+                        with st.expander(f"Research source URLs ({len(_crs_srcs)})", expanded=False):
+                            for u in _crs_srcs:
+                                st.markdown(f"- {u}")
+                else:
+                    st.caption(
+                        "Tavily research did not produce a useful buyer-segmentation signal."
+                    )
+
                 # Fallback mode row (v3 rows)
                 if fallback_mode:
                     _MODE_LABELS = {
@@ -471,6 +617,84 @@ with tab_enrich:
                             + ", ".join(b2b_evidence[:3])
                             + (" …" if len(b2b_evidence) > 3 else "")
                         )
+
+                # Research date window + Tavily metadata (set by code).
+                _nw = ba.get("news_window_days")
+                if _nw:
+                    _topic = ba.get("tavily_topic_used") or "—"
+                    _rc = ba.get("result_count")
+                    _modes = ba.get("tavily_modes_used") or []
+                    st.caption(
+                        f"News window: last {_nw} days "
+                        f"({ba.get('news_start_date') or '?'} → {ba.get('news_end_date') or '?'}) "
+                        f"· Tavily topic: {_topic}"
+                        + (f" · {_rc} results" if _rc is not None else "")
+                        + (f" · modes: {', '.join(_modes)}" if _modes else "")
+                    )
+
+                    # Selected strongest signal (relevance-first, not newest).
+                    _sel = ba.get("selected_signal")
+                    if _sel:
+                        _rel = (_sel.get("signal_relevance") or "?").title()
+                        _age = _sel.get("signal_recency_days")
+                        _age_str = f"~{_age}d ago" if _age is not None else "age unknown"
+                        st.markdown(
+                            f"**Strongest signal:** {_sel.get('signal_type') or 'signal'} "
+                            f"({_rel} relevance · {_age_str}) — {_sel.get('signal_summary') or ''}"
+                        )
+                        if _sel.get("reason"):
+                            st.caption(f"Why selected: {_sel['reason']}")
+                        if _sel.get("source_url"):
+                            st.caption(f"Source: {_sel['source_url']}")
+                    elif _nw:
+                        st.caption(
+                            f":gray[No strong company signal found within the configured {_nw}-day window.]"
+                        )
+
+                    if ba.get("recommended_outreach_angle"):
+                        st.markdown(
+                            f"**Recommended outreach angle:** _{ba['recommended_outreach_angle']}_"
+                        )
+
+                    # All candidate signals (expandable).
+                    _cands = ba.get("candidate_signals") or []
+                    if _cands:
+                        with st.expander(f"All candidate signals ({len(_cands)})", expanded=False):
+                            for c in _cands:
+                                _cage = c.get("signal_recency_days")
+                                st.markdown(
+                                    f"- **{c.get('signal_type') or 'signal'}** "
+                                    f"({(c.get('signal_relevance') or '?')}, "
+                                    f"{('~' + str(_cage) + 'd') if _cage is not None else 'age?'}): "
+                                    f"{c.get('signal_summary') or ''}"
+                                    + (f"  [{c.get('source_url')}]" if c.get('source_url') else "")
+                                )
+
+                    _surls = ba.get("source_urls") or []
+                    if _surls:
+                        with st.expander(f"Research source URLs ({len(_surls)})", expanded=False):
+                            for u in _surls:
+                                st.markdown(f"- {u}")
+
+                    # Tavily call debug metadata — verify the date window per call.
+                    _calls = ba.get("tavily_calls") or []
+                    if _calls:
+                        with st.expander(f"Tavily call debug metadata ({len(_calls)} calls)", expanded=False):
+                            st.caption(
+                                "Each buyer/company research Tavily call with its "
+                                "actual parameters (start_date/end_date confirm the window)."
+                            )
+                            for call in _calls:
+                                st.markdown(
+                                    f"- **{call.get('mode')}** · topic=`{call.get('topic')}` · "
+                                    f"depth=`{call.get('search_depth')}` · max={call.get('max_results')} · "
+                                    f"start=`{call.get('start_date')}` end=`{call.get('end_date')}` "
+                                    f"time_range=`{call.get('time_range')}` · "
+                                    f"{call.get('result_count')} results "
+                                    f"(oldest {call.get('oldest_result_date') or '?'}, "
+                                    f"newest {call.get('newest_result_date') or '?'})"
+                                )
+                            st.json(_calls)
 
                 # v3 fields (shown when present)
                 if fallback_mode:
@@ -527,6 +751,93 @@ with tab_enrich:
                                 "buyer segments + \"teams like that\" CTA."
                             )
 
+        # ---------- Tavily Company Research (always-visible section) ----------
+        # Separate from the Buyer account research card so the operator can
+        # always tell whether /research ran and whether it found anything
+        # useful. Reads the stored buyer_accounts JSON — never reruns Tavily.
+        st.subheader("Tavily Company Research")
+        _tcr = enrichment.get("buyer_accounts") or {}
+        _r_state = research_display_state(_tcr)
+
+        if _r_state == "skipped_disabled":
+            st.info(
+                "Tavily Company Research skipped because the setting is disabled."
+            )
+        elif _r_state == "not_run":
+            st.info("Tavily Company Research has not run for this lead.")
+        elif _r_state == "failed":
+            st.error(
+                "Tavily Company Research failed: "
+                f"{_tcr.get('research_error') or 'unknown error'}"
+            )
+        elif _r_state == "no_useful":
+            st.warning(
+                "Tavily Company Research completed, but no useful company signal "
+                "was found."
+            )
+            st.markdown("**Research status:** completed · **Useful signal found:** no")
+            if _tcr.get("research_no_signal_reason"):
+                st.markdown(f"**No-signal reason:** {_tcr['research_no_signal_reason']}")
+            _rsrc = _tcr.get("research_sources") or []
+            if _rsrc:
+                with st.expander(f"Sources checked ({len(_rsrc)})", expanded=False):
+                    for u in _rsrc:
+                        st.markdown(f"- {u}")
+        else:
+            st.success("Tavily Company Research completed — useful signal found.")
+            st.markdown("**Research status:** completed · **Useful signal found:** yes")
+            if _tcr.get("research_summary"):
+                st.markdown(f"**Research summary:** {_tcr['research_summary']}")
+            _sel = _tcr.get("selected_signal")
+            if _sel:
+                _rel = (_sel.get("signal_relevance") or "?").title()
+                _age = _sel.get("signal_recency_days")
+                _age_str = f"~{_age}d ago" if _age is not None else "age unknown"
+                st.markdown(
+                    f"**Strongest signal:** {_sel.get('signal_type') or 'signal'} "
+                    f"({_rel} relevance · {_age_str}) — {_sel.get('signal_summary') or ''}"
+                )
+                if _sel.get("reason"):
+                    st.markdown(f"**Why it matters:** {_sel['reason']}")
+            _rfind = _tcr.get("research_findings") or []
+            if _rfind:
+                st.markdown("**Findings:**")
+                for f in _rfind[:6]:
+                    st.markdown(f"- {f}")
+            _rsrc = _tcr.get("research_sources") or []
+            if _rsrc:
+                with st.expander(f"Source URLs ({len(_rsrc)})", expanded=False):
+                    for u in _rsrc:
+                        st.markdown(f"- {u}")
+
+        if _tcr.get("research_last_run_at"):
+            st.caption(f"Last run at: {_tcr['research_last_run_at']}")
+
+        # Tavily Research debug expander — the research call + raw payload.
+        _research_calls = [
+            c for c in (_tcr.get("tavily_calls") or []) if c.get("mode") == "research"
+        ]
+        if _research_calls or _tcr.get("research_raw_payload"):
+            with st.expander("Tavily Research Debug", expanded=False):
+                for call in _research_calls:
+                    st.markdown(
+                        f"- **mode=research** · window_days={call.get('window_days')} · "
+                        f"start=`{call.get('start_date')}` end=`{call.get('end_date')}` · "
+                        f"status=`{call.get('status')}` · "
+                        f"sources={call.get('source_count', call.get('result_count'))}"
+                        + (f" · reason=`{call.get('reason')}`" if call.get('reason') else "")
+                        + (f" · error=`{call.get('error')}`" if call.get('error') else "")
+                    )
+                    if call.get("query"):
+                        st.caption(f"Instructions: {call['query']}")
+                    if call.get("source_urls"):
+                        st.markdown("Source URLs:")
+                        for u in call["source_urls"]:
+                            st.markdown(f"- {u}")
+                if _tcr.get("research_raw_payload"):
+                    st.markdown("**Raw research payload:**")
+                    st.json(_tcr["research_raw_payload"])
+
         st.subheader("Source payloads")
         any_payload = False
         for col in _PAYLOAD_COLUMNS:
@@ -570,6 +881,94 @@ with tab_score:
         else:
             chips = "  ".join(pill(s, "blue") for s in signals)
             st.markdown(chips)
+
+    # ---------- Hiring Signal Enrichment (C-tier rescue layer) ----------
+    st.divider()
+    st.subheader("Hiring Signal Enrichment")
+    _STRENGTH_COLOR = {"high": ":green", "medium": ":orange", "low": ":gray", "none": ":gray"}
+    _STATUS_BADGE = {
+        "completed": ":green[completed]",
+        "skipped": ":gray[skipped]",
+        "failed": ":red[failed]",
+        "not_started": ":gray[not started]",
+    }
+    _UPLIFT_LABEL = {
+        "none": "No uplift",
+        "C_to_B": "C → B",
+        "C_to_A": "C → A",
+        "B_to_A": "B → A",
+    }
+    if hiring_signal is None:
+        st.info("Hiring signal enrichment has not run for this lead.")
+    else:
+        status = (hiring_signal.get("status") or "completed").lower()
+        last_run = hiring_signal.get("last_run_at") or hiring_signal.get("updated_at")
+        with st.container(border=True):
+            st.markdown(
+                f"**Status:** {_STATUS_BADGE.get(status, status)}"
+                f"  &nbsp;·&nbsp; **Last updated:** {fmt_timestamp(last_run)}"
+            )
+            if status == "failed" and hiring_signal.get("error"):
+                st.markdown(f":red[**Error:**] `{hiring_signal['error']}`")
+
+            found = bool(hiring_signal.get("signal_found"))
+            st.markdown(f"**hiring_signal_found:** {found}")
+            strength = (hiring_signal.get("signal_strength") or "none").lower()
+            color = _STRENGTH_COLOR.get(strength, ":gray")
+            st.markdown(f"**hiring_signal_strength:** {color}[**{strength.title()}**]")
+
+            roles = hiring_signal.get("relevant_roles") or []
+            if roles:
+                st.markdown("**relevant_roles_found:** " + "  ".join(pill(r, "green") for r in roles))
+            else:
+                st.markdown("**relevant_roles_found:** :gray[(none)]")
+
+            depts = hiring_signal.get("relevant_departments") or []
+            st.markdown(
+                "**relevant_departments:** "
+                + (", ".join(depts) if depts else ":gray[(none)]")
+            )
+            st.markdown(
+                f"**recency_estimate:** {hiring_signal.get('recency_estimate') or 'unknown'}"
+            )
+
+            applied = hiring_signal.get("applied_uplift") or "none"
+            rec = hiring_signal.get("tier_uplift_recommendation") or "none"
+            st.markdown(
+                f"**tier_uplift_recommendation:** {_UPLIFT_LABEL.get(rec, rec)}"
+                + (
+                    f"  _(applied: {_UPLIFT_LABEL.get(applied, applied)})_"
+                    if applied != rec else ""
+                )
+            )
+            if hiring_signal.get("why_it_matters"):
+                st.markdown(f"**why_it_matters:** {hiring_signal['why_it_matters']}")
+            if hiring_signal.get("recommended_email_angle"):
+                st.markdown(
+                    f"**recommended_email_angle:** _{hiring_signal['recommended_email_angle']}_"
+                )
+            urls = hiring_signal.get("source_urls") or []
+            if urls:
+                with st.expander(f"source_urls ({len(urls)})", expanded=False):
+                    for u in urls:
+                        st.markdown(f"- {u}")
+
+    if st.button("Run hiring signal enrichment", key=f"ld_hiring_{lead['id']}", type="secondary"):
+        ok, result = _run_with_spinner(
+            "Running hiring signal enrichment…",
+            research_hiring_signal_sync,
+            int(lead["id"]),
+            workspace_id=_ws_id,
+        )
+        if not ok:
+            st.error(f"Hiring signal enrichment failed: {result}")
+        else:
+            _status = (result or {}).get("status", "completed")
+            st.success(
+                f"Hiring signal enrichment {_status}. No email sent, no Instantly push."
+            )
+            st.cache_data.clear()
+            st.rerun()
 
 # === Tab 4: Generated Content ===
 with tab_content:

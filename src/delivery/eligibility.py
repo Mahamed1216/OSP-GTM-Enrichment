@@ -28,9 +28,52 @@ SKIP_LABELS: dict[str, str] = {
     "email_unverified": "email unverified",
     "below_tier": "below tier gate",
     "no_content": "missing content",
+    "unsafe_content": "needs review / regeneration",
     "already_sent": "already sent",
     "in_progress": "send in progress",
+    # SalesOS integration mode only: a CSM approval is required before any send.
+    # Tier alone is never enough. Surfaces only when SALESOS_INTEGRATION_MODE=true.
+    "missing_salesos_csm_approval": "awaiting SalesOS CSM approval",
 }
+
+
+# Internal-only / placeholder markers that must NEVER reach a prospect or be
+# pushed to Instantly. These are written into GeneratedContent.body by the
+# generator as status records (e.g. the buyer-research "NEEDS REVIEW: ..."
+# marker and the ICP-skip "SKIP: ..." marker). The send paths used to gate
+# only on tier/dedupe/verify/has-content, so a sendable-tier lead with such a
+# placeholder could have the marker delivered. This is the single source of
+# truth for "this content is internal and unsafe to send".
+_INTERNAL_CONTENT_MARKERS: tuple[str, ...] = (
+    "needs review",             # buyer-research placeholder ("NEEDS REVIEW: ...")
+    "no direct buyer account",
+    "lookalike buyer account",
+    "trigger based buyer",
+)
+
+
+def is_unsafe_internal_content(subject: str | None, body: str | None) -> bool:
+    """Return True when an email's subject/body is empty or contains internal
+    review / placeholder text that must never be sent to a prospect or pushed
+    to Instantly.
+
+    Shared by every pre-send path (deliver_email, overwrite_lead_copy, the
+    bulk-push eligibility filter, and the debug push diagnostic) so the safety
+    rule is enforced identically everywhere. Failure code: unsafe_content /
+    unsafe_internal_review_content.
+    """
+    stripped = (body or "").strip()
+    if not stripped:
+        return True  # empty/whitespace body is never sendable
+    combined = f"{subject or ''}\n{body or ''}".lower()
+    if any(marker in combined for marker in _INTERNAL_CONTENT_MARKERS):
+        return True
+    # ICP-skip / explicit placeholder markers (defense in depth).
+    if stripped.startswith("SKIP:"):
+        return True
+    if stripped.lower() in ("(needs review)", "(skip)"):
+        return True
+    return False
 
 
 def _verifier_configured() -> bool:
@@ -101,6 +144,10 @@ def filter_eligible(
     latest_content: dict[int, GeneratedContent] = {}
     for c in contents:
         latest_content.setdefault(c.lead_id, c)
+    # engine lead_id → latest email content id, for the SalesOS approval gate.
+    latest_content_id: dict[int, int] = {
+        lid: c.id for lid, c in latest_content.items()
+    }
 
     for lid in lead_ids:
         lead = leads.get(lid)
@@ -122,6 +169,12 @@ def filter_eligible(
             skipped["no_content"].append(lid)
             continue
 
+        # Hard content-safety gate: never bulk-send internal review/placeholder
+        # text (e.g. the "NEEDS REVIEW: ..." buyer-research marker).
+        if is_unsafe_internal_content(content.subject, content.body):
+            skipped["unsafe_content"].append(lid)
+            continue
+
         if content.delivery_status == "sent" and (content.delivery_id or "").strip():
             skipped["already_sent"].append(lid)
             continue
@@ -131,6 +184,22 @@ def filter_eligible(
             continue
 
         eligible.append(lid)
+
+    # SalesOS integration gate (mode-only, LAST check): tier alone is never
+    # enough — a lead that passes every safety check still cannot send without
+    # an explicit CSM approval. Runs after the safety checks above so unsafe /
+    # unverified / duplicate / below-tier leads keep their specific reason even
+    # when an approval exists. Standalone mode (flag off) is unchanged.
+    if settings.salesos_integration_mode and eligible:
+        from src.integrations.salesos.approvals import engine_leads_missing_approval
+        missing = engine_leads_missing_approval(session, eligible, latest_content_id)
+        if missing:
+            still_eligible = [lid for lid in eligible if lid not in missing]
+            # Preserve input order in the skip bucket.
+            for lid in eligible:
+                if lid in missing:
+                    skipped["missing_salesos_csm_approval"].append(lid)
+            eligible = still_eligible
 
     return eligible, skipped
 

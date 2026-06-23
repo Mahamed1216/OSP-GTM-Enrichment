@@ -36,6 +36,8 @@ _RUNTIME_NEW_TABLES: tuple[str, ...] = (
     "reply_drafts",
     "reply_threads",
     "lead_source_imports",   # Phase 7: external lead source import log
+    "lead_signals",          # Hiring signal C-tier rescue layer
+    "api_runs",              # Internal API (SalesOS) run tracking
 )
 
 
@@ -159,6 +161,20 @@ _RUNTIME_COLUMN_ADDS: list[tuple[str, str, str]] = [
     ("lead_source_imports", "scored_count", "INTEGER DEFAULT 0"),
     ("lead_source_imports", "content_generated_count", "INTEGER DEFAULT 0"),
     ("lead_source_imports", "enrichment_skipped_count", "INTEGER DEFAULT 0"),
+    # Hiring-signal run bookkeeping (added in the visibility hotfix). Older
+    # lead_signals rows (created before these columns) read back as
+    # status="not_started" via the model default on the next write.
+    ("lead_signals", "status", "VARCHAR(16) DEFAULT 'not_started'"),
+    ("lead_signals", "last_run_at", "TIMESTAMP"),
+    ("lead_signals", "error", "TEXT"),
+    # Source-signal layer: colleague's tier / tier_score from the lead engine
+    # payload, stored separately from our local Score.tier.
+    ("leads", "source_tier", "VARCHAR(16)"),
+    ("leads", "source_tier_score", "FLOAT"),
+    # Signal-first run trigger/poll flow — import-log bookkeeping.
+    ("lead_source_imports", "triggered_run_id", "VARCHAR(128)"),
+    ("lead_source_imports", "triggered_run_status", "VARCHAR(32)"),
+    ("lead_source_imports", "source_signal_count", "INTEGER DEFAULT 0"),
 ]
 
 # Postgres-only column widenings. SQLite ignores VARCHAR length caps so
@@ -338,6 +354,16 @@ def init_db() -> None:
         backfill_default_workspace_ids()
         backfill_osp_icp_config()
         migrate_json_winners_to_osp_db()
+        # SalesOS integration: create the shared-Supabase contract tables only
+        # when integration mode is on, so a standalone deployment never grows
+        # unused salesos_* tables. The workers also ensure these lazily at boot.
+        if settings.salesos_integration_mode:
+            try:
+                from src.integrations.salesos import ensure_salesos_tables
+                ensure_salesos_tables()
+            except Exception:
+                import logging as _logging
+                _logging.getLogger(__name__).warning("salesos_ensure_tables_failed")
     except Exception:
         _db_initialized = False  # Allow the next caller to retry.
         raise

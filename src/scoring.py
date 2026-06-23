@@ -159,6 +159,29 @@ async def score_lead(lead_id: int, *, workspace_id: int | None = None) -> ScoreR
                 workspace_id=workspace_id,
             ))
 
+    # Hiring-signal tier uplift (C-tier rescue layer). Applied AFTER the base
+    # LLM score so the deterministic rule operates on a clean base. No-op when
+    # the lead has no hiring signal stored. Wrapped so scoring never breaks if
+    # the lead_signals table is missing (pre-migration DB).
+    try:
+        from src.signals.store import apply_hiring_uplift
+        uplift = apply_hiring_uplift(
+            lead_id,
+            workspace_id=workspace_id,
+            base_tier=result.tier,
+            base_score=result.score,
+        )
+        if uplift and uplift.get("applied"):
+            result.tier = uplift["new_tier"]
+            result.score = uplift["new_score"]
+            log.info("scoring_hiring_uplift", extra={
+                "lead_id": lead_id,
+                "recommendation": uplift["recommendation"],
+                "new_tier": result.tier,
+            })
+    except Exception as exc:  # pragma: no cover - uplift is best-effort
+        log.warning("scoring_hiring_uplift_failed", extra={"lead_id": lead_id, "error": str(exc)})
+
     log.info("scoring_complete", extra={
         "lead_id": lead_id,
         "score": result.score,

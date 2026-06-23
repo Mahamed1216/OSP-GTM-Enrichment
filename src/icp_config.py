@@ -69,6 +69,28 @@ class ICPConfig(BaseModel):
     signals: IntentSignals = Field(default_factory=IntentSignals)
     news_search_terms: list[str] = Field(default_factory=list)
     generate_content_for_all_tiers: bool = False
+    # Content-type toggles (workspace scoped via the workspaces.icp_config JSON).
+    # Email is on by default; call scripts and LinkedIn DMs are OFF by default to
+    # save LLM cost. Workspaces whose icp_config was saved before these fields
+    # existed pick up the defaults automatically (call/LinkedIn off).
+    generate_email_enabled: bool = True
+    generate_call_script_enabled: bool = False
+    generate_linkedin_dm_enabled: bool = False
+    # Buyer-research Tavily news window. Buyer/company-news research searches
+    # for relevant company signals within this many days (default 90) instead
+    # of only the last few days, so older-but-relevant funding/hiring/expansion
+    # signals aren't missed. See src/enrichment/buyer_accounts.py.
+    buyer_research_news_window_days: int = 90
+    # Layered Tavily research toggles (Company Researcher / Crawl2RAG style).
+    # Crawl the company website + extract top URLs for richer company context.
+    # Default on; may use more Tavily credits.
+    buyer_research_use_crawl: bool = True
+    buyer_research_use_extract: bool = True
+    # Tavily Research agent (Company Researcher) for deeper company research.
+    # Default OFF: /research is expensive and was the main driver of a Tavily
+    # cost spike. Cheaper Search/Crawl/Extract layers stay on. Turn this on per
+    # workspace only when deeper research is worth the credits.
+    buyer_research_use_research: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +269,35 @@ def load_workspace_icp_config(workspace_id=None):
     except Exception as exc:
         log.warning("load_workspace_icp_config_failed", extra={"workspace_id": workspace_id, "error": f"{type(exc).__name__}: {exc}"})
     return default_icp_config()
+
+
+# Map a GeneratedContent.kind to its ICPConfig toggle field.
+_CONTENT_KIND_FLAG = {
+    "email": "generate_email_enabled",
+    "call_script": "generate_call_script_enabled",
+    "linkedin_msg": "generate_linkedin_dm_enabled",
+}
+
+
+def is_content_type_enabled(kind: str, workspace_id=None) -> bool:
+    """Return True when the workspace allows generating `kind` content.
+
+    Defaults (when the workspace has no saved config or an older one): email
+    on, call_script off, linkedin_msg off. Unknown kinds default to enabled so
+    a new content type is never silently suppressed by this gate.
+    """
+    flag = _CONTENT_KIND_FLAG.get(kind)
+    if flag is None:
+        return True
+    try:
+        cfg = load_workspace_icp_config(workspace_id)
+        return bool(getattr(cfg, flag))
+    except Exception as exc:  # pragma: no cover - defensive; never block email
+        log.warning(
+            "content_type_toggle_load_failed",
+            extra={"kind": kind, "workspace_id": workspace_id, "error": str(exc)},
+        )
+        return kind == "email"
 
 
 def save_workspace_icp_config(cfg, workspace_id=None):

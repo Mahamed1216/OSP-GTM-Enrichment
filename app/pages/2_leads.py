@@ -1,6 +1,7 @@
 """Leads — filterable, sortable table; select rows for bulk actions or open detail."""
 from __future__ import annotations
 
+import logging
 import sys
 import time
 from pathlib import Path
@@ -14,7 +15,13 @@ import streamlit as st
 
 from app.lib.async_runner import run_async
 from app.lib.badges import status_pill, tier_badge
+from app.lib.bulk_push import run_bulk_push
 from app.lib.db_queries import count_leads, list_leads
+from app.lib.push_confirm import (
+    build_push_confirm_token,
+    confirm_button_enabled,
+    push_confirmation_active,
+)
 from app.lib.workspace_state import get_current_workspace_id, render_workspace_banner
 from app.styles import inject_styles
 from src.config import settings
@@ -26,12 +33,15 @@ from src.delivery.instantly import (
     get_campaign,
     overwrite_lead_copy,
 )
+from src.delivery.instantly_config import resolve_instantly_config
 from src.db import session_scope as _delete_session_scope
 from src.leads import delete_lead, reset_lead_sequence
 
 inject_styles()
 
-_CONFIRM_TTL = 5.0  # seconds for two-click confirm window
+log = logging.getLogger(__name__)
+
+_CONFIRM_TTL = 5.0  # seconds for two-click confirm window (delete only)
 _BULK_PUSH_HARD_LIMIT = 10  # over this requires "I understand" checkbox
 _PAGE_SIZES = [25, 50, 100, 250]
 _DEFAULT_PAGE_SIZE = 50
@@ -54,6 +64,7 @@ def _count_leads_cached(
     sent_only: bool,
     not_sent_only: bool,
     enriched_only: bool,
+    hiring_filter: str = "any",
 ) -> int:
     return count_leads(
         workspace_id,
@@ -62,6 +73,7 @@ def _count_leads_cached(
         sent_only=sent_only,
         not_sent_only=not_sent_only,
         enriched_only=enriched_only,
+        hiring_filter=hiring_filter,
     )
 
 
@@ -75,6 +87,7 @@ def _list_leads_cached(
     sent_only: bool,
     not_sent_only: bool,
     enriched_only: bool,
+    hiring_filter: str = "any",
 ) -> pd.DataFrame:
     return list_leads(
         workspace_id,
@@ -85,6 +98,7 @@ def _list_leads_cached(
         sent_only=sent_only,
         not_sent_only=not_sent_only,
         enriched_only=enriched_only,
+        hiring_filter=hiring_filter,
     )
 
 
@@ -135,7 +149,7 @@ def _on_not_sent_change() -> None:
 
 
 st.markdown('<div class="filter-row">', unsafe_allow_html=True)
-fc1, fc2, fc3, fc4, _ = st.columns([2, 1, 1, 1, 2])
+fc1, fc2, fc3, fc4, fc5 = st.columns([2, 1, 1, 1, 2])
 with fc1:
     tier_filter = st.multiselect(
         "Tier",
@@ -156,7 +170,46 @@ with fc3:
 with fc4:
     enriched_only = st.checkbox("Has enrichment", key="leads_filter_enriched",
                                 on_change=_reset_page)
+with fc5:
+    hiring_filter = st.selectbox(
+        "Hiring signal",
+        options=["any", "high", "medium", "none"],
+        index=0,
+        key="leads_filter_hiring",
+        on_change=_reset_page,
+    )
 st.markdown('</div>', unsafe_allow_html=True)
+
+# ---------- C-tier hiring rescue ----------
+# Workspace-scoped: researches hiring signals for C-tier leads missing one
+# (limit 25 by default) and applies tier uplifts. Never sends or pushes.
+with st.expander("🚀 Run C-tier hiring rescue", expanded=False):
+    st.caption(
+        "Researches open RevOps / SDR / GTM / automation roles for C-tier "
+        "leads in this workspace that have no hiring signal yet, then applies "
+        "any tier uplift. Uses Tavily. No emails sent, no Instantly push."
+    )
+    rc1, rc2 = st.columns([1, 3])
+    with rc1:
+        _rescue_limit = st.number_input(
+            "Limit", min_value=1, max_value=200, value=25, step=5,
+            key="leads_rescue_limit",
+        )
+    if st.button("Run hiring rescue", key="leads_rescue_run", type="primary"):
+        try:
+            from src.signals.hiring_rescue import run_hiring_rescue_sync
+            with st.spinner("Researching hiring signals…"):
+                report = run_hiring_rescue_sync(_ws_id, limit=int(_rescue_limit))
+            st.success(
+                f"Processed {report.processed_count} leads · "
+                f"high {report.high_signal_count} / med {report.medium_signal_count} "
+                f"/ low {report.low_signal_count} / none {report.no_signal_count} · "
+                f"bumped → B: {report.bumped_to_B_count}, → A: {report.bumped_to_A_count}"
+                + (f" · {report.errors} errors" if report.errors else "")
+            )
+            st.cache_data.clear()
+        except Exception as exc:
+            st.error(f"Hiring rescue failed: {type(exc).__name__}: {exc}")
 
 # ---------- Resolve current pagination state ----------
 _page = st.session_state["leads_page"]
@@ -166,17 +219,18 @@ _tiers = tuple(tier_filter)
 _sent = bool(st.session_state.get("leads_filter_sent"))
 _not_sent = bool(st.session_state.get("leads_filter_not_sent"))
 _enriched = bool(st.session_state.get("leads_filter_enriched"))
+_hiring = st.session_state.get("leads_filter_hiring", "any")
 
 # ---------- Load data (server-side filtered + paginated) ----------
 try:
-    _total = _count_leads_cached(_ws_id, _search, _tiers, _sent, _not_sent, _enriched)
-    df = _list_leads_cached(_ws_id, _page, _page_size, _search, _tiers, _sent, _not_sent, _enriched)
+    _total = _count_leads_cached(_ws_id, _search, _tiers, _sent, _not_sent, _enriched, _hiring)
+    df = _list_leads_cached(_ws_id, _page, _page_size, _search, _tiers, _sent, _not_sent, _enriched, _hiring)
 except Exception as exc:
     st.error(f"Could not load leads: {exc}")
     st.stop()
 
 if _total == 0:
-    if _search or _tiers or _sent or _not_sent or _enriched:
+    if _search or _tiers or _sent or _not_sent or _enriched or _hiring != "any":
         st.info("No leads match the current filters.")
     else:
         st.info("No leads yet in this workspace. Use the Run Pipeline page to ingest a CSV.")
@@ -271,11 +325,13 @@ selection = st.dataframe(
     use_container_width=True,
     on_select="rerun",
     selection_mode="multi-row",
-    column_order=["id", "Name", "Company", "Title", "Tier", "Score", "Enriched", "Status"],
+    column_order=["id", "Name", "Company", "Title", "Tier", "Score", "Enriched", "Hiring", "Src signal", "Status"],
     column_config={
         "id": st.column_config.NumberColumn("ID", width="small"),
         "Score": st.column_config.NumberColumn("Score", format="%d"),
         "Enriched": st.column_config.CheckboxColumn("Enriched"),
+        "Hiring": st.column_config.TextColumn("Hiring", width="small"),
+        "Src signal": st.column_config.TextColumn("Src signal", width="small"),
         "Sent": None,
         "Replied": None,
         "Email": None,
@@ -354,7 +410,8 @@ if selected_lead_ids:
         if ac4.button("Clear selection", key="clear_selection"):
             st.session_state.pop("leads_table", None)
             st.session_state.pop(_del_key, None)
-            st.session_state.pop("push_selected_pending", None)
+            st.session_state.pop("push_confirm_token", None)
+            st.session_state.pop("bulk_push_big_ack", None)
             st.rerun()
 
         if confirming:
@@ -367,6 +424,40 @@ if selected_lead_ids:
     skip_summary = summarize_skips(skipped)
 
     with st.container(border=True):
+        # ---------- Persistent push result (survives Streamlit reruns) ----------
+        # The push outcome is stored in session_state by the Confirm handler so
+        # it is still shown after the rerun that closes the confirmation dialog.
+        _last_push = st.session_state.get("last_instantly_push_result")
+        if _last_push:
+            _ps = _last_push.get("status")
+            if _ps == "completed":
+                st.success(
+                    f"Push completed: {_last_push.get('n_sent', 0)} succeeded, "
+                    f"{_last_push.get('n_failed', 0)} failed."
+                )
+                _fails = _last_push.get("failures") or []
+                if _fails:
+                    with st.expander(f"Failed / blocked leads ({len(_fails)})", expanded=False):
+                        for lid, reason in _fails:
+                            st.markdown(f"- lead `{lid}` — {reason}")
+            elif _ps == "blocked":
+                st.warning(f"Push blocked: {_last_push.get('error') or 'no eligible leads'}")
+                _br = _last_push.get("blocked_reasons") or {}
+                if _br:
+                    st.caption(
+                        "Blocked by: "
+                        + ", ".join(
+                            f"{cnt} {SKIP_LABELS.get(code, code)}" for code, cnt in _br.items()
+                        )
+                    )
+            elif _ps == "failed":
+                st.error(f"Push failed: {_last_push.get('error') or 'unknown error'}")
+            if _last_push.get("completed_at"):
+                st.caption(f"Last push: {_last_push['completed_at']}")
+            if st.button("Dismiss push result", key="dismiss_push_result"):
+                st.session_state.pop("last_instantly_push_result", None)
+                st.rerun()
+
         push_label = f"Push to Instantly ({n_eligible} eligible)"
         pc1, pc2 = st.columns([1.5, 5])
         push_clicked = pc1.button(
@@ -405,28 +496,70 @@ if selected_lead_ids:
                 f"Full breakdown: {skip_summary}."
             )
 
-        _push_key = "push_selected_pending"
+        # ---------- Confirmation flow: stable token, no time race ----------
+        # The dialog is shown while a stored token matches a freshly-computed
+        # one scoped to (workspace, selected ids, eligible ids, campaign). When
+        # any of those change, the token mismatches and we auto-clear the
+        # confirmation + the safety checkbox. No 5-second window — checking the
+        # box (which reruns) can never make the dialog disappear.
+        _TOKEN_KEY = "push_confirm_token"
+        _ACK_KEY = "bulk_push_big_ack"
+        # Resolve the campaign id for the ACTIVE workspace (not the env-only
+        # value). API key comes from env/secrets via the same resolver downstream
+        # in deliver_email; here we only need the campaign id for the token,
+        # campaign-info preview, and the bulk push call.
+        _push_cfg = resolve_instantly_config(
+            _ws_id, allow_campaign_env_fallback=(_ws_id is None)
+        )
+        _push_campaign_id = _push_cfg.campaign_id
+        current_token = build_push_confirm_token(
+            workspace_id=_ws_id,
+            selected_ids=selected_lead_ids,
+            eligible_ids=eligible_ids,
+            campaign_id=_push_campaign_id,
+        )
+        stored_token = st.session_state.get(_TOKEN_KEY)
+
+        # Scope changed (selection / workspace / eligibility / campaign) →
+        # reset the confirmation + clear the checkbox before it renders.
+        if stored_token and stored_token != current_token:
+            st.session_state.pop(_TOKEN_KEY, None)
+            st.session_state.pop(_ACK_KEY, None)
+            stored_token = None
+
         if push_clicked and n_eligible:
-            st.session_state[_push_key] = time.time()
+            # Enter confirmation mode for THIS scope. Clear any stale checkbox
+            # value here (before the widget renders) so it starts unchecked.
+            st.session_state[_TOKEN_KEY] = current_token
+            st.session_state.pop(_ACK_KEY, None)
+            log.info(
+                "push_confirm_started",
+                extra={
+                    "workspace_id": _ws_id,
+                    "selected_count": n,
+                    "eligible_count": n_eligible,
+                    "confirmation_key": current_token,
+                },
+            )
             st.rerun()
 
-        push_pending_at = st.session_state.get(_push_key)
-        confirming_push = (
-            bool(push_pending_at) and (time.time() - push_pending_at) < _CONFIRM_TTL
-        )
+        confirming_push = push_confirmation_active(stored_token, current_token)
 
         if confirming_push and n_eligible:
             # Lazy-fetch campaign info; cache 5min in session_state.
             campaign_cache = st.session_state.get("push_campaign_cache") or {}
             cached_at = campaign_cache.get("at", 0)
-            if time.time() - cached_at > 300:
+            # Only fetch campaign info when a campaign id actually resolved —
+            # otherwise we'd crash before the debug panel can show the missing
+            # reason. The config gate below blocks the push when it's absent.
+            if _push_campaign_id and time.time() - cached_at > 300:
                 try:
-                    campaign = run_async(get_campaign(settings.instantly_campaign_id))
+                    campaign = run_async(get_campaign(_push_campaign_id))
                     campaign_cache = {"at": time.time(), "data": campaign}
                     st.session_state["push_campaign_cache"] = campaign_cache
                 except Exception as exc:
                     st.error(f"Could not fetch Instantly campaign info: {exc}")
-                    st.session_state.pop(_push_key, None)
+                    st.session_state.pop(_TOKEN_KEY, None)
                     st.stop()
             campaign = campaign_cache.get("data") or {}
 
@@ -449,55 +582,94 @@ if selected_lead_ids:
             st.caption(f"Sender(s): {', '.join(senders)}")
             st.caption(f"Daily send rate: {daily_limit}")
 
-            big_batch_ok = True
+            # --- Debug panel: Instantly push configuration (shared resolver) ---
+            # Shows exactly what the push will use, BEFORE Confirm. Never shows
+            # the full API key — only configured yes/no, source, masked prefix.
+            with st.container(border=True):
+                st.markdown("**Instantly push configuration**")
+                _dbg1, _dbg2 = st.columns(2)
+                _dbg1.markdown(
+                    f"**API key configured:** {'✅ Yes' if _push_cfg.api_key else '❌ No'}"
+                )
+                _dbg1.markdown(f"**API key source:** `{_push_cfg.api_key_source}`")
+                _dbg2.markdown(
+                    f"**Campaign ID configured:** {'✅ Yes' if _push_cfg.campaign_id else '❌ No'}"
+                )
+                _dbg2.markdown(f"**Campaign ID source:** `{_push_cfg.campaign_id_source}`")
+                if _push_cfg.missing_reasons:
+                    st.error("Missing reasons: " + ", ".join(_push_cfg.missing_reasons))
+                else:
+                    st.caption("Push configuration OK.")
+
+            # Block the push outright when config is incomplete — exact reasons,
+            # no vague combined message, and never marks a lead sent.
+            _config_ok = not _push_cfg.missing_reasons
+
+            # Safety checkbox. Stable key → its checked state persists across
+            # the rerun that checking it triggers. Required for any batch over
+            # the hard limit; smaller batches still confirm via the button.
+            ack_checked = True
             if n_eligible > _BULK_PUSH_HARD_LIMIT:
-                big_batch_ok = st.checkbox(
+                ack_checked = st.checkbox(
                     f"I understand this will send {n_eligible} real emails.",
-                    key="bulk_push_big_ack",
+                    key=_ACK_KEY,
                 )
 
-            cc1, cc2 = st.columns([1.5, 5])
-            if cc1.button(
+            button_enabled = confirm_button_enabled(
+                n_eligible, bool(ack_checked), _BULK_PUSH_HARD_LIMIT
+            ) and _config_ok
+            log.info(
+                "push_confirm_render",
+                extra={
+                    "workspace_id": _ws_id,
+                    "selected_count": n,
+                    "eligible_count": n_eligible,
+                    "confirmation_key": current_token,
+                    "checkbox_state": bool(ack_checked),
+                    "button_enabled": button_enabled,
+                },
+            )
+
+            cc1, cc2, cc3 = st.columns([1.5, 1.5, 4])
+            confirm_clicked = cc1.button(
                 f"Confirm push ({n_eligible})",
                 type="primary",
                 key="confirm_push",
-                disabled=not big_batch_ok,
-            ):
-                st.session_state.pop(_push_key, None)
-                progress = st.progress(0.0, text=f"Pushing {n_eligible} lead(s)…")
-                status = st.status("Sending…", expanded=True)
-                n_sent = n_failed = 0
-                with status:
-                    for i, lid in enumerate(eligible_ids, start=1):
-                        try:
-                            result = run_async(
-                                deliver_email(lid, dry_run=False, workspace_id=_ws_id)
-                            )
-                        except Exception as exc:
-                            n_failed += 1
-                            st.write(f"❌ lead {lid} — {type(exc).__name__}: {exc}")
-                        else:
-                            if result.delivered:
-                                n_sent += 1
-                                st.write(f"✅ lead {lid} — sent (id={result.delivery_id})")
-                            else:
-                                n_failed += 1
-                                st.write(
-                                    f"⚠️ lead {lid} — skipped: {result.skip_reason}"
-                                )
-                        progress.progress(
-                            i / n_eligible,
-                            text=f"Pushed {i} of {n_eligible}…",
-                        )
-                status.update(
-                    label=f"Bulk push complete — {n_sent} sent, {n_failed} failed.",
-                    state="complete",
-                )
-                st.toast(f"{n_sent} sent, {n_failed} failed.")
-                st.cache_data.clear()
-                st.session_state.pop("leads_table", None)
+                disabled=not button_enabled,
+            )
+            if cc2.button("Cancel", key="cancel_push", type="secondary"):
+                st.session_state.pop(_TOKEN_KEY, None)
                 st.rerun()
-            cc2.caption(":red[Click \"Confirm push\" within 5s to proceed.]")
+            if not _config_ok:
+                cc3.caption(
+                    ":red[Cannot push — " + ", ".join(_push_cfg.missing_reasons) + ".]"
+                )
+            elif not button_enabled:
+                cc3.caption(":gray[Check the box above to enable Confirm push.]")
+
+            if confirm_clicked:
+                # Run the push NOW, synchronously, BEFORE any state reset or
+                # rerun, via the testable run_bulk_push helper. The result is
+                # stored in session_state and rendered by the persistent panel
+                # above on the next render, so it never disappears.
+                log.info("push_confirm_clicked", extra={
+                    "workspace_id": _ws_id,
+                    "selected_count": n,
+                    "eligible_count": n_eligible,
+                    "campaign_id": _push_campaign_id,
+                    "confirmation_checked": bool(ack_checked),
+                })
+                with st.spinner("Push started — sending to Instantly…"):
+                    rec = run_async(run_bulk_push(
+                        list(selected_lead_ids), _ws_id,
+                        campaign_id=_push_campaign_id,
+                    ))
+                # Persist result + close the dialog ONLY now (after the push
+                # finished). The persistent panel renders it on the next run.
+                st.session_state["last_instantly_push_result"] = rec
+                st.session_state.pop(_TOKEN_KEY, None)
+                st.cache_data.clear()
+                st.rerun()
 
     # ---------- Overwrite existing Instantly copy ----------
     # For when bad copy was already pushed and the local content has been

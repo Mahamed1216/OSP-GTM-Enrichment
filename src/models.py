@@ -134,6 +134,13 @@ class Lead(Base):
     external_client_slug: Mapped[Optional[str]] = mapped_column(String(128))
     phone: Mapped[Optional[str]] = mapped_column(String(64))
     lead_source_raw: Mapped[Optional[dict]] = mapped_column(JSON)
+    # Source signal layer: the colleague's own tier / tier_score from the
+    # OSP Lead Engine payload, stored SEPARATELY from our local Score.tier so
+    # it's supporting evidence, never blindly copied. NULL when the payload
+    # carried no tier. The full signals/matched_icps live in lead_source_raw
+    # and a normalized copy in the lead_signals row (signal_type="source_import").
+    source_tier: Mapped[Optional[str]] = mapped_column(String(16))
+    source_tier_score: Mapped[Optional[float]] = mapped_column(Float)
 
     enrichment: Mapped[Optional["Enrichment"]] = relationship(
         back_populates="lead", uselist=False, cascade="all, delete-orphan"
@@ -503,6 +510,69 @@ class ReplyThread(Base):
     )
 
 
+class LeadSignal(Base):
+    """A buying-intent signal discovered for a lead (workspace scoped).
+
+    First signal_type is "hiring" — the C-tier rescue layer researches
+    whether a lead's company has active job postings (RevOps / SDR / GTM /
+    automation roles) that indicate active GTM investment, timing, and pain.
+    The table is generic on `signal_type` so future signals (funding, tech
+    adoption, etc.) can reuse the same shape.
+
+    One row per (lead_id, signal_type) — the unique constraint makes the
+    enrichment idempotent: re-running the rescue updates the existing row
+    instead of appending a duplicate. `base_tier` / `base_score` capture the
+    lead's score at uplift time so the deterministic tier-uplift step in
+    src.signals.uplift can re-apply itself idempotently without compounding.
+
+    NOTHING here ever triggers a send or an Instantly push — it is research
+    + a scoring uplift recommendation only.
+    """
+    __tablename__ = "lead_signals"
+    __table_args__ = (
+        UniqueConstraint("lead_id", "signal_type", name="uq_lead_signals_lead_type"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    lead_id: Mapped[int] = mapped_column(ForeignKey("leads.id"), index=True)
+    workspace_id: Mapped[Optional[int]] = mapped_column(
+        Integer, default=_default_workspace_id, index=True
+    )
+    signal_type: Mapped[str] = mapped_column(String(32), default="hiring", index=True)
+
+    # Classifier output.
+    signal_found: Mapped[bool] = mapped_column(Boolean, default=False)
+    signal_strength: Mapped[str] = mapped_column(String(16), default="none")  # none|low|medium|high
+    relevant_roles: Mapped[list] = mapped_column(JSON, default=list)
+    relevant_departments: Mapped[list] = mapped_column(JSON, default=list)
+    recency_estimate: Mapped[Optional[str]] = mapped_column(String(32))  # last_30/90/180_days|unknown
+    summary: Mapped[Optional[str]] = mapped_column(Text)
+    why_it_matters: Mapped[Optional[str]] = mapped_column(Text)
+    source_urls: Mapped[list] = mapped_column(JSON, default=list)
+    recommended_email_angle: Mapped[Optional[str]] = mapped_column(Text)
+
+    # Uplift bookkeeping.
+    # tier_uplift_recommendation = the deterministic recommendation (none|C_to_B|C_to_A|B_to_A).
+    # applied_uplift = what was actually applied to the Score row (or "none").
+    # base_tier/base_score = the pre-uplift score, captured so re-applying is idempotent.
+    tier_uplift_recommendation: Mapped[str] = mapped_column(String(16), default="none")
+    applied_uplift: Mapped[Optional[str]] = mapped_column(String(16))
+    base_tier: Mapped[Optional[str]] = mapped_column(String(1))
+    base_score: Mapped[Optional[int]] = mapped_column(Integer)
+
+    # Run bookkeeping so the UI can show whether enrichment ran.
+    # status: not_started | completed | skipped | failed.
+    status: Mapped[str] = mapped_column(String(16), default="not_started")
+    last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    error: Mapped[Optional[str]] = mapped_column(Text)
+
+    raw_payload: Mapped[Optional[dict]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=now_utc, onupdate=now_utc, nullable=False
+    )
+
+
 class LeadSourceImport(Base):
     """Audit record for one pull-based import from the external lead source API.
 
@@ -539,3 +609,42 @@ class LeadSourceImport(Base):
     scored_count: Mapped[int] = mapped_column(Integer, default=0)
     content_generated_count: Mapped[int] = mapped_column(Integer, default=0)
     enrichment_skipped_count: Mapped[int] = mapped_column(Integer, default=0)
+    # Signal-first trigger/poll flow. NULL on imports that used the normal
+    # contacts-polling path (trigger_run_before_import disabled).
+    triggered_run_id: Mapped[Optional[str]] = mapped_column(String(128))
+    triggered_run_status: Mapped[Optional[str]] = mapped_column(String(32))
+    # Total normalized source signals across all imported contacts in this run.
+    source_signal_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class ApiRun(Base):
+    """Audit + async-tracking record for one internal-API process request.
+
+    SalesOS POSTs a lead/batch to /api/v1/leads/process; we persist the request
+    here so the run can be processed inline (sync) or by a background worker
+    (async, `python -m src.api.worker`) and polled via /api/v1/runs/{run_id}.
+
+    `run_id` is the external opaque handle ("run_<uuid>"). The raw request and
+    per-lead results are stored as JSON. NOTHING here ever sends an email or
+    pushes to Instantly — it only records and orchestrates the existing pipeline.
+    """
+    __tablename__ = "api_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    workspace_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)
+    source: Mapped[Optional[str]] = mapped_column(String(64))      # e.g. "salesos"
+    run_mode: Mapped[str] = mapped_column(String(16), default="async")  # sync | async
+    # queued | running | completed | failed | partial
+    status: Mapped[str] = mapped_column(String(16), default="queued", nullable=False, index=True)
+    lead_count: Mapped[int] = mapped_column(Integer, default=0)
+    processed_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    request_payload: Mapped[Optional[dict]] = mapped_column(JSON)
+    result_payload: Mapped[Optional[dict]] = mapped_column(JSON)
+    error: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=now_utc, onupdate=now_utc, nullable=False
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)

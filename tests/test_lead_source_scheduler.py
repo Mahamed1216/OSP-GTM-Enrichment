@@ -300,6 +300,17 @@ def test_newly_imported_contacts_are_scored(monkeypatch):
 
 def test_newly_imported_contacts_get_generated_content(monkeypatch):
     ws_id = _seed_ws()
+    # Enable all content types for this workspace so we still exercise the
+    # full 3-generator path (call scripts + LinkedIn DMs now default OFF).
+    from src.icp_config import ICPConfig, save_workspace_icp_config
+    save_workspace_icp_config(
+        ICPConfig(
+            generate_email_enabled=True,
+            generate_call_script_enabled=True,
+            generate_linkedin_dm_enabled=True,
+        ),
+        workspace_id=ws_id,
+    )
     generated = []
 
     async def fake_gen(lead_id, *, workspace_id=None, **kw):
@@ -1132,6 +1143,17 @@ def test_evergreen_processing_runs_scoring(monkeypatch):
 
 def test_evergreen_processing_runs_content_generation(monkeypatch):
     ws_id = _seed_ws()
+    # Enable all content types so this still exercises the full 3-generator
+    # path (call scripts + LinkedIn DMs default OFF for cost saving).
+    from src.icp_config import ICPConfig, save_workspace_icp_config
+    save_workspace_icp_config(
+        ICPConfig(
+            generate_email_enabled=True,
+            generate_call_script_enabled=True,
+            generate_linkedin_dm_enabled=True,
+        ),
+        workspace_id=ws_id,
+    )
     generated: list[int] = []
 
     async def spy_gen(lead_id, *, workspace_id=None, **kw):

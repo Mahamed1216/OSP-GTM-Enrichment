@@ -38,7 +38,15 @@ async def generate_call_script(
     *,
     regeneration_feedback: str | None = None,
     workspace_id: int | None = None,
-) -> CallScript:
+) -> CallScript | None:
+    # Defense-in-depth cost gate: when the workspace has call-script generation
+    # disabled, skip cleanly — no LLM call, no placeholder/failed record, no
+    # row written. Returns None so callers can treat it as "skipped_disabled".
+    from src.icp_config import is_content_type_enabled
+    if not is_content_type_enabled("call_script", workspace_id):
+        log.info("call_script_skipped_disabled", extra={"lead_id": lead_id, "workspace_id": workspace_id})
+        return None
+
     with session_scope() as session:
         lead = session.get(Lead, lead_id)
         if not lead:
