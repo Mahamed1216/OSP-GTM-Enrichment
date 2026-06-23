@@ -1,0 +1,85 @@
+# Build the Docker image, push it to Amazon ECR, and deploy to the ECS
+# "staging" cluster on every push to main.
+#
+# Secrets are NEVER committed: AWS credentials come from GitHub Actions secrets,
+# and app secrets are injected at runtime by ECS from SSM/Secrets Manager (see
+# aws/ecs-task-definition-api.json + the "AWS ECS/ECR Deployment" README section).
+#
+# This workflow does NOT create AWS resources. The ECR repository, ECS cluster,
+# ECS service, task roles, and CloudWatch log group must already exist (one-time
+# setup — see README). To create the ECR repo:
+#   aws ecr create-repository --repository-name osp-gtm-enrichment --region us-east-2
+name: Deploy API to ECS (staging)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    # Manual trigger from the Actions tab (re-deploy without a new commit).
+
+# Don't let two deploys race the same service.
+concurrency:
+  group: deploy-ecs-staging
+  cancel-in-progress: false
+
+env:
+  # Default region is us-east-2; the AWS_REGION secret overrides it if set.
+  AWS_REGION: us-east-2
+  ECR_REPOSITORY: osp-gtm-enrichment
+  ECS_CLUSTER: staging
+  ECS_SERVICE: osp-gtm-api          # change here if the real ECS service name differs
+  ECS_TASK_DEFINITION: aws/ecs-task-definition-api.json
+  CONTAINER_NAME: osp-gtm-api
+
+jobs:
+  deploy:
+    name: Build, push, and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          # Use the AWS_REGION secret when provided; otherwise default to us-east-2.
+          aws-region: ${{ secrets.AWS_REGION || env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker build \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" \
+            .
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Render ECS task definition with the new image
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true

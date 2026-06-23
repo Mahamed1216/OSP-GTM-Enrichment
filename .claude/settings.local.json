@@ -56,7 +56,11 @@
       "Bash(git commit -m ' *)",
       "Bash(docker --version)",
       "Bash(taskkill //F //IM python.exe)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "Bash(docker build *)",
+      "Bash(echo \"BUILD_EXIT=$?\")",
+      "Bash(py -m pytest tests/ -q -p no:cacheprovider --ignore=tests/test_llm_live.py --ignore=tests/test_ingest_writer.py)",
+      "Bash(echo \"PYTEST_EXIT=$?\")"
     ]
   }
 }

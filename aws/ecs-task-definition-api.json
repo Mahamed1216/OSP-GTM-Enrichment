@@ -1,0 +1,75 @@
+{
+  "family": "osp-gtm-api",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "<EXECUTION_ROLE_ARN>",
+  "taskRoleArn": "<TASK_ROLE_ARN>",
+  "containerDefinitions": [
+    {
+      "name": "osp-gtm-api",
+      "image": "PLACEHOLDER_IMAGE_REPLACED_BY_WORKFLOW",
+      "essential": true,
+      "command": ["uvicorn", "src.api.server:app", "--host", "0.0.0.0", "--port", "8000"],
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "SALESOS_INTEGRATION_MODE",
+          "value": "false"
+        },
+        {
+          "name": "INSTANTLY_CAMPAIGN_ID",
+          "value": ""
+        }
+      ],
+      "secrets": [
+        {
+          "name": "DATABASE_URL",
+          "valueFrom": "arn:aws:ssm:us-east-2:<AWS_ACCOUNT_ID>:parameter/osp-gtm/DATABASE_URL"
+        },
+        {
+          "name": "ANTHROPIC_API_KEY",
+          "valueFrom": "arn:aws:ssm:us-east-2:<AWS_ACCOUNT_ID>:parameter/osp-gtm/ANTHROPIC_API_KEY"
+        },
+        {
+          "name": "TAVILY_API_KEY",
+          "valueFrom": "arn:aws:ssm:us-east-2:<AWS_ACCOUNT_ID>:parameter/osp-gtm/TAVILY_API_KEY"
+        },
+        {
+          "name": "APIFY_API_TOKEN",
+          "valueFrom": "arn:aws:ssm:us-east-2:<AWS_ACCOUNT_ID>:parameter/osp-gtm/APIFY_API_TOKEN"
+        },
+        {
+          "name": "INSTANTLY_API_KEY",
+          "valueFrom": "arn:aws:ssm:us-east-2:<AWS_ACCOUNT_ID>:parameter/osp-gtm/INSTANTLY_API_KEY"
+        },
+        {
+          "name": "INSTANTLY_WEBHOOK_SECRET",
+          "valueFrom": "arn:aws:ssm:us-east-2:<AWS_ACCOUNT_ID>:parameter/osp-gtm/INSTANTLY_WEBHOOK_SECRET"
+        },
+        {
+          "name": "LEAD_SOURCE_JOB_SECRET",
+          "valueFrom": "arn:aws:ssm:us-east-2:<AWS_ACCOUNT_ID>:parameter/osp-gtm/LEAD_SOURCE_JOB_SECRET"
+        },
+        {
+          "name": "INTERNAL_API_KEY",
+          "valueFrom": "arn:aws:ssm:us-east-2:<AWS_ACCOUNT_ID>:parameter/osp-gtm/INTERNAL_API_KEY"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "<AWSLOGS_GROUP>",
+          "awslogs-region": "<AWSLOGS_REGION>",
+          "awslogs-stream-prefix": "<AWSLOGS_STREAM_PREFIX>"
+        }
+      }
+    }
+  ]
+}

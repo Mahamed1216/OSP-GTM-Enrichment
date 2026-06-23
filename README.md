@@ -239,6 +239,94 @@ bake them into the image or commit `.env`.
 
 ---
 
+## AWS ECS/ECR Deployment (GitHub Actions)
+
+CI/CD is wired up in
+[`.github/workflows/deploy-ecs.yml`](.github/workflows/deploy-ecs.yml). On every
+push to `main` (or a manual **Run workflow**), GitHub Actions:
+
+1. Builds the Docker image (the existing `Dockerfile`).
+2. Pushes it to **Amazon ECR** (`osp-gtm-enrichment`, tagged with the commit SHA
+   and `latest`).
+3. Renders the ECS task definition
+   ([`aws/ecs-task-definition-api.json`](aws/ecs-task-definition-api.json)) with
+   the new image.
+4. Deploys it to the **ECS cluster `staging`** and waits for service stability.
+
+It uses the official AWS actions (`configure-aws-credentials`, `amazon-ecr-login`,
+`amazon-ecs-render-task-definition`, `amazon-ecs-deploy-task-definition`). It does
+**not** change app behavior, weaken safety gates, auto-send email, auto-push to
+Instantly, or remove the Streamlit fallback dashboard — it only ships the same
+image the local Docker smoke tests already validated.
+
+### Workflow configuration (edit at the top of the workflow `env:`)
+
+| Variable              | Value                              |
+| --------------------- | ---------------------------------- |
+| `AWS_REGION`          | `us-east-2` (default; overridable by the `AWS_REGION` secret) |
+| `ECR_REPOSITORY`      | `osp-gtm-enrichment`               |
+| `ECS_CLUSTER`         | `staging`                          |
+| `ECS_SERVICE`         | `osp-gtm-api` *(change here if your real service name differs)* |
+| `ECS_TASK_DEFINITION` | `aws/ecs-task-definition-api.json` |
+| `CONTAINER_NAME`      | `osp-gtm-api`                      |
+
+### Required GitHub Actions secrets
+
+Set these in **Settings → Secrets and variables → Actions** (no AWS keys or app
+secrets are ever committed):
+
+| Secret                  | Purpose                                                         |
+| ----------------------- | -------------------------------------------------------------- |
+| `AWS_ACCESS_KEY_ID`     | IAM access key for the deploy user/role.                       |
+| `AWS_SECRET_ACCESS_KEY` | IAM secret key.                                                |
+| `AWS_REGION`            | Optional — overrides the `us-east-2` default if set.           |
+
+The IAM principal needs ECR push (`ecr:*` on the repo + `ecr:GetAuthorizationToken`)
+and ECS deploy permissions (`ecs:RegisterTaskDefinition`,
+`ecs:UpdateService`, `ecs:DescribeServices`, plus `iam:PassRole` for the task
+roles).
+
+### Required AWS resources (one-time setup — not created by the workflow)
+
+- **ECR repository** `osp-gtm-enrichment`:
+  ```bash
+  aws ecr create-repository --repository-name osp-gtm-enrichment --region us-east-2
+  ```
+- **ECS cluster** `staging` (Fargate).
+- **ECS service** `osp-gtm-api` in the `staging` cluster, fronting the
+  `osp-gtm-api` task (with VPC subnets + security group allowing the API port).
+  The workflow **updates** this service; it must already exist.
+- **Task execution role** (`<EXECUTION_ROLE_ARN>`) — lets ECS pull from ECR,
+  write CloudWatch logs, and read SSM/Secrets Manager. **Task role**
+  (`<TASK_ROLE_ARN>`) — runtime AWS permissions for the container.
+- **CloudWatch log group** matching `<AWSLOGS_GROUP>` /
+  `<AWSLOGS_STREAM_PREFIX>` in the task definition.
+- **Secrets / env vars** — fill in the `aws/ecs-task-definition-api.json`
+  placeholders. App secrets are referenced **by name** via `secrets[].valueFrom`
+  SSM parameters (e.g. `/osp-gtm/DATABASE_URL`); no secret values live in the
+  repo. Create them once, e.g.:
+  ```bash
+  aws ssm put-parameter --name /osp-gtm/DATABASE_URL --type SecureString \
+    --value "<value>" --region us-east-2
+  ```
+  `SALESOS_INTEGRATION_MODE` is a non-secret config flag (defaults to `false`).
+
+### First deploy flow
+
+```
+edit aws/ecs-task-definition-api.json placeholders (roles, log group, SSM ARNs, account id)
+  → create ECR repo + ECS cluster/service + roles + log group + SSM params (one time)
+  → set GitHub secrets (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY [, AWS_REGION])
+  → git push main
+  → GitHub Actions: build Docker → push to ECR → render task def → update ECS service `osp-gtm-api`
+```
+
+> The placeholders in the task definition (`<EXECUTION_ROLE_ARN>`,
+> `<TASK_ROLE_ARN>`, `<AWS_ACCOUNT_ID>`, `<AWSLOGS_GROUP>`, `<AWSLOGS_REGION>`,
+> `<AWSLOGS_STREAM_PREFIX>`) must be filled in before the first successful deploy.
+
+---
+
 ## SalesOS integration (primary production model)
 
 **SalesOS is the primary CSM-facing UI.** The engine runs as a Dockerized
