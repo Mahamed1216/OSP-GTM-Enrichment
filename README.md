@@ -230,11 +230,11 @@ in the app**, not via env.
 | Scheduler            | **EventBridge** scheduled task → `python -m src.lead_source.scheduler` |
 | API async worker     | ECS service (`python -m src.api.worker`) or EventBridge `--once`    |
 | SalesOS workers      | ECS services / EventBridge `--once`: `src.integrations.salesos.worker` + `src.integrations.salesos.send_approved` |
-| Secrets              | **AWS Secrets Manager** or **SSM Parameter Store** (inject as env)  |
+| Secrets              | **AWS Secrets Manager** (injected into the task as env vars)        |
 | Logs                 | **CloudWatch**                                                      |
 | Database             | **Supabase Postgres** initially via `DATABASE_URL`; **RDS Postgres** as a later migration |
 
-Put secrets in Secrets Manager / SSM and inject them as task env vars — do not
+Put secrets in AWS Secrets Manager and inject them as task env vars — do not
 bake them into the image or commit `.env`.
 
 ---
@@ -299,38 +299,44 @@ roles).
 - **Task execution role** — the task definition uses
   `arn:aws:iam::802589444494:role/ecsTaskExecutionRole` (the conventional ECS
   execution role). It lets ECS pull from ECR, write CloudWatch logs, and read the
-  SSM parameters. If the execution role in account `802589444494` has a different
-  name, update `executionRoleArn` in `aws/ecs-task-definition-api.json`. No task
-  role is set — the container makes no AWS SDK calls at runtime (it only reads SSM
-  at startup via the execution role).
+  Secrets Manager secrets. If the execution role in account `802589444494` has a
+  different name, update `executionRoleArn` in `aws/ecs-task-definition-api.json`.
+  No task role is set — the container makes no AWS SDK calls at runtime (it only
+  reads Secrets Manager at startup via the execution role).
 - **CloudWatch log group** `/ecs/osp-gtm-api` in `us-east-2` (stream prefix
   `ecs`), matching the task definition's `logConfiguration`. Create it once:
   ```bash
   aws logs create-log-group --log-group-name /ecs/osp-gtm-api --region us-east-2
   ```
-- **Secrets / env vars** — app secrets are referenced **by SSM parameter name**
-  (not full ARNs) via `secrets[].valueFrom` in `aws/ecs-task-definition-api.json`
-  (e.g. `/osp-gtm/DATABASE_URL`); no secret values live in the repo. Using the
-  parameter **name** (rather than an ARN) makes ECS resolve each parameter in the
-  **task's own account and region**, which avoids the "Systems Manager parameter
-  ARN has a different account ID" registration error. The parameters must
-  therefore exist in **AWS account `802589444494`**, **region `us-east-2`** (the
-  account/region this service deploys to). Create them once, e.g.:
+- **Secrets / env vars** — app secrets are stored in **AWS Secrets Manager** and
+  referenced via `secrets[].valueFrom` ARNs in `aws/ecs-task-definition-api.json`
+  (e.g. `arn:aws:secretsmanager:us-east-2:802589444494:secret:osp-gtm/DATABASE_URL`);
+  no secret values live in the repo. The secrets must exist in **AWS account
+  `802589444494`**, **region `us-east-2`**. Create them once, e.g.:
   ```bash
-  aws ssm put-parameter --name /osp-gtm/DATABASE_URL --type SecureString \
-    --value "<value>" --region us-east-2
+  aws secretsmanager create-secret --name osp-gtm/DATABASE_URL \
+    --secret-string "<value>" --region us-east-2
   ```
-  Required parameter names: `/osp-gtm/DATABASE_URL`, `/osp-gtm/ANTHROPIC_API_KEY`,
-  `/osp-gtm/TAVILY_API_KEY`, `/osp-gtm/APIFY_API_TOKEN`, `/osp-gtm/INSTANTLY_API_KEY`,
-  `/osp-gtm/INSTANTLY_WEBHOOK_SECRET`, `/osp-gtm/LEAD_SOURCE_JOB_SECRET`,
-  `/osp-gtm/INTERNAL_API_KEY`. The task execution role needs
-  `ssm:GetParameters` on these (plus `kms:Decrypt` for `SecureString`).
-  `SALESOS_INTEGRATION_MODE` is a non-secret config flag (defaults to `false`).
+  Required secret names: `osp-gtm/DATABASE_URL`, `osp-gtm/ANTHROPIC_API_KEY`,
+  `osp-gtm/TAVILY_API_KEY`, `osp-gtm/APIFY_API_TOKEN`, `osp-gtm/INSTANTLY_API_KEY`,
+  `osp-gtm/INSTANTLY_WEBHOOK_SECRET`, `osp-gtm/LEAD_SOURCE_JOB_SECRET`,
+  `osp-gtm/INTERNAL_API_KEY`. The task execution role needs
+  `secretsmanager:GetSecretValue` on these (plus `kms:Decrypt` if a customer-managed
+  KMS key is used).
+
+  > Secrets Manager appends a random 6-character suffix to each ARN
+  > (e.g. `...secret:osp-gtm/DATABASE_URL-AbCdEf`). ECS resolves the ARN **without**
+  > the suffix (as written here) to the current version, so no edit is needed after
+  > creating the secrets. If you prefer pinning, append the real suffix AWS shows in
+  > `aws secretsmanager describe-secret`.
+
+  `SALESOS_INTEGRATION_MODE` and `INSTANTLY_CAMPAIGN_ID` stay as non-secret
+  `environment` entries (`SALESOS_INTEGRATION_MODE` defaults to `false`).
 
 ### First deploy flow
 
 ```
-create ECR repo + ECS cluster/service + execution role + log group + SSM params (one time)
+create ECR repo + ECS cluster/service + execution role + log group + Secrets Manager secrets (one time)
   → set GitHub secrets (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY [, AWS_REGION])
   → git push main
   → GitHub Actions: build Docker → push to ECR → render task def → update ECS service `osp-gtm-api`
@@ -340,8 +346,8 @@ create ECR repo + ECS cluster/service + execution role + log group + SSM params 
 > `802589444494`, log group `/ecs/osp-gtm-api`, region `us-east-2`) — no
 > angle-bracket placeholders remain. Verify the `executionRoleArn` matches your
 > real execution-role name, and ensure the log group, ECS service, and the
-> `/osp-gtm/*` SSM parameters all exist in account `802589444494` / `us-east-2`
-> before the first deploy.
+> `osp-gtm/*` Secrets Manager secrets all exist in account `802589444494` /
+> `us-east-2` before the first deploy.
 
 ---
 

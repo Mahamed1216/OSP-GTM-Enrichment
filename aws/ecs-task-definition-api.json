@@ -30,35 +30,35 @@
       "secrets": [
         {
           "name": "DATABASE_URL",
-          "valueFrom": "/osp-gtm/DATABASE_URL"
+          "valueFrom": "arn:aws:secretsmanager:us-east-2:802589444494:secret:osp-gtm/DATABASE_URL"
         },
         {
           "name": "ANTHROPIC_API_KEY",
-          "valueFrom": "/osp-gtm/ANTHROPIC_API_KEY"
+          "valueFrom": "arn:aws:secretsmanager:us-east-2:802589444494:secret:osp-gtm/ANTHROPIC_API_KEY"
         },
         {
           "name": "TAVILY_API_KEY",
-          "valueFrom": "/osp-gtm/TAVILY_API_KEY"
+          "valueFrom": "arn:aws:secretsmanager:us-east-2:802589444494:secret:osp-gtm/TAVILY_API_KEY"
         },
         {
           "name": "APIFY_API_TOKEN",
-          "valueFrom": "/osp-gtm/APIFY_API_TOKEN"
+          "valueFrom": "arn:aws:secretsmanager:us-east-2:802589444494:secret:osp-gtm/APIFY_API_TOKEN"
         },
         {
           "name": "INSTANTLY_API_KEY",
-          "valueFrom": "/osp-gtm/INSTANTLY_API_KEY"
+          "valueFrom": "arn:aws:secretsmanager:us-east-2:802589444494:secret:osp-gtm/INSTANTLY_API_KEY"
         },
         {
           "name": "INSTANTLY_WEBHOOK_SECRET",
-          "valueFrom": "/osp-gtm/INSTANTLY_WEBHOOK_SECRET"
+          "valueFrom": "arn:aws:secretsmanager:us-east-2:802589444494:secret:osp-gtm/INSTANTLY_WEBHOOK_SECRET"
         },
         {
           "name": "LEAD_SOURCE_JOB_SECRET",
-          "valueFrom": "/osp-gtm/LEAD_SOURCE_JOB_SECRET"
+          "valueFrom": "arn:aws:secretsmanager:us-east-2:802589444494:secret:osp-gtm/LEAD_SOURCE_JOB_SECRET"
         },
         {
           "name": "INTERNAL_API_KEY",
-          "valueFrom": "/osp-gtm/INTERNAL_API_KEY"
+          "valueFrom": "arn:aws:secretsmanager:us-east-2:802589444494:secret:osp-gtm/INTERNAL_API_KEY"
         }
       ],
       "logConfiguration": {
