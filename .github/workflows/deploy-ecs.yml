@@ -27,7 +27,7 @@ env:
   AWS_REGION: us-east-2
   ECR_REPOSITORY: osp-gtm-enrichment
   ECS_CLUSTER: staging
-  ECS_SERVICE: ECS_SERVICE: osp-gtm-api-service-ypivw3fk          # change here if the real ECS service name differs
+  ECS_SERVICE: osp-gtm-api-service-ypivw3fk          # change here if the real ECS service name differs
   ECS_TASK_DEFINITION: aws/ecs-task-definition-api.json
   CONTAINER_NAME: osp-gtm-api
 
