@@ -2,7 +2,7 @@
 # "staging" cluster on every push to main.
 #
 # Secrets are NEVER committed: AWS credentials come from GitHub Actions secrets,
-# and app secrets are injected at runtime by ECS from SSM/Secrets Manager (see
+# and app secrets are injected at runtime by ECS from AWS Secrets Manager (see
 # aws/ecs-task-definition-api.json + the "AWS ECS/ECR Deployment" README section).
 #
 # This workflow does NOT create AWS resources. The ECR repository, ECS cluster,
@@ -27,7 +27,7 @@ env:
   AWS_REGION: us-east-2
   ECR_REPOSITORY: osp-gtm-enrichment
   ECS_CLUSTER: staging
-  ECS_SERVICE: osp-gtm-api          # change here if the real ECS service name differs
+  ECS_SERVICE: ECS_SERVICE: osp-gtm-api-service-ypivw3fk          # change here if the real ECS service name differs
   ECS_TASK_DEFINITION: aws/ecs-task-definition-api.json
   CONTAINER_NAME: osp-gtm-api
 
