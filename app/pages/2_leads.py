@@ -549,7 +549,10 @@ if selected_lead_ids:
             # Lazy-fetch campaign info; cache 5min in session_state.
             campaign_cache = st.session_state.get("push_campaign_cache") or {}
             cached_at = campaign_cache.get("at", 0)
-            if time.time() - cached_at > 300:
+            # Only fetch campaign info when a campaign id actually resolved —
+            # otherwise we'd crash before the debug panel can show the missing
+            # reason. The config gate below blocks the push when it's absent.
+            if _push_campaign_id and time.time() - cached_at > 300:
                 try:
                     campaign = run_async(get_campaign(_push_campaign_id))
                     campaign_cache = {"at": time.time(), "data": campaign}
@@ -579,6 +582,29 @@ if selected_lead_ids:
             st.caption(f"Sender(s): {', '.join(senders)}")
             st.caption(f"Daily send rate: {daily_limit}")
 
+            # --- Debug panel: Instantly push configuration (shared resolver) ---
+            # Shows exactly what the push will use, BEFORE Confirm. Never shows
+            # the full API key — only configured yes/no, source, masked prefix.
+            with st.container(border=True):
+                st.markdown("**Instantly push configuration**")
+                _dbg1, _dbg2 = st.columns(2)
+                _dbg1.markdown(
+                    f"**API key configured:** {'✅ Yes' if _push_cfg.api_key else '❌ No'}"
+                )
+                _dbg1.markdown(f"**API key source:** `{_push_cfg.api_key_source}`")
+                _dbg2.markdown(
+                    f"**Campaign ID configured:** {'✅ Yes' if _push_cfg.campaign_id else '❌ No'}"
+                )
+                _dbg2.markdown(f"**Campaign ID source:** `{_push_cfg.campaign_id_source}`")
+                if _push_cfg.missing_reasons:
+                    st.error("Missing reasons: " + ", ".join(_push_cfg.missing_reasons))
+                else:
+                    st.caption("Push configuration OK.")
+
+            # Block the push outright when config is incomplete — exact reasons,
+            # no vague combined message, and never marks a lead sent.
+            _config_ok = not _push_cfg.missing_reasons
+
             # Safety checkbox. Stable key → its checked state persists across
             # the rerun that checking it triggers. Required for any batch over
             # the hard limit; smaller batches still confirm via the button.
@@ -591,7 +617,7 @@ if selected_lead_ids:
 
             button_enabled = confirm_button_enabled(
                 n_eligible, bool(ack_checked), _BULK_PUSH_HARD_LIMIT
-            )
+            ) and _config_ok
             log.info(
                 "push_confirm_render",
                 extra={
@@ -614,7 +640,11 @@ if selected_lead_ids:
             if cc2.button("Cancel", key="cancel_push", type="secondary"):
                 st.session_state.pop(_TOKEN_KEY, None)
                 st.rerun()
-            if not button_enabled:
+            if not _config_ok:
+                cc3.caption(
+                    ":red[Cannot push — " + ", ".join(_push_cfg.missing_reasons) + ".]"
+                )
+            elif not button_enabled:
                 cc3.caption(":gray[Check the box above to enable Confirm push.]")
 
             if confirm_clicked:

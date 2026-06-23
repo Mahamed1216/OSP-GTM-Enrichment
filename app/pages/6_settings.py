@@ -22,7 +22,7 @@ import streamlit as st
 
 from app.lib.workspace_state import get_current_workspace, get_current_workspace_id, render_workspace_banner, set_current_workspace
 from app.styles import inject_styles
-from src.delivery.instantly_config import resolve_instantly_config
+from src.delivery.instantly_config import build_instantly_diagnostic, resolve_instantly_config
 from src.workspace import (
     backfill_osp_icp_config,
     create_workspace,
@@ -178,6 +178,29 @@ if _selected_ws:
             f"{_API_SRC_LABELS.get(_inst_cfg.api_key_source, _inst_cfg.api_key_source)}, "
             f"campaign ID from {_CAMP_SRC_LABELS.get(_inst_cfg.campaign_id_source, _inst_cfg.campaign_id_source)}."
         )
+
+    # --- Temporary runtime diagnostic: which runtime/source exposes creds? ---
+    # Booleans + masked prefix only — the full API key is never shown/logged.
+    with st.expander("Instantly runtime diagnostic (temporary)", expanded=bool(_inst_cfg.missing_reasons)):
+        _diag = build_instantly_diagnostic(
+            _selected_ws_id, allow_campaign_env_fallback=(_selected_ws_id is None)
+        )
+        dg1, dg2 = st.columns(2)
+        with dg1:
+            st.markdown(f"**workspace_id:** `{_diag['workspace_id']}`")
+            st.markdown(f"**workspace_slug:** `{_diag['workspace_slug']}`")
+            st.markdown(f"**api_key_found:** {'yes' if _diag['api_key_found'] else 'no'}")
+            st.markdown(f"**api_key_source:** `{_diag['api_key_source']}`")
+            st.markdown(f"**api_key (masked):** `{_diag['api_key_masked']}`")
+        with dg2:
+            st.markdown(f"**campaign_id_found:** {'yes' if _diag['campaign_id_found'] else 'no'}")
+            st.markdown(f"**campaign_id_source:** `{_diag['campaign_id_source']}`")
+            st.markdown(
+                "**missing_reasons:** "
+                + (", ".join(_diag["missing_reasons"]) if _diag["missing_reasons"] else "none")
+            )
+        st.markdown("**Per-source probes** (presence only — values never shown):")
+        st.json(_diag["probes"])
 
 with st.expander("Workspace foundation (read-only)", expanded=False):
     try:

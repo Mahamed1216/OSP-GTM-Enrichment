@@ -55,10 +55,12 @@ async def run_bulk_push(
     }
 
     try:
-        # Config guard — do not weaken safety gates.
+        # Config guard — do not weaken safety gates. Exact reason (no vague
+        # combined message). The campaign id is resolved by the shared resolver
+        # in the caller; the API key is enforced per-lead in deliver_email.
         if not (campaign_id or "").strip():
             rec["status"] = "blocked"
-            rec["error"] = "No Instantly campaign configured for this workspace."
+            rec["error"] = "missing_instantly_campaign_id"
             return rec
 
         # Re-run the full server-side safety/eligibility filter NOW (unsafe

@@ -14,14 +14,22 @@ the push path uses THIS resolver.)
 
 API key resolution order:
   A. environment variable   INSTANTLY_API_KEY
-  B. Streamlit secret        INSTANTLY_API_KEY
+  B. Streamlit secret        INSTANTLY_API_KEY        (top-level)
+  B'. Streamlit secret       [instantly] api_key       (nested table fallback)
   C. app config (settings)   settings.instantly_api_key  (itself loads env/.env)
 
 Campaign ID resolution order:
   A. workspace.instantly_campaign_id  (workspace column)
   B. workspace config campaign id      (workspace.icp_config["instantly_campaign_id"], if present)
   C. environment variable   INSTANTLY_CAMPAIGN_ID
-  D. Streamlit secret        INSTANTLY_CAMPAIGN_ID
+  D. Streamlit secret        INSTANTLY_CAMPAIGN_ID     (top-level)
+  D'. Streamlit secret       [instantly] campaign_id    (nested table fallback)
+
+Why the nested fallback matters: app.lib.config.bootstrap_env_from_streamlit_secrets()
+mirrors only TOP-LEVEL SCALAR secrets into os.environ and silently skips nested
+TOML tables. So secrets stored as a ``[instantly]`` section never reach
+os.environ / pydantic settings, and a top-level ``st.secrets.get("INSTANTLY_API_KEY")``
+also misses them. We therefore read st.secrets directly here — both shapes.
 
 The env/secret campaign fallback (C/D) is gated by ``allow_campaign_env_fallback``
 so the push path can require an explicitly-selected workspace to resolve its OWN
@@ -53,22 +61,59 @@ def _mask_key(key: str | None) -> str:
     return f"{k[:4]}…(len={len(k)})"
 
 
-def _read_streamlit_secret(name: str) -> str | None:
-    """Best-effort read of a Streamlit secret. Returns None outside a Streamlit
-    runtime, or when the secret / secrets.toml is absent. Never raises."""
+def _streamlit_secrets_obj():
+    """Return the st.secrets mapping if available in this runtime, else None.
+
+    Never raises: tolerates streamlit not installed, no secrets.toml, and
+    st.secrets not yet initialised (common outside a script run)."""
     try:
-        import streamlit as st
+        import streamlit as st  # local import on purpose
     except Exception:
         return None
     try:
-        val = st.secrets.get(name)  # type: ignore[attr-defined]
+        secrets = st.secrets
+        # Touch it so a missing-secrets runtime raises here and we return None.
+        _ = secrets.get  # attribute access; cheap
+        return secrets
     except Exception:
-        # No secrets file, or st.secrets not initialised — degrade silently.
         return None
-    if val is None:
+
+
+def _secret_value_present(value) -> bool:
+    return value is not None and str(value).strip() != ""
+
+
+def _read_streamlit_secret(
+    top_level_key: str,
+    *,
+    nested_key: str | None = None,
+    section: str = "instantly",
+) -> str | None:
+    """Read a Streamlit secret, trying the TOP-LEVEL key first, then a nested
+    ``[section]`` table (e.g. ``[instantly] api_key``). Returns None outside a
+    Streamlit runtime or when absent. Never raises."""
+    secrets = _streamlit_secrets_obj()
+    if secrets is None:
         return None
-    s = str(val).strip()
-    return s or None
+    # Top-level: INSTANTLY_API_KEY = "..."
+    try:
+        val = secrets.get(top_level_key)
+        if _secret_value_present(val):
+            return str(val).strip()
+    except Exception:
+        pass
+    # Nested table: [instantly]\n api_key = "..."
+    if nested_key:
+        try:
+            sect = secrets.get(section)
+            if sect is not None:
+                getter = getattr(sect, "get", None)
+                nv = getter(nested_key) if callable(getter) else None
+                if _secret_value_present(nv):
+                    return str(nv).strip()
+        except Exception:
+            pass
+    return None
 
 
 def _resolve_api_key() -> tuple[str | None, str]:
@@ -79,7 +124,7 @@ def _resolve_api_key() -> tuple[str | None, str]:
     env_key = (os.environ.get("INSTANTLY_API_KEY") or "").strip()
     if env_key:
         return env_key, "env"
-    sec = _read_streamlit_secret("INSTANTLY_API_KEY")
+    sec = _read_streamlit_secret("INSTANTLY_API_KEY", nested_key="api_key")
     if sec:
         return sec, "streamlit_secrets"
     cfg_key = (settings.instantly_api_key or "").strip()
@@ -113,7 +158,7 @@ def _resolve_campaign_id_from_ws(
         ).strip()
         if env_cid:
             return env_cid, "env"
-        sec = _read_streamlit_secret("INSTANTLY_CAMPAIGN_ID")
+        sec = _read_streamlit_secret("INSTANTLY_CAMPAIGN_ID", nested_key="campaign_id")
         if sec:
             return sec, "streamlit_secrets"
 
@@ -187,3 +232,75 @@ def resolve_instantly_config(
         campaign_id_source=campaign_id_source,
         missing_reasons=missing_reasons,
     )
+
+
+def _probe_top_secret(key: str) -> bool:
+    """True if a TOP-LEVEL Streamlit secret with this key is present (value hidden)."""
+    secrets = _streamlit_secrets_obj()
+    if secrets is None:
+        return False
+    try:
+        return _secret_value_present(secrets.get(key))
+    except Exception:
+        return False
+
+
+def _probe_nested_secret(key: str, *, section: str = "instantly") -> bool:
+    """True if ``[section] key`` nested Streamlit secret is present (value hidden)."""
+    secrets = _streamlit_secrets_obj()
+    if secrets is None:
+        return False
+    try:
+        sect = secrets.get(section)
+        getter = getattr(sect, "get", None) if sect is not None else None
+        return _secret_value_present(getter(key)) if callable(getter) else False
+    except Exception:
+        return False
+
+
+def build_instantly_diagnostic(
+    workspace_id: int | None = None,
+    *,
+    allow_campaign_env_fallback: bool = True,
+) -> dict:
+    """Runtime diagnostic for the Settings + Push panels.
+
+    Returns booleans + sources + a MASKED key prefix only — never the full key,
+    and never a raw secret value. Probes each source independently so an operator
+    can see *which* runtime (env vs Streamlit secrets, top-level vs nested
+    ``[instantly]``) actually exposes the credentials.
+    """
+    cfg = resolve_instantly_config(
+        workspace_id, allow_campaign_env_fallback=allow_campaign_env_fallback
+    )
+    workspace_slug = None
+    try:
+        from src.workspace import get_default_workspace, get_workspace_by_id
+        ws = (
+            get_workspace_by_id(workspace_id) if workspace_id is not None
+            else get_default_workspace()
+        )
+        workspace_slug = (ws or {}).get("slug")
+    except Exception:
+        workspace_slug = None
+
+    return {
+        "workspace_id": workspace_id,
+        "workspace_slug": workspace_slug,
+        # Resolved (what the push will actually use).
+        "campaign_id_found": bool(cfg.campaign_id),
+        "campaign_id_source": cfg.campaign_id_source,
+        "api_key_found": bool(cfg.api_key),
+        "api_key_source": cfg.api_key_source,
+        "api_key_masked": _mask_key(cfg.api_key),
+        "missing_reasons": list(cfg.missing_reasons),
+        # Independent per-source probes (presence only, values never exposed).
+        "probes": {
+            "env_INSTANTLY_API_KEY": bool((os.environ.get("INSTANTLY_API_KEY") or "").strip()),
+            "env_INSTANTLY_CAMPAIGN_ID": bool((os.environ.get("INSTANTLY_CAMPAIGN_ID") or "").strip()),
+            "secret_top_INSTANTLY_API_KEY": _probe_top_secret("INSTANTLY_API_KEY"),
+            "secret_top_INSTANTLY_CAMPAIGN_ID": _probe_top_secret("INSTANTLY_CAMPAIGN_ID"),
+            "secret_nested_instantly.api_key": _probe_nested_secret("api_key"),
+            "secret_nested_instantly.campaign_id": _probe_nested_secret("campaign_id"),
+        },
+    }
