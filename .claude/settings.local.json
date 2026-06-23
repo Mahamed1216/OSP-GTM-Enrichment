@@ -51,7 +51,12 @@
       "Bash(ps -W)",
       "Bash(tasklist)",
       "PowerShell(py *)",
-      "Bash(py -m pytest -p no:cacheprovider -q)"
+      "Bash(py -m pytest -p no:cacheprovider -q)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(docker --version)",
+      "Bash(taskkill //F //IM python.exe)",
+      "Bash(git *)"
     ]
   }
 }

@@ -615,3 +615,36 @@ class LeadSourceImport(Base):
     triggered_run_status: Mapped[Optional[str]] = mapped_column(String(32))
     # Total normalized source signals across all imported contacts in this run.
     source_signal_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class ApiRun(Base):
+    """Audit + async-tracking record for one internal-API process request.
+
+    SalesOS POSTs a lead/batch to /api/v1/leads/process; we persist the request
+    here so the run can be processed inline (sync) or by a background worker
+    (async, `python -m src.api.worker`) and polled via /api/v1/runs/{run_id}.
+
+    `run_id` is the external opaque handle ("run_<uuid>"). The raw request and
+    per-lead results are stored as JSON. NOTHING here ever sends an email or
+    pushes to Instantly — it only records and orchestrates the existing pipeline.
+    """
+    __tablename__ = "api_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    workspace_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)
+    source: Mapped[Optional[str]] = mapped_column(String(64))      # e.g. "salesos"
+    run_mode: Mapped[str] = mapped_column(String(16), default="async")  # sync | async
+    # queued | running | completed | failed | partial
+    status: Mapped[str] = mapped_column(String(16), default="queued", nullable=False, index=True)
+    lead_count: Mapped[int] = mapped_column(Integer, default=0)
+    processed_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    request_payload: Mapped[Optional[dict]] = mapped_column(JSON)
+    result_payload: Mapped[Optional[dict]] = mapped_column(JSON)
+    error: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=now_utc, onupdate=now_utc, nullable=False
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)

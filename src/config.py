@@ -37,6 +37,18 @@ class Settings(BaseSettings):
     tier_b_min: int = 70
     send_min_tier: Tier = "B"
 
+    # SalesOS integration
+    # When False (default): the engine runs in standalone mode — the Streamlit
+    # operator UI is the user-facing surface and the existing manual/confirm
+    # push flow is unchanged.
+    # When True: the engine runs as a Dockerized background worker against the
+    # shared SalesOS Supabase database. CSMs source leads + approve sends in
+    # SalesOS; the engine MUST NOT push to Instantly on tier alone — an explicit
+    # SalesOS CSM approval is required before any send (see
+    # src.integrations.salesos). Streamlit remains available as an internal
+    # admin/fallback UI regardless of this flag.
+    salesos_integration_mode: bool = False
+
     # Storage
     database_url: str = "sqlite:///sdr.db"
     log_dir: Path = Path("logs")

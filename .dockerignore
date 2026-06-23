@@ -1,0 +1,49 @@
+# Secrets — NEVER copy these into the image (config comes from env at runtime).
+.env
+.env.*
+*.env
+.streamlit/secrets.toml
+.streamlit/secrets.toml.*
+
+# Version control / CI
+.git
+.github
+.gitignore
+
+# Python caches / build artifacts
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.cache/
+
+# Virtual environments
+.venv
+venv
+env
+.lockenv
+
+# Local databases (never ship local data)
+*.db
+*.sqlite
+*.sqlite3
+sdr.db
+
+# Logs and local artifacts
+logs/
+*.log
+
+# Node / front-end tooling (if ever added)
+node_modules/
+
+# Editor / OS cruft
+.idea/
+.vscode/
+.DS_Store
+
+# Test + docs that don't belong in the runtime image
+tests/
+.claude/

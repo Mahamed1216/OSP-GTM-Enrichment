@@ -37,6 +37,7 @@ _RUNTIME_NEW_TABLES: tuple[str, ...] = (
     "reply_threads",
     "lead_source_imports",   # Phase 7: external lead source import log
     "lead_signals",          # Hiring signal C-tier rescue layer
+    "api_runs",              # Internal API (SalesOS) run tracking
 )
 
 
@@ -353,6 +354,16 @@ def init_db() -> None:
         backfill_default_workspace_ids()
         backfill_osp_icp_config()
         migrate_json_winners_to_osp_db()
+        # SalesOS integration: create the shared-Supabase contract tables only
+        # when integration mode is on, so a standalone deployment never grows
+        # unused salesos_* tables. The workers also ensure these lazily at boot.
+        if settings.salesos_integration_mode:
+            try:
+                from src.integrations.salesos import ensure_salesos_tables
+                ensure_salesos_tables()
+            except Exception:
+                import logging as _logging
+                _logging.getLogger(__name__).warning("salesos_ensure_tables_failed")
     except Exception:
         _db_initialized = False  # Allow the next caller to retry.
         raise
