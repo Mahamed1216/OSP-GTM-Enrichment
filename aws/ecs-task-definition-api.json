@@ -4,8 +4,7 @@
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "512",
   "memory": "1024",
-  "executionRoleArn": "<EXECUTION_ROLE_ARN>",
-  "taskRoleArn": "<TASK_ROLE_ARN>",
+  "executionRoleArn": "arn:aws:iam::802589444494:role/ecsTaskExecutionRole",
   "containerDefinitions": [
     {
       "name": "osp-gtm-api",
@@ -65,9 +64,9 @@
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
-          "awslogs-group": "<AWSLOGS_GROUP>",
-          "awslogs-region": "<AWSLOGS_REGION>",
-          "awslogs-stream-prefix": "<AWSLOGS_STREAM_PREFIX>"
+          "awslogs-group": "/ecs/osp-gtm-api",
+          "awslogs-region": "us-east-2",
+          "awslogs-stream-prefix": "ecs"
         }
       }
     }

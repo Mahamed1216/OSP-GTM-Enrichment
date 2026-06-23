@@ -296,11 +296,18 @@ roles).
 - **ECS service** `osp-gtm-api` in the `staging` cluster, fronting the
   `osp-gtm-api` task (with VPC subnets + security group allowing the API port).
   The workflow **updates** this service; it must already exist.
-- **Task execution role** (`<EXECUTION_ROLE_ARN>`) — lets ECS pull from ECR,
-  write CloudWatch logs, and read SSM/Secrets Manager. **Task role**
-  (`<TASK_ROLE_ARN>`) — runtime AWS permissions for the container.
-- **CloudWatch log group** matching `<AWSLOGS_GROUP>` /
-  `<AWSLOGS_STREAM_PREFIX>` in the task definition.
+- **Task execution role** — the task definition uses
+  `arn:aws:iam::802589444494:role/ecsTaskExecutionRole` (the conventional ECS
+  execution role). It lets ECS pull from ECR, write CloudWatch logs, and read the
+  SSM parameters. If the execution role in account `802589444494` has a different
+  name, update `executionRoleArn` in `aws/ecs-task-definition-api.json`. No task
+  role is set — the container makes no AWS SDK calls at runtime (it only reads SSM
+  at startup via the execution role).
+- **CloudWatch log group** `/ecs/osp-gtm-api` in `us-east-2` (stream prefix
+  `ecs`), matching the task definition's `logConfiguration`. Create it once:
+  ```bash
+  aws logs create-log-group --log-group-name /ecs/osp-gtm-api --region us-east-2
+  ```
 - **Secrets / env vars** — app secrets are referenced **by SSM parameter name**
   (not full ARNs) via `secrets[].valueFrom` in `aws/ecs-task-definition-api.json`
   (e.g. `/osp-gtm/DATABASE_URL`); no secret values live in the repo. Using the
@@ -323,19 +330,18 @@ roles).
 ### First deploy flow
 
 ```
-edit aws/ecs-task-definition-api.json placeholders (roles, log group)
-  → create ECR repo + ECS cluster/service + roles + log group + SSM params (one time)
+create ECR repo + ECS cluster/service + execution role + log group + SSM params (one time)
   → set GitHub secrets (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY [, AWS_REGION])
   → git push main
   → GitHub Actions: build Docker → push to ECR → render task def → update ECS service `osp-gtm-api`
 ```
 
-> The placeholders in the task definition (`<EXECUTION_ROLE_ARN>`,
-> `<TASK_ROLE_ARN>`, `<AWSLOGS_GROUP>`, `<AWSLOGS_REGION>`,
-> `<AWSLOGS_STREAM_PREFIX>`) must be filled in before the first successful deploy.
-> The SSM secrets are referenced by parameter **name** (e.g. `/osp-gtm/DATABASE_URL`),
-> so no account id is needed in the task definition — but the parameters must
-> exist in account `802589444494` / `us-east-2`.
+> The task definition now ships with concrete values (execution role in account
+> `802589444494`, log group `/ecs/osp-gtm-api`, region `us-east-2`) — no
+> angle-bracket placeholders remain. Verify the `executionRoleArn` matches your
+> real execution-role name, and ensure the log group, ECS service, and the
+> `/osp-gtm/*` SSM parameters all exist in account `802589444494` / `us-east-2`
+> before the first deploy.
 
 ---
 
