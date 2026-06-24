@@ -89,9 +89,67 @@ jobs:
           image: ${{ steps.build-image.outputs.image }}
 
       - name: Deploy to Amazon ECS
+        id: deploy-ecs
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
           task-definition: ${{ steps.render-task-def.outputs.task-definition }}
           service: ${{ env.ECS_SERVICE }}
           cluster: ${{ env.ECS_CLUSTER }}
           wait-for-service-stability: true
+
+      # When the deploy above fails or times out, the rollout started but the
+      # service never stabilized. The waiter error alone doesn't say WHY, so dump
+      # the ECS service events, the stopped-task stop reasons / container exit
+      # codes, and recent container logs. set +e keeps every probe running even if
+      # an individual AWS call fails. This step does NOT mask the failure — the
+      # job stays red because the deploy step already failed.
+      - name: ECS failure diagnostics
+        if: failure()
+        run: |
+          set +e
+
+          echo "::group::ECS service description"
+          aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --region "$AWS_REGION"
+          echo "::endgroup::"
+
+          echo "::group::Latest ECS service events (most recent 10)"
+          aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --region "$AWS_REGION" \
+            --query "services[0].events[0:10].[createdAt,message]" \
+            --output table
+          echo "::endgroup::"
+
+          echo "::group::Stopped task ARNs"
+          aws ecs list-tasks \
+            --cluster "$ECS_CLUSTER" \
+            --service-name "$ECS_SERVICE" \
+            --desired-status STOPPED \
+            --region "$AWS_REGION" \
+            --max-results 10
+          echo "::endgroup::"
+
+          echo "::group::Stopped task details (stop reason + container exit codes)"
+          TASKS=$(aws ecs list-tasks --cluster "$ECS_CLUSTER" --service-name "$ECS_SERVICE" --desired-status STOPPED --region "$AWS_REGION" --query "taskArns[]" --output text)
+          if [ -n "$TASKS" ]; then
+            aws ecs describe-tasks \
+              --cluster "$ECS_CLUSTER" \
+              --tasks $TASKS \
+              --region "$AWS_REGION" \
+              --query "tasks[].{stoppedReason:stoppedReason,stopCode:stopCode,containers:containers[].{name:name,lastStatus:lastStatus,exitCode:exitCode,reason:reason,logStreamName:logStreamName}}" \
+              --output json
+          else
+            echo "No stopped tasks found for $ECS_SERVICE."
+          fi
+          echo "::endgroup::"
+
+          echo "::group::Recent CloudWatch logs (/ecs/osp-gtm-api, last 30m)"
+          aws logs tail "/ecs/osp-gtm-api" \
+            --region "$AWS_REGION" \
+            --since 30m \
+            || true
+          echo "::endgroup::"
