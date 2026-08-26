@@ -1,20 +1,29 @@
-"""api/requirements.txt must cover everything the Vercel function imports.
+"""The Vercel function's dependencies must be declared where uv reads them.
 
-This deployment has now failed twice on a missing Python dependency, each time
-surfacing only as a runtime error on the live site. These tests turn that into a
-local failure: they walk the real import graph of the serverless function and
-assert every third-party module it can reach is declared.
+This deployment has failed three times on Python dependency declaration, each
+time surfacing only as an error on the live site:
+
+  1. requirements.txt was complete, but `[project]` in pyproject.toml had no
+     `dependencies` key, so uv installed nothing -> "No module named 'fastapi'".
+  2. Adding api/requirements.txt changed nothing; uv never looked at it.
+  3. Deleting `[project]` broke `uv lock` outright -> the build itself failed.
+
+Vercel builds with uv, so **pyproject.toml is authoritative**. These tests walk
+the function's real import graph and assert every third-party module it can
+reach is declared there, and that the two requirements.txt files agree with it.
 """
 from __future__ import annotations
 
 import ast
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
 
 _ROOT = Path(__file__).resolve().parent.parent
+_PYPROJECT = _ROOT / "pyproject.toml"
 _VERCEL_REQS = _ROOT / "api" / "requirements.txt"
 _ROOT_REQS = _ROOT / "requirements.txt"
 
@@ -27,11 +36,11 @@ _DIST_FOR_MODULE = {
     "starlette": "fastapi",  # ships as a fastapi dependency
 }
 
-# Imports the function may reach but must NOT declare. Both are guarded by
-# try/except ImportError because the Streamlit UI does not run on Vercel.
+# Reachable from the function but must NOT be declared: both import sites are
+# guarded by try/except ImportError and the Streamlit UI does not run on Vercel.
 _OPTIONAL_MODULES = {"streamlit", "pandas"}
 
-# Test-only packages that belong in the root file but not the function bundle.
+# Test-only packages: they belong in requirements.txt but not in the bundle.
 _TEST_ONLY = {"pytest", "pytest-asyncio"}
 
 
@@ -39,16 +48,31 @@ def _normalize(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def _declared(path: Path) -> dict[str, str]:
-    """Return {normalized package name: version specifier} from a reqs file."""
+def _split_requirement(spec: str) -> tuple[str, str]:
+    """'fastapi>=0.111.0,<1.0' -> ('fastapi', '>=0.111.0,<1.0')."""
+    match = re.match(r"^([A-Za-z0-9_.\-]+)(\[[^\]]+\])?(.*)$", spec.strip())
+    if not match:
+        return _normalize(spec), ""
+    return _normalize(match.group(1)), match.group(3).strip()
+
+
+def _pyproject() -> dict:
+    return tomllib.loads(_PYPROJECT.read_text(encoding="utf-8"))
+
+
+def _pyproject_deps() -> dict[str, str]:
+    project = _pyproject().get("project", {})
+    return dict(_split_requirement(dep) for dep in project.get("dependencies", []))
+
+
+def _requirements(path: Path) -> dict[str, str]:
     out: dict[str, str] = {}
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.split("#", 1)[0].strip()
         if not line or line.startswith("-"):
             continue
-        match = re.match(r"^([A-Za-z0-9_.\-]+)(\[[^\]]+\])?(.*)$", line)
-        if match:
-            out[_normalize(match.group(1))] = match.group(3).strip()
+        name, spec = _split_requirement(line)
+        out[name] = spec
     return out
 
 
@@ -77,18 +101,44 @@ def _imported_modules() -> dict[str, set[str]]:
     return found
 
 
-def test_vercel_requirements_file_exists():
-    """Vercel resolves requirements next to the function entrypoint."""
-    assert _VERCEL_REQS.is_file(), (
-        "api/requirements.txt is missing. Without it the Vercel Python function "
-        "deploys with no third-party packages and dies with "
-        "ModuleNotFoundError: No module named 'fastapi'."
+# ---------------------------------------------------------------------------
+# pyproject.toml — what Vercel's uv actually reads
+# ---------------------------------------------------------------------------
+
+def test_project_table_exists():
+    """`uv lock` fails outright without it: 'No `project` table found'."""
+    assert "project" in _pyproject(), (
+        "pyproject.toml must keep a [project] table — Vercel runs `uv lock`, "
+        "which refuses to run without one and fails the whole build."
     )
 
 
-def test_every_backend_import_is_declared():
-    declared = _declared(_VERCEL_REQS)
-    missing: list[str] = []
+def test_project_declares_dependencies():
+    """A [project] table with no dependencies makes uv install nothing."""
+    deps = _pyproject_deps()
+    assert deps, (
+        "[project].dependencies is empty. uv reads this file instead of "
+        "requirements.txt, so an empty list deploys a function with no "
+        "third-party packages at all."
+    )
+    assert "fastapi" in deps
+
+
+def test_no_build_system():
+    """Without [build-system] uv treats this as a virtual project.
+
+    Adding one makes uv build the repo as a package, and the flat layout
+    (src/, app/, api/, scripts/, tests/) breaks setuptools auto-discovery.
+    """
+    assert "build-system" not in _pyproject(), (
+        "Adding [build-system] makes uv try to build this repo as a package; "
+        "the flat layout will fail setuptools' auto-discovery."
+    )
+
+
+def test_every_backend_import_is_declared_in_pyproject():
+    declared = _pyproject_deps()
+    missing = []
     for module, files in sorted(_imported_modules().items()):
         if module in _OPTIONAL_MODULES:
             continue
@@ -96,48 +146,65 @@ def test_every_backend_import_is_declared():
         if dist not in declared:
             missing.append(f"{module} (-> {dist}) imported by {sorted(files)[0]}")
     assert not missing, (
-        "api/requirements.txt is missing packages the function imports:\n  "
+        "[project].dependencies is missing packages the function imports:\n  "
         + "\n  ".join(missing)
     )
 
 
 def test_psycopg2_declared():
     """SQLAlchemy loads the driver by name, so no import statement reveals it."""
-    assert "psycopg2-binary" in _declared(_VERCEL_REQS), (
+    assert "psycopg2-binary" in _pyproject_deps(), (
         "psycopg2-binary must be declared or every Postgres connection fails."
     )
 
 
 def test_optional_ui_packages_not_bundled():
-    declared = _declared(_VERCEL_REQS)
+    declared = _pyproject_deps()
     for name in _OPTIONAL_MODULES:
         assert _normalize(name) not in declared, (
-            f"{name} must not ship in the function bundle — its import sites are "
-            "guarded and it would bloat the serverless package."
+            f"{name} must not ship in the function bundle — its import sites "
+            "are guarded and it would bloat the serverless package."
         )
 
 
-@pytest.mark.parametrize("package", sorted(_declared(_VERCEL_REQS)))
-def test_version_specifiers_match_root_requirements(package):
-    """Shared packages must not drift between the two dependency files."""
-    root = _declared(_ROOT_REQS)
-    if package not in root:
-        pytest.skip(f"{package} is function-only")
-    assert _declared(_VERCEL_REQS)[package] == root[package], (
-        f"{package} is pinned differently in api/requirements.txt and "
-        "requirements.txt; the function would run a different version."
-    )
+def test_test_only_packages_not_bundled():
+    declared = _pyproject_deps()
+    for name in _TEST_ONLY:
+        assert name not in declared, f"{name} is test-only; keep it out of the bundle."
 
 
-def test_root_runtime_packages_are_covered():
-    """Anything runtime in the root file must reach the function too."""
-    vercel = _declared(_VERCEL_REQS)
+# ---------------------------------------------------------------------------
+# The requirements.txt files must not drift from pyproject.toml
+# ---------------------------------------------------------------------------
+
+def test_vercel_requirements_file_exists():
+    assert _VERCEL_REQS.is_file()
+
+
+@pytest.mark.parametrize("package", sorted(_pyproject_deps()))
+def test_requirements_files_match_pyproject(package):
+    pyproject = _pyproject_deps()
+    for path in (_ROOT_REQS, _VERCEL_REQS):
+        declared = _requirements(path)
+        assert package in declared, (
+            f"{package} is in [project].dependencies but missing from "
+            f"{path.relative_to(_ROOT)}"
+        )
+        assert declared[package] == pyproject[package], (
+            f"{package} is pinned differently in {path.relative_to(_ROOT)} "
+            f"({declared[package]}) and pyproject.toml ({pyproject[package]})"
+        )
+
+
+def test_root_runtime_packages_are_declared():
+    """Anything runtime in requirements.txt must reach the deployment too."""
+    pyproject = _pyproject_deps()
     missing = [
         name
-        for name in _declared(_ROOT_REQS)
-        if name not in _TEST_ONLY and name not in vercel
+        for name in _requirements(_ROOT_REQS)
+        if name not in _TEST_ONLY and name not in pyproject
     ]
     assert not missing, (
         "these runtime packages are in requirements.txt but not in "
-        f"api/requirements.txt: {missing}"
+        f"[project].dependencies: {missing}"
     )

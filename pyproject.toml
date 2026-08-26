@@ -1,20 +1,56 @@
-# Tooling config only — deliberately NOT a PEP 621 [project] definition.
+# Vercel builds the Python function with `uv`, and uv reads THIS file — not
+# requirements.txt. That makes `[project].dependencies` below the authoritative
+# dependency list for the deployment.
 #
-# This repo is a set of applications run from source (Streamlit UI, FastAPI
-# services, CLI scripts); nothing ever pip-installs it as a package. It used to
-# carry a [project] table with name/version/requires-python and no
-# `dependencies` key, which is a trap for any installer that prefers PEP 621
-# metadata over requirements.txt: it reads the table, finds no dependencies, and
-# installs nothing. That is the exact shape of the Vercel failure where the
-# Python function deployed and ran but had no third-party packages at all.
+# History worth keeping, because both failure modes were confusing:
+#   * A `[project]` table with no `dependencies` key => uv installs nothing.
+#     The function deploys and runs, but every import fails with
+#     "ModuleNotFoundError: No module named 'fastapi'".
+#   * No `[project]` table at all => `uv lock` refuses to run and the build
+#     fails with "No `project` table found in pyproject.toml".
 #
-# Dependencies live in:
-#   requirements.txt        runtime + tests (local dev, CI, Docker)
-#   requirements-ui.txt     Streamlit UI only
-#   api/requirements.txt    the Vercel serverless function
+# There is deliberately no [build-system]: without one, uv treats this as a
+# virtual project and installs only the dependencies, never trying to build the
+# repo as a package. That matters because the flat layout (src/, app/, api/,
+# scripts/, tests/) would break setuptools' auto-discovery.
 #
-# Do not reintroduce [project] without also declaring `dependencies` and a
-# [build-system].
+# requirements.txt and api/requirements.txt carry the same runtime set for local
+# dev, Docker and CI. tests/test_vercel_requirements.py fails if the three
+# files drift apart or if the backend grows an undeclared import.
+
+[project]
+name = "osp-gtm-enrichment"
+version = "0.1.0"
+description = "OSP GTM Enrichment API"
+requires-python = ">=3.11,<3.13"
+readme = "README.md"
+
+# Every third-party module reachable from api/index.py, verified by an AST walk
+# of api/, src/ and app/lib/config.py. Ranges match requirements.txt so the
+# deployment cannot resolve a different major version.
+#
+# Not listed, on purpose:
+#   streamlit, pandas  - operator UI only; both import sites are guarded by
+#                        try/except ImportError and the UI does not run here.
+#   pytest, pytest-asyncio - test-only; they stay in requirements.txt so they
+#                        never bloat the serverless bundle.
+#   requests, python-multipart, email-validator - nothing imports them.
+dependencies = [
+  "anthropic>=0.40.0,<1.0",
+  "apify-client>=1.7.0,<4.0",
+  "fastapi>=0.111.0,<1.0",
+  "httpx>=0.27.0,<1.0",
+  "nest-asyncio>=1.6.0,<2.0",
+  "psycopg2-binary>=2.9.9,<3.0",
+  "pydantic>=2.6.0,<3.0",
+  "pydantic-settings>=2.2.0,<3.0",
+  "python-dotenv>=1.0.0,<2.0",
+  "rich>=13.7.0,<16.0",
+  "sqlalchemy>=2.0.0,<3.0",
+  "tavily-python>=0.5.0,<1.0",
+  "tenacity>=8.2.0,<10.0",
+  "uvicorn>=0.29.0,<1.0",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
