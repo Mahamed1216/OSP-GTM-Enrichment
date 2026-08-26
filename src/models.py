@@ -403,7 +403,7 @@ class PromptRecommendation(Base):
 class PromptConfig(Base):
     """User-edited overrides for the three content-generation system prompts.
 
-    Persisted in the DB (not data/prompts_config.json) so Streamlit Cloud
+    Persisted in the DB (not data/prompts_config.json) so the deployment
     deploys don't wipe overrides — local disk is ephemeral there. One row
     per (channel, workspace_id) pair so each workspace has independent prompts.
 
@@ -620,7 +620,7 @@ class LeadSourceImport(Base):
 class ApiRun(Base):
     """Audit + async-tracking record for one internal-API process request.
 
-    SalesOS POSTs a lead/batch to /api/v1/leads/process; we persist the request
+    A caller POSTs a lead/batch to /api/v1/leads/process; we persist the request
     here so the run can be processed inline (sync) or by a background worker
     (async, `python -m src.api.worker`) and polled via /api/v1/runs/{run_id}.
 
@@ -633,7 +633,7 @@ class ApiRun(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     run_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
     workspace_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)
-    source: Mapped[Optional[str]] = mapped_column(String(64))      # e.g. "salesos"
+    source: Mapped[Optional[str]] = mapped_column(String(64))      # e.g. "api", "console"
     run_mode: Mapped[str] = mapped_column(String(16), default="async")  # sync | async
     # queued | running | completed | failed | partial
     status: Mapped[str] = mapped_column(String(16), default="queued", nullable=False, index=True)

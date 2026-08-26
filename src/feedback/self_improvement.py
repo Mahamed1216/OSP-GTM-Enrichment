@@ -831,7 +831,7 @@ def save_recommendation(
     except SQLAlchemyError as exc:
         # session_scope() already rolled back on the way out. We log
         # with the SQL the row tried to commit so the schema-vs-payload
-        # mismatch is debuggable from the Streamlit Cloud logs alone.
+        # mismatch is debuggable from the deployment logs alone.
         log.warning(
             "save_recommendation_failed",
             extra={

@@ -1,9 +1,8 @@
-"""Internal API for SalesOS.
+"""Internal API for the operator console and external callers.
 
-SalesOS sends lead payloads (sourced via Dele's system) here; we run the
-existing pipeline (enrichment, buyer research, signal capture, scoring, email,
-safety) and return the processed payload for SalesOS to route. We NEVER push to
-Instantly and NEVER send email.
+A caller POSTs lead payloads here; we run the pipeline (enrichment, buyer
+research, signal capture, scoring, email, safety) and return the processed
+payload. We NEVER push to Instantly and NEVER send email from this API.
 
 Run:
     uvicorn src.api.server:app --host 0.0.0.0 --port 8000
@@ -32,8 +31,8 @@ SERVICE_NAME = "osp-gtm-enrichment"
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    # Ensure schema exists when this runs as a standalone container against the
-    # shared DB. Guarded + idempotent; never fatal at boot.
+    # Ensure the schema exists when running as a long-lived server. Guarded +
+    # idempotent; never fatal at boot. The Vercel function does not run this.
     try:
         from src.db import init_db
         init_db()
@@ -44,7 +43,7 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(
     title="OSP GTM Enrichment — Internal API",
-    description="SalesOS-facing API to process sourced leads through the pipeline.",
+    description="API to process sourced leads through the enrichment pipeline.",
     version=API_VERSION,
     lifespan=_lifespan,
 )
@@ -90,7 +89,7 @@ async def require_api_key(authorization: str | None = Header(default=None)) -> N
 class ProcessRequest(BaseModel):
     workspace_slug: str | None = None
     workspace_id: int | None = None
-    source: str | None = "salesos"
+    source: str | None = "api"
     run_mode: str = "async"  # "async" (default) | "sync"
     options: dict | None = None
     leads: list[dict] = Field(default_factory=list)
@@ -122,7 +121,7 @@ def _resolve_workspace_id(req: ProcessRequest) -> int | None:
 
 @app.post(
     "/api/v1/leads/process",
-    summary="Process one lead or a batch (from SalesOS)",
+    summary="Process one lead or a batch",
     dependencies=[Depends(require_api_key)],
 )
 async def process_leads(req: ProcessRequest) -> dict:
@@ -249,3 +248,216 @@ def _iso(value) -> str | None:
         return value.isoformat()
     except AttributeError:
         return str(value)
+
+
+# ---------------------------------------------------------------------------
+# Console read APIs
+#
+# Everything below backs the operator console. All are read-only, workspace
+# scoped, and reuse the query layer in src/lib/db_queries.py rather than
+# introducing a second set of SQL. None of them return a secret value.
+# ---------------------------------------------------------------------------
+
+def _default_ws(workspace_id: int | None, workspace_slug: str | None) -> int | None:
+    """Resolve the workspace to read, falling back to the default one."""
+    if workspace_id is not None:
+        return workspace_id
+    if workspace_slug:
+        from src.workspace import get_workspace_by_slug
+        ws = get_workspace_by_slug(workspace_slug)
+        return ws["id"] if ws else -1  # unknown slug -> match nothing
+    from src.workspace import get_default_workspace_id
+    try:
+        return get_default_workspace_id()
+    except Exception:
+        return None
+
+
+@app.get(
+    "/api/v1/dashboard/summary",
+    summary="Counts, tier split and recent activity for the console home",
+    dependencies=[Depends(require_api_key)],
+)
+async def dashboard_summary(
+    workspace_id: int | None = None,
+    workspace_slug: str | None = None,
+) -> dict:
+    from src.lib.db_queries import (
+        kpi_counts,
+        ready_to_send_count,
+        recent_activity,
+        tier_distribution,
+    )
+
+    ws = _default_ws(workspace_id, workspace_slug)
+    counts = kpi_counts(ws)
+    recent_runs = run_store.list_recent_runs(limit=5, workspace_id=ws)
+    return {
+        "workspace_id": ws,
+        "counts": counts,
+        "tiers": tier_distribution(ws),
+        "ready_to_send": ready_to_send_count(ws),
+        "recent_activity": recent_activity(limit=8, workspace_id=ws),
+        "recent_runs": recent_runs,
+        "failed_runs": [r for r in recent_runs if r.get("status") == "failed"],
+    }
+
+
+@app.get(
+    "/api/v1/leads",
+    summary="Filterable, paginated lead list",
+    dependencies=[Depends(require_api_key)],
+)
+async def list_leads_endpoint(
+    workspace_id: int | None = None,
+    workspace_slug: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    search: str = "",
+    tier: str = "",
+    enriched_only: bool = False,
+    sent_only: bool = False,
+    not_sent_only: bool = False,
+) -> dict:
+    from src.lib.db_queries import count_leads, list_lead_records
+
+    ws = _default_ws(workspace_id, workspace_slug)
+    tiers = [t.strip().upper() for t in tier.split(",") if t.strip()] or None
+    filters = {
+        "search": search,
+        "tier_filter": tiers,
+        "enriched_only": enriched_only,
+        "sent_only": sent_only,
+        "not_sent_only": not_sent_only,
+    }
+    limit = max(1, min(200, limit))
+    rows = list_lead_records(ws, limit=limit, offset=max(0, offset), **filters)
+    return {
+        "leads": rows,
+        "total": count_leads(ws, **filters),
+        "limit": limit,
+        "offset": max(0, offset),
+    }
+
+
+@app.get(
+    "/api/v1/leads/{lead_id}",
+    summary="Full detail for one lead (enrichment, score, content, signals)",
+    dependencies=[Depends(require_api_key)],
+)
+async def get_lead_endpoint(
+    lead_id: int,
+    workspace_id: int | None = None,
+    workspace_slug: str | None = None,
+) -> dict:
+    from src.lib.db_queries import get_lead_full
+
+    ws = _default_ws(workspace_id, workspace_slug)
+    lead = get_lead_full(lead_id, ws)
+    if lead is None:
+        raise HTTPException(status_code=404, detail="lead_not_found")
+    return lead
+
+
+@app.get(
+    "/api/v1/runs",
+    summary="Recent processing runs",
+    dependencies=[Depends(require_api_key)],
+)
+async def list_runs_endpoint(
+    workspace_id: int | None = None,
+    workspace_slug: str | None = None,
+    limit: int = 25,
+) -> dict:
+    ws = _default_ws(workspace_id, workspace_slug)
+    return {"runs": run_store.list_recent_runs(limit=max(1, min(100, limit)), workspace_id=ws)}
+
+
+@app.get(
+    "/api/v1/generated-content",
+    summary="Recently generated outbound content",
+    dependencies=[Depends(require_api_key)],
+)
+async def list_generated_content(
+    workspace_id: int | None = None,
+    workspace_slug: str | None = None,
+    kind: str = "email",
+    limit: int = 25,
+) -> dict:
+    from sqlalchemy import select as _select
+
+    from src.db import session_scope
+    from src.models import GeneratedContent, Lead
+
+    ws = _default_ws(workspace_id, workspace_slug)
+    limit = max(1, min(100, limit))
+    with session_scope() as session:
+        query = (
+            _select(GeneratedContent, Lead)
+            .join(Lead, Lead.id == GeneratedContent.lead_id)
+            .order_by(GeneratedContent.created_at.desc())
+            .limit(limit)
+        )
+        if kind:
+            query = query.where(GeneratedContent.kind == kind)
+        if ws is not None:
+            query = query.where(GeneratedContent.workspace_id == ws)
+        items = [
+            {
+                "id": content.id,
+                "lead_id": content.lead_id,
+                "lead_name": f"{lead.first_name or ''} {lead.last_name or ''}".strip(),
+                "company": lead.company,
+                "kind": content.kind,
+                "subject": content.subject,
+                "body": content.body,
+                "prompt_version": content.prompt_version,
+                "model": content.model,
+                "skip_reason": content.skip_reason,
+                "delivery_status": content.delivery_status,
+                "error_message": content.error_message,
+                "delivered_at": _iso(content.delivered_at),
+                "created_at": _iso(content.created_at),
+            }
+            for content, lead in session.execute(query).all()
+        ]
+    return {"content": items, "kind": kind, "limit": limit}
+
+
+@app.get(
+    "/api/v1/settings/status",
+    summary="Which configuration is present (never the values)",
+    dependencies=[Depends(require_api_key)],
+)
+async def settings_status() -> dict:
+    """Booleans and non-secret scalars only — no credential is ever returned."""
+    from src.config import settings
+
+    def configured(name: str) -> bool:
+        return bool((os.environ.get(name) or "").strip())
+
+    return {
+        "env": {
+            name: configured(name)
+            for name in (
+                "DATABASE_URL",
+                "INTERNAL_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "APIFY_API_TOKEN",
+                "TAVILY_API_KEY",
+                "INSTANTLY_API_KEY",
+                "INSTANTLY_CAMPAIGN_ID",
+                "INSTANTLY_WEBHOOK_SECRET",
+                "LEAD_SOURCE_JOB_SECRET",
+                "CRON_SECRET",
+            )
+        },
+        "scoring": {
+            "email_verifier": settings.email_verifier,
+            "tier_a_min": settings.tier_a_min,
+            "tier_b_min": settings.tier_b_min,
+            "send_min_tier": settings.send_min_tier,
+            "scoring_model": settings.scoring_model,
+            "content_model": settings.content_model,
+        },
+    }

@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field, ValidationError
 log = logging.getLogger(__name__)
 
 # Resolved relative to the repo root (parent of the src/ directory).
-# Using an absolute path avoids working-directory sensitivity on Streamlit Cloud.
+# Using an absolute path avoids working-directory sensitivity in serverless runtimes.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = _REPO_ROOT / "data" / "icp_config.json"
 # Legacy relative form kept as backup for callers that override path= explicitly.
@@ -164,7 +164,7 @@ def save_icp_config(cfg: ICPConfig, path: Path = CONFIG_PATH) -> None:
 
     Concurrent readers see either the previous version or the new one,
     never partial bytes. Caller is responsible for cache invalidation
-    (st.cache_data.clear() in the Streamlit page).
+    (callers re-read after writing).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")

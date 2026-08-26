@@ -23,14 +23,13 @@ from pydantic import ValidationError
 
 from src.config import Settings
 
-# The four fields named in the production error, plus the two others that share
-# the failure mode (bool and non-str fields cannot parse "").
+# The four fields named in the production error, plus LOG_LEVEL which shares
+# the failure mode.
 _BLANKABLE = (
     "EMAIL_VERIFIER",
     "TIER_A_MIN",
     "TIER_B_MIN",
     "SEND_MIN_TIER",
-    "SALESOS_INTEGRATION_MODE",
     "LOG_LEVEL",
 )
 
@@ -45,7 +44,6 @@ def test_all_blank_env_vars_fall_back_to_defaults(monkeypatch):
     assert settings.tier_a_min == 85
     assert settings.tier_b_min == 70
     assert settings.send_min_tier == "B"
-    assert settings.salesos_integration_mode is False
     assert settings.log_level == "INFO"
 
 

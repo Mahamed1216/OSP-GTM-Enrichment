@@ -523,7 +523,7 @@ def test_lead_detail_exposes_full_signal_shape():
     result = import_contacts([_dele_contact()], workspace_id=osp, client_slug="osp", import_id=log_id)
     lead_id = result.created_lead_ids[0]
 
-    from app.lib.db_queries import get_lead_full
+    from src.lib.db_queries import get_lead_full
     bundle = get_lead_full(lead_id, workspace_id=osp)
     ss = bundle["source_signal"]
     assert ss is not None

@@ -3,13 +3,10 @@
 Endpoint: POST /api/instantly/reply-webhook
 Security: X-Webhook-Secret header must match INSTANTLY_WEBHOOK_SECRET env var.
 
-Run alongside Streamlit:
-    python run_webhook.py                   # dev (port 8001)
-    uvicorn src.webhook.server:app --port 8001  # production
+On Vercel this is mounted by api/index.py; the reply webhook is reachable at
+POST /api/instantly/reply-webhook. Run it standalone for local development:
 
-Streamlit Cloud note: Streamlit Cloud runs only one Streamlit process.
-Deploy this server separately (Railway, Fly.io, Render, etc.) using the
-same DATABASE_URL so it shares the Postgres DB with the Streamlit app.
+    uvicorn api.index:app --port 8000
 """
 from __future__ import annotations
 

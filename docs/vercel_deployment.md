@@ -1,14 +1,13 @@
 # Deploying on Vercel
 
-Vercel hosts two things from this repo:
+Vercel hosts both halves of this app:
 
-1. **The operator console** — a small Next.js app (`pages/`) served at `/`.
-2. **The API** — the existing FastAPI code, as one Python serverless function
+1. **The operator console** — a Next.js app (`pages/`, `components/`) at `/`.
+2. **The API** — the FastAPI code, as one Python serverless function
    (`api/index.py`) serving `/health` and `/api/*`.
 
-It does **not** host the Streamlit operator UI (`app/`). Streamlit needs a
-long-lived, stateful websocket process, which serverless cannot provide. Keep it
-on Streamlit Cloud (or any container host) pointed at the same `DATABASE_URL`.
+Supabase Postgres holds the data. There is no other deployment target: the
+Streamlit UI, the SalesOS integration and the ECS/Docker path were all removed.
 
 ## Routing
 
@@ -34,6 +33,11 @@ local `uvicorn` process backs the dev server. Override the origin with
 | `POST /api/v1/leads/process` | `src/api/server.py` | `Authorization: Bearer $INTERNAL_API_KEY` |
 | `GET /api/v1/runs/{run_id}` | `src/api/server.py` | bearer `$INTERNAL_API_KEY` |
 | `GET /api/v1/leads/{id}/processed` | `src/api/server.py` | bearer `$INTERNAL_API_KEY` |
+| `GET /api/v1/dashboard/summary` | `src/api/server.py` | bearer `$INTERNAL_API_KEY` |
+| `GET /api/v1/leads` · `/api/v1/leads/{id}` | `src/api/server.py` | bearer `$INTERNAL_API_KEY` |
+| `GET /api/v1/runs` | `src/api/server.py` | bearer `$INTERNAL_API_KEY` |
+| `GET /api/v1/generated-content` | `src/api/server.py` | bearer `$INTERNAL_API_KEY` |
+| `GET /api/v1/settings/status` | `src/api/server.py` | bearer `$INTERNAL_API_KEY` |
 | `POST /api/v1/drain` | `api/index.py` → `src/api/worker.py` | bearer `$INTERNAL_API_KEY` or `$CRON_SECRET` |
 | `POST /api/instantly/reply-webhook` | `src/webhook/server.py` | `X-Webhook-Secret` |
 | `POST /api/lead-source/run-scheduled` | `src/webhook/server.py` | `X-Job-Secret` |
@@ -64,7 +68,7 @@ misbehaving deployment.
 Both of these have already broken this deployment once each, and both fail the
 same way: the build succeeds, then the function dies on its first import.
 
-1. **`vercel.json`'s `includeFiles`** puts `src/`, `app/` and `data/` in the
+1. **`vercel.json`'s `includeFiles`** puts `src/` and `data/` in the
    bundle. Vercel traces imports statically and cannot see the runtime
    `sys.path` insert, so without it: `ModuleNotFoundError: No module named 'src'`.
 2. **A dependency file the installer actually reads.** The function has

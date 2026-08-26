@@ -34,25 +34,6 @@ from src.models import GeneratedContent, Lead, Score, Workspace
 from src.workspace import create_workspace
 
 
-class _FakeSecrets:
-    """Minimal st.secrets stand-in: top-level keys + nested [section] tables."""
-
-    def __init__(self, data: dict):
-        self._d = data
-
-    def get(self, key, default=None):
-        return self._d.get(key, default)
-
-    def keys(self):
-        return self._d.keys()
-
-    def __getitem__(self, key):
-        return self._d[key]
-
-    def __contains__(self, key):
-        return key in self._d
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -63,13 +44,8 @@ def _clean_env(monkeypatch) -> None:
     monkeypatch.delenv("INSTANTLY_CAMPAIGN_ID", raising=False)
     monkeypatch.setattr(cfgmod.settings, "instantly_api_key", "", raising=False)
     monkeypatch.setattr(cfgmod.settings, "instantly_campaign_id", "", raising=False)
-    # Default: no Streamlit secrets unless a test installs a fake mapping.
-    monkeypatch.setattr(cfgmod, "_streamlit_secrets_obj", lambda: None)
 
 
-def _use_secrets(monkeypatch, data: dict) -> None:
-    """Install a fake st.secrets mapping for the resolver + diagnostic probes."""
-    monkeypatch.setattr(cfgmod, "_streamlit_secrets_obj", lambda: _FakeSecrets(data))
 
 
 def _ws_without_campaign(slug: str) -> int:
@@ -112,63 +88,15 @@ def test_env_api_key_is_used(monkeypatch):
 
 
 # ===========================================================================
-# 2. Streamlit secret used when env missing
+# 2. Resolution precedence
 # ===========================================================================
 
-def test_streamlit_secret_api_key_used_when_env_missing(monkeypatch):
-    _clean_env(monkeypatch)  # env + config empty
-    _use_secrets(monkeypatch, {"INSTANTLY_API_KEY": "secret-key-xyz"})
-    ws = create_workspace("Secret Key", "secret-key-ws", "camp-s1")
 
-    cfg = resolve_instantly_config(ws["id"])
-    assert cfg.api_key == "secret-key-xyz"
-    assert cfg.api_key_source == "streamlit_secrets"
-
-
-def test_streamlit_top_level_campaign_id_found(monkeypatch):
-    _clean_env(monkeypatch)
-    monkeypatch.setenv("INSTANTLY_API_KEY", "env-key")
-    _use_secrets(monkeypatch, {"INSTANTLY_CAMPAIGN_ID": "secret-camp"})
-    ws_id = _ws_without_campaign("sec-camp-ws")
-
-    cfg = resolve_instantly_config(ws_id, allow_campaign_env_fallback=True)
-    assert cfg.campaign_id == "secret-camp"
-    assert cfg.campaign_id_source == "streamlit_secrets"
-
-
-def test_nested_instantly_api_key_found(monkeypatch):
-    """The actual bug: secrets nested under [instantly] are skipped by the
-    env bootstrap and by a top-level st.secrets.get — the resolver must still
-    find them via the nested fallback."""
-    _clean_env(monkeypatch)
-    _use_secrets(monkeypatch, {"instantly": {"api_key": "nested-key", "campaign_id": "nested-camp"}})
-    ws = create_workspace("Nested", "nested-ws", "camp-n")
-
-    cfg = resolve_instantly_config(ws["id"])
-    assert cfg.api_key == "nested-key"
-    assert cfg.api_key_source == "streamlit_secrets"
-
-
-def test_nested_instantly_campaign_id_found(monkeypatch):
-    _clean_env(monkeypatch)
-    monkeypatch.setenv("INSTANTLY_API_KEY", "env-key")
-    _use_secrets(monkeypatch, {"instantly": {"campaign_id": "nested-camp"}})
-    ws_id = _ws_without_campaign("nested-camp-ws")
-
-    cfg = resolve_instantly_config(ws_id, allow_campaign_env_fallback=True)
-    assert cfg.campaign_id == "nested-camp"
-    assert cfg.campaign_id_source == "streamlit_secrets"
-
-
-def test_workspace_campaign_precedes_secret_and_env(monkeypatch):
-    """Workspace campaign id wins over BOTH env and (top-level/nested) secret."""
+def test_workspace_campaign_precedes_env(monkeypatch):
+    """Workspace campaign id wins over the env fallback."""
     _clean_env(monkeypatch)
     monkeypatch.setenv("INSTANTLY_API_KEY", "env-key")
     monkeypatch.setenv("INSTANTLY_CAMPAIGN_ID", "env-camp")
-    _use_secrets(monkeypatch, {
-        "INSTANTLY_CAMPAIGN_ID": "secret-camp",
-        "instantly": {"campaign_id": "nested-camp"},
-    })
     ws = create_workspace("WS Wins", "ws-wins", "workspace-camp")
 
     cfg = resolve_instantly_config(ws["id"])
@@ -179,17 +107,16 @@ def test_workspace_campaign_precedes_secret_and_env(monkeypatch):
 def test_diagnostic_reports_sources_and_masks_key(monkeypatch):
     _clean_env(monkeypatch)
     secret = "sk-FULLSECRET-zzz-999-do-not-leak"
-    _use_secrets(monkeypatch, {"instantly": {"api_key": secret, "campaign_id": "nested-camp"}})
+    monkeypatch.setenv("INSTANTLY_API_KEY", secret)
     ws = create_workspace("Diag", "diag-ws", "camp-diag")
 
     diag = build_instantly_diagnostic(ws["id"])
     assert diag["api_key_found"] is True
-    assert diag["api_key_source"] == "streamlit_secrets"
+    assert diag["api_key_source"] == "env"
     assert diag["campaign_id_found"] is True
     assert diag["campaign_id_source"] == "workspace_column"  # workspace wins
-    assert diag["probes"]["secret_nested_instantly.api_key"] is True
-    assert diag["probes"]["secret_top_INSTANTLY_API_KEY"] is False
-    assert diag["probes"]["env_INSTANTLY_API_KEY"] is False
+    assert diag["probes"]["env_INSTANTLY_API_KEY"] is True
+    assert diag["probes"]["config_instantly_api_key"] is False
     # The full key is NEVER present in the diagnostic.
     assert secret not in str(diag)
     assert diag["api_key_masked"].startswith("sk-F")
@@ -200,7 +127,7 @@ def test_generic_combined_error_removed():
     import pathlib
     root = pathlib.Path(__file__).resolve().parents[1]
     vague = "Instantly API key or campaign ID not configured for this workspace"
-    for rel in ("src/delivery/instantly.py", "app/lib/bulk_push.py"):
+    for rel in ("src/delivery/instantly.py", "src/lib/bulk_push.py"):
         text = (root / rel).read_text(encoding="utf-8")
         assert vague not in text, f"{rel} still contains the vague combined error"
 

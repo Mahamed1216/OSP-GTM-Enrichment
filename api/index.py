@@ -18,10 +18,6 @@ is imported lazily and every failure is turned into a JSON body that names the
 cause. ``/health`` keeps answering even when the backend cannot be imported at
 all, which is what makes the deployment diagnosable from the outside.
 
-The Streamlit UI in ``app/`` is deliberately not served here: it needs a
-long-lived, stateful websocket server and cannot run on Vercel. Keep it on
-Streamlit Cloud (or any container host) pointed at the same DATABASE_URL.
-
 Local check:
     uvicorn api.index:app --port 8000
 """
@@ -35,8 +31,8 @@ import traceback
 from pathlib import Path
 
 # The entrypoint is api/index.py, so the repo root must be on sys.path for
-# `import src.*` / `import app.lib.*` to resolve. vercel.json's includeFiles
-# is what puts those directories in the bundle in the first place.
+# `import src.*` to resolve. vercel.json's includeFiles is what puts src/ in
+# the bundle in the first place.
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
@@ -124,7 +120,8 @@ def _backend() -> dict:
                 "The Python function could not import the pipeline code. If this "
                 "is ModuleNotFoundError for 'src', the bundle is missing those "
                 "files — check includeFiles in vercel.json. If it names a "
-                "third-party package, it is missing from requirements.txt."
+                "third-party package, it is missing from [project].dependencies "
+                "in pyproject.toml, which is what Vercel's uv installs."
             ),
             "traceback": traceback.format_exc().splitlines()[-6:],
         }

@@ -36,8 +36,8 @@ _DIST_FOR_MODULE = {
     "starlette": "fastapi",  # ships as a fastapi dependency
 }
 
-# Reachable from the function but must NOT be declared: both import sites are
-# guarded by try/except ImportError and the Streamlit UI does not run on Vercel.
+# Must never appear in the bundle. The Streamlit UI was removed from this repo;
+# these guard against it (or its heavy deps) creeping back into the function.
 _OPTIONAL_MODULES = {"streamlit", "pandas"}
 
 # Test-only packages: they belong in requirements.txt but not in the bundle.
@@ -80,7 +80,7 @@ def _imported_modules() -> dict[str, set[str]]:
     """Top-level third-party modules reachable from the serverless function."""
     stdlib = set(sys.stdlib_module_names)
     local = {"src", "app", "api", "scripts", "tests"}
-    sources = [_ROOT / "api" / "index.py", _ROOT / "app" / "lib" / "config.py"]
+    sources = [_ROOT / "api" / "index.py"]
     sources += [p for p in (_ROOT / "src").rglob("*.py") if "__pycache__" not in str(p)]
 
     found: dict[str, set[str]] = {}
@@ -162,8 +162,8 @@ def test_optional_ui_packages_not_bundled():
     declared = _pyproject_deps()
     for name in _OPTIONAL_MODULES:
         assert _normalize(name) not in declared, (
-            f"{name} must not ship in the function bundle — its import sites "
-            "are guarded and it would bloat the serverless package."
+            f"{name} must not ship in the function bundle — the Streamlit UI "
+            "was removed and this would only bloat the serverless package."
         )
 
 

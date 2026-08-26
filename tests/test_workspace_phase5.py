@@ -292,19 +292,19 @@ class TestIcpBlockInPrompts:
 class TestPipelineRunnerAcceptsWorkspaceId:
     def test_process_single_lead_signature_accepts_workspace_id(self):
         import inspect
-        from app.lib.pipeline_runner import process_single_lead
+        from src.lib.pipeline_runner import process_single_lead
         sig = inspect.signature(process_single_lead)
         assert "workspace_id" in sig.parameters
 
     def test_run_phased_pipeline_signature_accepts_workspace_id(self):
         import inspect
-        from app.lib.pipeline_runner import run_phased_pipeline
+        from src.lib.pipeline_runner import run_phased_pipeline
         sig = inspect.signature(run_phased_pipeline)
         assert "workspace_id" in sig.parameters
 
     def test_bulk_regenerate_content_signature_accepts_workspace_id(self):
         import inspect
-        from app.lib.pipeline_runner import bulk_regenerate_content
+        from src.lib.pipeline_runner import bulk_regenerate_content
         sig = inspect.signature(bulk_regenerate_content)
         assert "workspace_id" in sig.parameters
 
@@ -346,24 +346,24 @@ class TestPipelineRunnerAcceptsWorkspaceId:
 class TestRatingRunnerAcceptsWorkspaceId:
     def test_rerun_enrichment_sync_accepts_workspace_id(self):
         import inspect
-        from app.lib.rating_runner import rerun_enrichment_sync
+        from src.lib.rating_runner import rerun_enrichment_sync
         sig = inspect.signature(rerun_enrichment_sync)
         assert "workspace_id" in sig.parameters
 
     def test_rerun_scoring_sync_accepts_workspace_id(self):
         import inspect
-        from app.lib.rating_runner import rerun_scoring_sync
+        from src.lib.rating_runner import rerun_scoring_sync
         sig = inspect.signature(rerun_scoring_sync)
         assert "workspace_id" in sig.parameters
 
     def test_regenerate_email_sync_accepts_workspace_id(self):
         import inspect
-        from app.lib.rating_runner import regenerate_email_sync
+        from src.lib.rating_runner import regenerate_email_sync
         sig = inspect.signature(regenerate_email_sync)
         assert "workspace_id" in sig.parameters
 
     def test_full_refresh_sync_accepts_workspace_id(self):
         import inspect
-        from app.lib.rating_runner import full_refresh_sync
+        from src.lib.rating_runner import full_refresh_sync
         sig = inspect.signature(full_refresh_sync)
         assert "workspace_id" in sig.parameters

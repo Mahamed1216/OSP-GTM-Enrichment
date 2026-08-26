@@ -193,7 +193,7 @@ def test_prompt_enforces_rationale_consistency(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_no_tavily_on_page_load(monkeypatch):
-    from app.lib.db_queries import get_lead_full
+    from src.lib.db_queries import get_lead_full
     from src.db import session_scope
     from src.models import Enrichment, Lead
     from src.workspace import get_default_workspace_id, seed_default_workspace

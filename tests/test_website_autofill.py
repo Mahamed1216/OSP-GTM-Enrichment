@@ -959,47 +959,6 @@ def test_manual_settings_save_changes_only_selected_workspace():
 # I5. Autofill session state keys include workspace_id
 # ---------------------------------------------------------------------------
 
-def test_autofill_session_state_keys_are_workspace_scoped():
-    # Verify that the session_state key names used by the autofill section
-    # include the workspace_id to prevent cross-workspace leakage.
-    settings_page = (
-        pathlib.Path(__file__).resolve().parent.parent
-        / "app" / "pages" / "6_settings.py"
-    )
-    text = settings_page.read_text(encoding="utf-8")
-
-    # Keys must be formatted with _selected_ws_id
-    assert '"_autofill_result_{' in text or "_autofill_result_{_selected_ws_id}" in text
-    assert '"_autofill_url_{' in text or "_autofill_url_{_selected_ws_id}" in text
-    assert '"_autofill_confirm_{' in text or "_autofill_confirm_{_selected_ws_id}" in text
-
-
-# ---------------------------------------------------------------------------
-# I6. Switching workspace clears the workspace-change guard
-# ---------------------------------------------------------------------------
-
-def test_workspace_change_guard_is_in_settings_page():
-    settings_page = (
-        pathlib.Path(__file__).resolve().parent.parent
-        / "app" / "pages" / "6_settings.py"
-    )
-    text = settings_page.read_text(encoding="utf-8")
-
-    assert "settings_last_workspace_id" in text, (
-        "6_settings.py must contain the workspace-change guard that clears "
-        "form session-state keys on workspace switch"
-    )
-    assert "_SETTINGS_FORM_KEYS" in text, (
-        "_SETTINGS_FORM_KEYS must be defined and used in the workspace-change guard"
-    )
-    assert "session_state.pop(_fk" in text or "st.session_state.pop(_fk" in text, (
-        "The guard must pop form keys when workspace changes"
-    )
-
-
-# ---------------------------------------------------------------------------
-# I7. Cache/session clear does not affect other workspace DB values
-# ---------------------------------------------------------------------------
 
 def test_cache_clear_does_not_affect_other_workspace_db():
     osp_id = _seed_osp()

@@ -31,9 +31,6 @@ SKIP_LABELS: dict[str, str] = {
     "unsafe_content": "needs review / regeneration",
     "already_sent": "already sent",
     "in_progress": "send in progress",
-    # SalesOS integration mode only: a CSM approval is required before any send.
-    # Tier alone is never enough. Surfaces only when SALESOS_INTEGRATION_MODE=true.
-    "missing_salesos_csm_approval": "awaiting SalesOS CSM approval",
 }
 
 
@@ -144,7 +141,7 @@ def filter_eligible(
     latest_content: dict[int, GeneratedContent] = {}
     for c in contents:
         latest_content.setdefault(c.lead_id, c)
-    # engine lead_id → latest email content id, for the SalesOS approval gate.
+    # engine lead_id → latest email content id.
     latest_content_id: dict[int, int] = {
         lid: c.id for lid, c in latest_content.items()
     }
@@ -184,22 +181,6 @@ def filter_eligible(
             continue
 
         eligible.append(lid)
-
-    # SalesOS integration gate (mode-only, LAST check): tier alone is never
-    # enough — a lead that passes every safety check still cannot send without
-    # an explicit CSM approval. Runs after the safety checks above so unsafe /
-    # unverified / duplicate / below-tier leads keep their specific reason even
-    # when an approval exists. Standalone mode (flag off) is unchanged.
-    if settings.salesos_integration_mode and eligible:
-        from src.integrations.salesos.approvals import engine_leads_missing_approval
-        missing = engine_leads_missing_approval(session, eligible, latest_content_id)
-        if missing:
-            still_eligible = [lid for lid in eligible if lid not in missing]
-            # Preserve input order in the skip bucket.
-            for lid in eligible:
-                if lid in missing:
-                    skipped["missing_salesos_csm_approval"].append(lid)
-            eligible = still_eligible
 
     return eligible, skipped
 

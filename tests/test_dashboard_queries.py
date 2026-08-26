@@ -5,7 +5,7 @@ import asyncio
 
 import pytest
 
-from app.lib.db_queries import list_unrated_content, rating_summary_per_content_type
+from src.lib.db_queries import list_unrated_content, rating_summary_per_content_type
 from src.db import session_scope
 from src.feedback.ratings import record_rating
 from src.models import GeneratedContent, Score

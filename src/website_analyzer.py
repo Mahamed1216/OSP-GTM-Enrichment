@@ -4,7 +4,7 @@ Fetches and analyzes a company website to generate suggested ICP settings.
 Never auto-saves — returns an AnalysisResult for user review only.
 
 Entry points:
-  analyze_website(url, notes)            — synchronous wrapper (Streamlit)
+  analyze_website(url, notes)            — synchronous wrapper
   analyze_website_async(url, notes)      — async version
   apply_suggestions_to_config(cfg, s, checked_fields) — apply reviewed fields
 
@@ -433,8 +433,8 @@ async def analyze_website_async(url: str, notes: str = "") -> AnalysisResult:
 
 
 def analyze_website(url: str, notes: str = "") -> AnalysisResult:
-    """Synchronous wrapper for Streamlit. Never saves — for review only."""
-    from app.lib.async_runner import run_async
+    """Synchronous wrapper for sync callers. Never saves — for review only."""
+    from src.async_runner import run_async
     return run_async(analyze_website_async(url=url, notes=notes))
 
 

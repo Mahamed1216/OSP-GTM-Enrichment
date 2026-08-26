@@ -33,7 +33,7 @@ from src.workspace import (
     get_default_workspace_id,
     seed_default_workspace,
 )
-from app.lib.db_queries import kpi_counts, latest_instantly_snapshot, list_leads
+from src.lib.db_queries import kpi_counts, latest_instantly_snapshot, list_leads
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +235,7 @@ class TestNewWorkspaceDoesNotSeeOspLeads:
 
 class TestNewWorkspaceDoesNotSeeOspContent:
     def test_osp_content_invisible_to_new_workspace(self):
-        from app.lib.db_queries import ready_to_send_count
+        from src.lib.db_queries import ready_to_send_count
         osp_id = _seed_osp()
         with session_scope() as session:
             lead = _make_lead(session, "b@osp.com", osp_id)

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from sqlalchemy import select
 
-from app.lib.push_confirm import (
+from src.lib.push_confirm import (
     build_push_confirm_token,
     confirm_button_enabled,
     push_confirmation_active,

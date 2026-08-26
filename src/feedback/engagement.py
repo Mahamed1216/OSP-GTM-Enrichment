@@ -180,7 +180,7 @@ def _record_campaign_id(record: dict) -> str | None:
 class CampaignAnalyticsMismatch(RuntimeError):
     """Raised when the analytics endpoint returns no record matching the
     configured INSTANTLY_CAMPAIGN_ID. Carries the debug payload so the
-    caller (script logger, Streamlit UI) can render it verbatim."""
+    caller (script logger, console) can render it verbatim."""
 
     def __init__(self, message: str, debug: dict):
         super().__init__(message)

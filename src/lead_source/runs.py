@@ -1,6 +1,6 @@
 """Trigger + poll a sourcing run in the external lead source system.
 
-Dele's sourcing system is signal-first: SalesOS / this system can trigger a
+The sourcing system is signal-first: this system can trigger a
 sourcing run, poll it to completion, then pull the resulting contacts. This is
 the OPTIONAL pre-import step gated by the per-workspace
 ``trigger_run_before_import`` setting. When that flag is false (the default),

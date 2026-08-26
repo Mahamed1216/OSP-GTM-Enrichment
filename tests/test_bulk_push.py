@@ -10,7 +10,7 @@ import asyncio
 
 from sqlalchemy import select
 
-from app.lib.bulk_push import run_bulk_push
+from src.lib.bulk_push import run_bulk_push
 from src.db import session_scope
 from src.models import GeneratedContent, Lead, Score, now_utc
 from src.workspace import create_workspace, get_default_workspace_id, seed_default_workspace

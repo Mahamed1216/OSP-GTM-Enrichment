@@ -1,4 +1,4 @@
-"""Internal API for SalesOS — endpoint, auth, processing, and safety tests.
+"""Internal API — endpoint, auth, processing, and safety tests.
 
 No live LLM/HTTP: the pipeline primitives (enrich_lead, enrich_hiring_signal,
 score_lead, generate_email) are monkeypatched. TestClient is used WITHOUT a
@@ -40,7 +40,7 @@ def _sample_request(*, workspace_slug="osp", run_mode="sync", push=False,
                     email="john@acme.com") -> dict:
     return {
         "workspace_slug": workspace_slug,
-        "source": "salesos",
+        "source": "api",
         "run_mode": run_mode,
         "options": {
             "run_enrichment": True,
@@ -222,7 +222,7 @@ def test_sync_process_full_payload_and_storage(monkeypatch):
         ).scalar_one()
         # 7. raw source payload stored verbatim
         assert lead.lead_source_raw is not None
-        assert lead.lead_source_raw["salesos_payload"]["external_contact_id"] == "contact_123"
+        assert lead.lead_source_raw["source_payload"]["external_contact_id"] == "contact_123"
         # 9. source tier stored SEPARATELY from local Score tier
         assert lead.source_tier == "A"
         assert lead.source_tier_score == 88.0

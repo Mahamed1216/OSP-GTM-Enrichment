@@ -1,6 +1,6 @@
 """Evergreen lead source scheduler — import + enrich + score + content for each enabled workspace.
 
-Scheduling is deliberately external. Streamlit Cloud cannot reliably run
+Scheduling is deliberately external. Serverless functions cannot reliably run
 background jobs. Use one of:
 
   Option A — CLI (Render Cron / GitHub Actions):
@@ -415,21 +415,21 @@ async def run_all_enabled_workspaces(
 
 
 # ---------------------------------------------------------------------------
-# Sync wrapper — for Streamlit UI and CLI
+# Sync wrapper — for the CLI
 # ---------------------------------------------------------------------------
 
 def run_import_and_process_sync(workspace_id: int) -> dict[str, Any]:
-    """Synchronous entry point for the Streamlit UI button.
+    """Synchronous entry point for sync callers.
 
     Runs import + auto-process. Applies nest_asyncio when an existing event
-    loop is running (Streamlit context), falls back to asyncio.run() otherwise.
+    loop is running, falls back to asyncio.run() otherwise.
     """
     import asyncio
 
     coro = run_workspace_auto_import(workspace_id)
     try:
         loop = asyncio.get_running_loop()
-        # Already inside a running loop (e.g. Streamlit) — use nest_asyncio
+        # Already inside a running loop — use nest_asyncio
         import nest_asyncio
         nest_asyncio.apply()
         return loop.run_until_complete(coro)

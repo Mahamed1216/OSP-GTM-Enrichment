@@ -1,0 +1,1265 @@
+"""Read-only SQLAlchemy queries for the UI. Each function opens its own session."""
+from __future__ import annotations
+
+import functools
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from sqlalchemy import and_, case, func, select
+
+from src.db import session_scope
+from src.feedback.ratings import get_rating_trends, get_unrated_content
+from src.models import (
+    Engagement,
+    Enrichment,
+    GeneratedContent,
+    InstantlyAnalyticsSnapshot,
+    Lead,
+    Score,
+    now_utc,
+)
+
+
+def _email_content_subq(workspace_id: int | None = None):
+    """Subquery: latest email GeneratedContent row per lead.
+
+    When workspace_id is given, restricts to content rows in that workspace.
+    """
+    stmt = (
+        select(
+            GeneratedContent.lead_id.label("lead_id"),
+            func.max(GeneratedContent.id).label("content_id"),
+            func.max(
+                case((GeneratedContent.delivered_at.is_not(None), 1), else_=0)
+            ).label("any_delivered"),
+        )
+        .where(GeneratedContent.kind == "email")
+        .group_by(GeneratedContent.lead_id)
+    )
+    if workspace_id is not None:
+        stmt = stmt.where(GeneratedContent.workspace_id == workspace_id)
+    return stmt.subquery()
+
+
+def _hiring_signal_subq(workspace_id: int | None = None):
+    """Subquery: hiring-signal strength per lead (1:1 on the unique constraint)."""
+    from src.models import LeadSignal
+
+    stmt = (
+        select(
+            LeadSignal.lead_id.label("lead_id"),
+            LeadSignal.signal_strength.label("hiring_strength"),
+            LeadSignal.signal_found.label("hiring_found"),
+        )
+        .where(LeadSignal.signal_type == "hiring")
+    )
+    if workspace_id is not None:
+        stmt = stmt.where(LeadSignal.workspace_id == workspace_id)
+    return stmt.subquery()
+
+
+def _source_signal_subq(workspace_id: int | None = None):
+    """Subquery: imported source-signal strength per lead (1:1)."""
+    from src.models import LeadSignal
+
+    stmt = (
+        select(
+            LeadSignal.lead_id.label("lead_id"),
+            LeadSignal.signal_strength.label("source_strength"),
+            LeadSignal.signal_found.label("source_found"),
+        )
+        .where(LeadSignal.signal_type == "source_import")
+    )
+    if workspace_id is not None:
+        stmt = stmt.where(LeadSignal.workspace_id == workspace_id)
+    return stmt.subquery()
+
+
+def kpi_counts(workspace_id: int | None = None) -> dict[str, int]:
+    with session_scope() as session:
+        leads_q = select(func.count(Lead.id))
+        enriched_q = select(func.count(Enrichment.id))
+        scored_q = select(func.count(Score.id))
+        if workspace_id is not None:
+            leads_q = leads_q.where(Lead.workspace_id == workspace_id)
+            enriched_q = enriched_q.where(Enrichment.workspace_id == workspace_id)
+            scored_q = scored_q.where(Score.workspace_id == workspace_id)
+        leads_total = session.execute(leads_q).scalar() or 0
+        enriched = session.execute(enriched_q).scalar() or 0
+        scored = session.execute(scored_q).scalar() or 0
+        # `sent` was previously COUNT(delivered_at IS NOT NULL), which counts
+        # leads we PUSHED to Instantly — not leads Instantly has actually sent
+        # an email to. The campaign cadence means a chunk of pushes are still
+        # queued at any moment, so that count ran ~2x the live Instantly figure.
+        # The truth lives in Engagement.sent (synced from emails_sent_count > 0).
+        eng_bool_stmt = (
+            select(
+                func.sum(case((Engagement.sent.is_(True), 1), else_=0)).label("sent"),
+                func.sum(case((Engagement.replied.is_(True), 1), else_=0)).label("replied"),
+                func.sum(case((Engagement.opened.is_(True), 1), else_=0)).label("opened"),
+                func.sum(case((Engagement.clicked.is_(True), 1), else_=0)).label("clicked"),
+                func.sum(case((Engagement.bounced.is_(True), 1), else_=0)).label("bounced"),
+            )
+            .join(GeneratedContent, Engagement.content_id == GeneratedContent.id)
+            .where(GeneratedContent.kind == "email")
+        )
+        if workspace_id is not None:
+            eng_bool_stmt = eng_bool_stmt.where(
+                GeneratedContent.workspace_id == workspace_id
+            )
+        row = session.execute(eng_bool_stmt).one()
+        return {
+            "leads_total": int(leads_total),
+            "enriched": int(enriched),
+            "scored": int(scored),
+            "sent": int(row.sent or 0),
+            "replied": int(row.replied or 0),
+            "opened": int(row.opened or 0),
+            "clicked": int(row.clicked or 0),
+            "bounced": int(row.bounced or 0),
+        }
+
+
+def tier_distribution(workspace_id: int | None = None) -> dict[str, int]:
+    """Counts per tier including unscored.
+
+    Returns A/B/C/D plus an "—" bucket for leads that have no Score row yet.
+    Keyed with the dash so consumers can iterate in order and render the
+    "no-tier" group as a neutral track.
+    """
+    with session_scope() as session:
+        tier_q = select(Score.tier, func.count(Score.id)).group_by(Score.tier)
+        leads_q = select(func.count(Lead.id))
+        if workspace_id is not None:
+            tier_q = tier_q.where(Score.workspace_id == workspace_id)
+            leads_q = leads_q.where(Lead.workspace_id == workspace_id)
+        rows = session.execute(tier_q).all()
+        leads_total = session.execute(leads_q).scalar() or 0
+    out: dict[str, int] = {"A": 0, "B": 0, "C": 0, "D": 0}
+    for tier, count in rows:
+        if tier and tier.upper() in out:
+            out[tier.upper()] = int(count)
+    scored_total = sum(out.values())
+    out["—"] = max(0, int(leads_total) - scored_total)
+    return out
+
+
+def recent_activity(limit: int = 8, workspace_id: int | None = None) -> list[dict[str, Any]]:
+    """Most-recent events across enrich/gen/send/reply/rate, newest first.
+
+    Pulls up to `limit` events from each source then merges + truncates so a
+    burst of one event type can't crowd out the rest. Each entry is a plain
+    dict: {kind, text, when}.
+    """
+    from src.models import ContentRating
+
+    events: list[dict[str, Any]] = []
+
+    with session_scope() as session:
+        enrich_q = (
+            select(
+                Enrichment.enriched_at,
+                Lead.first_name,
+                Lead.last_name,
+                Lead.company,
+            )
+            .join(Lead, Lead.id == Enrichment.lead_id)
+            .order_by(Enrichment.enriched_at.desc())
+            .limit(limit)
+        )
+        if workspace_id is not None:
+            enrich_q = enrich_q.where(Lead.workspace_id == workspace_id)
+        enrichments = session.execute(enrich_q).all()
+        for r in enrichments:
+            name = f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip() or "(no name)"
+            company = (r.company or "").strip()
+            text = f"Enriched {name}" + (f" at {company}" if company else "")
+            events.append({"kind": "enrich", "text": text, "when": r.enriched_at})
+
+        gen_q = (
+            select(
+                GeneratedContent.created_at,
+                GeneratedContent.kind,
+                Lead.first_name,
+                Lead.last_name,
+            )
+            .join(Lead, Lead.id == GeneratedContent.lead_id)
+            .where(GeneratedContent.superseded_by_id.is_(None))
+            .order_by(GeneratedContent.created_at.desc())
+            .limit(limit)
+        )
+        if workspace_id is not None:
+            gen_q = gen_q.where(Lead.workspace_id == workspace_id)
+        gens = session.execute(gen_q).all()
+        kind_label = {"email": "email", "call_script": "call script", "linkedin_msg": "LinkedIn DM"}
+        for r in gens:
+            name = f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip() or "(no name)"
+            events.append({
+                "kind": "gen",
+                "text": f"Generated {kind_label.get(r.kind, r.kind)} for {name}",
+                "when": r.created_at,
+            })
+
+        sends_q = (
+            select(
+                GeneratedContent.delivered_at,
+                Lead.first_name,
+                Lead.last_name,
+            )
+            .join(Lead, Lead.id == GeneratedContent.lead_id)
+            .where(GeneratedContent.delivered_at.is_not(None))
+            .order_by(GeneratedContent.delivered_at.desc())
+            .limit(limit)
+        )
+        if workspace_id is not None:
+            sends_q = sends_q.where(Lead.workspace_id == workspace_id)
+        sends = session.execute(sends_q).all()
+        for r in sends:
+            name = f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip() or "(no name)"
+            events.append({
+                "kind": "send",
+                "text": f"Pushed email for {name} to Instantly",
+                "when": r.delivered_at,
+            })
+
+        replies_q = (
+            select(
+                Engagement.synced_at,
+                Lead.first_name,
+                Lead.last_name,
+                Lead.company,
+            )
+            .join(GeneratedContent, Engagement.content_id == GeneratedContent.id)
+            .join(Lead, Lead.id == GeneratedContent.lead_id)
+            .where(Engagement.replied.is_(True))
+            .order_by(Engagement.synced_at.desc())
+            .limit(limit)
+        )
+        if workspace_id is not None:
+            replies_q = replies_q.where(Lead.workspace_id == workspace_id)
+        replies = session.execute(replies_q).all()
+        for r in replies:
+            name = f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip() or "(no name)"
+            company = (r.company or "").strip()
+            text = f"Reply from {name}" + (f" at {company}" if company else "")
+            events.append({"kind": "reply", "text": text, "when": r.synced_at})
+
+        ratings_q = (
+            select(
+                ContentRating.rated_at,
+                ContentRating.rating,
+                Lead.first_name,
+                Lead.last_name,
+            )
+            .join(GeneratedContent, GeneratedContent.id == ContentRating.generated_content_id)
+            .join(Lead, Lead.id == GeneratedContent.lead_id)
+            .order_by(ContentRating.rated_at.desc())
+            .limit(limit)
+        )
+        if workspace_id is not None:
+            ratings_q = ratings_q.where(Lead.workspace_id == workspace_id)
+        ratings = session.execute(ratings_q).all()
+        for r in ratings:
+            name = f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip() or "(no name)"
+            verb = "Thumbs-up" if r.rating == "up" else "Thumbs-down"
+            tail = " — redo" if r.rating == "down" else ""
+            events.append({
+                "kind": "rate",
+                "text": f"{verb} on {name}{tail}",
+                "when": r.rated_at,
+            })
+
+    events.sort(key=lambda e: e["when"] or datetime.min, reverse=True)
+    return events[:limit]
+
+
+def ready_to_send_count(workspace_id: int | None = None) -> int:
+    """Leads with active email content that hasn't been delivered yet.
+
+    Used to drive the Dashboard promo CTA. Counts distinct leads with at
+    least one active (non-superseded) email GeneratedContent whose
+    delivered_at is null AND delivery_status is not 'in_progress'/'error'.
+    """
+    with session_scope() as session:
+        stmt = (
+            select(func.count(func.distinct(GeneratedContent.lead_id)))
+            .where(
+                GeneratedContent.kind == "email",
+                GeneratedContent.superseded_by_id.is_(None),
+                GeneratedContent.delivered_at.is_(None),
+                func.coalesce(GeneratedContent.delivery_status, "") != "in_progress",
+            )
+        )
+        if workspace_id is not None:
+            stmt = stmt.where(GeneratedContent.workspace_id == workspace_id)
+        return int(session.execute(stmt).scalar() or 0)
+
+
+_LEAD_LIST_COLUMNS = [
+    "id", "Name", "Email", "Company", "Title", "Tier", "Score",
+    "Enriched", "Hiring", "Src signal", "Sent", "Replied",
+]
+
+
+def list_lead_records(
+    workspace_id: int | None = None,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    search: str = "",
+    tier_filter: list[str] | None = None,
+    sent_only: bool = False,
+    not_sent_only: bool = False,
+    enriched_only: bool = False,
+    hiring_filter: str = "any",
+) -> list[dict[str, Any]]:
+    """Lead list with joined score/enrichment/email-delivery/reply flags.
+
+    Returns plain dicts so the API layer can serialise them without pandas
+    (which is not installed in the serverless bundle). ``list_leads`` wraps
+    this in a DataFrame for analysis callers.
+
+    All filtering happens in SQL before LIMIT/OFFSET so the DB does the work
+    instead of loading the full table into Python for slicing.
+
+    `hiring_filter` is one of: "any" (no filter), "high", "medium", or "none"
+    (no signal row, or a signal row with no relevant hiring found).
+    """
+    from sqlalchemy import or_
+
+    email_sub = _email_content_subq(workspace_id=workspace_id)
+    hiring_sub = _hiring_signal_subq(workspace_id=workspace_id)
+    source_sub = _source_signal_subq(workspace_id=workspace_id)
+    stmt = (
+        select(
+            Lead.id.label("id"),
+            Lead.first_name,
+            Lead.last_name,
+            Lead.email.label("email"),
+            Lead.company,
+            Lead.title,
+            Score.tier,
+            Score.score,
+            Enrichment.id.label("enrichment_id"),
+            email_sub.c.any_delivered,
+            hiring_sub.c.hiring_strength,
+            hiring_sub.c.hiring_found,
+            source_sub.c.source_strength,
+            source_sub.c.source_found,
+            func.coalesce(
+                func.max(case((Engagement.replied.is_(True), 1), else_=0)), 0
+            ).label("any_reply"),
+        )
+        .select_from(Lead)
+        .outerjoin(Score, Score.lead_id == Lead.id)
+        .outerjoin(Enrichment, Enrichment.lead_id == Lead.id)
+        .outerjoin(email_sub, email_sub.c.lead_id == Lead.id)
+        .outerjoin(hiring_sub, hiring_sub.c.lead_id == Lead.id)
+        .outerjoin(source_sub, source_sub.c.lead_id == Lead.id)
+        .outerjoin(
+            GeneratedContent,
+            and_(
+                GeneratedContent.lead_id == Lead.id,
+                GeneratedContent.kind == "email",
+            ),
+        )
+        .outerjoin(Engagement, Engagement.content_id == GeneratedContent.id)
+        .group_by(
+            Lead.id,
+            Lead.first_name,
+            Lead.last_name,
+            Lead.email,
+            Lead.company,
+            Lead.title,
+            Score.tier,
+            Score.score,
+            Enrichment.id,
+            email_sub.c.any_delivered,
+            hiring_sub.c.hiring_strength,
+            hiring_sub.c.hiring_found,
+            source_sub.c.source_strength,
+            source_sub.c.source_found,
+        )
+        .order_by(Lead.id.desc())  # newest first
+    )
+    if workspace_id is not None:
+        stmt = stmt.where(Lead.workspace_id == workspace_id)
+
+    _hf = (hiring_filter or "any").lower()
+    if _hf in ("high", "medium", "low"):
+        stmt = stmt.where(hiring_sub.c.hiring_strength == _hf)
+    elif _hf == "none":
+        stmt = stmt.where(
+            or_(
+                hiring_sub.c.hiring_strength.is_(None),
+                hiring_sub.c.hiring_strength == "none",
+                hiring_sub.c.hiring_found.is_(False),
+            )
+        )
+
+    if search and search.strip():
+        q = f"%{search.strip()}%"
+        stmt = stmt.where(
+            or_(
+                Lead.first_name.ilike(q),
+                Lead.last_name.ilike(q),
+                Lead.email.ilike(q),
+            )
+        )
+    if tier_filter:
+        stmt = stmt.where(Score.tier.in_(tier_filter))
+    if enriched_only:
+        stmt = stmt.where(Enrichment.id.is_not(None))
+    if sent_only:
+        stmt = stmt.where(email_sub.c.any_delivered == 1)
+    elif not_sent_only:
+        stmt = stmt.where(
+            or_(email_sub.c.any_delivered == 0, email_sub.c.any_delivered.is_(None))
+        )
+
+    stmt = stmt.limit(limit).offset(offset)
+
+    with session_scope() as session:
+        rows = session.execute(stmt).all()
+
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        records.append(
+            {
+                "id": row.id,
+                "Name": f"{row.first_name} {row.last_name}".strip(),
+                "Email": row.email or "",
+                "Company": row.company or "",
+                "Title": row.title or "",
+                "Tier": row.tier or "",
+                "Score": int(row.score) if row.score is not None else None,
+                "Enriched": bool(row.enrichment_id is not None),
+                # "Not run" = no signal row; "None" = ran, no relevant hiring;
+                # otherwise the strength (High/Medium/Low).
+                "Hiring": (
+                    "Not run" if row.hiring_strength is None
+                    else row.hiring_strength.title() if row.hiring_found
+                    else "None"
+                ),
+                # Source signal: imported strength, or "No" when none in payload.
+                "Src signal": (
+                    row.source_strength.title()
+                    if (row.source_strength and row.source_found)
+                    else "No"
+                ),
+                "Sent": bool(row.any_delivered),
+                "Replied": bool(row.any_reply),
+            }
+        )
+    return records
+
+
+@functools.wraps(list_lead_records)
+def list_leads(*args, **kwargs) -> "pd.DataFrame":
+    """DataFrame view of :func:`list_lead_records` (analysis / notebooks).
+
+    ``functools.wraps`` keeps ``inspect.signature`` reporting the real
+    parameters and defaults rather than ``(*args, **kwargs)``.
+    """
+    import pandas as pd  # optional: not installed in the serverless bundle
+
+    return pd.DataFrame.from_records(
+        list_lead_records(*args, **kwargs),
+        columns=_LEAD_LIST_COLUMNS,
+    )
+
+
+def count_leads(
+    workspace_id: int | None = None,
+    *,
+    search: str = "",
+    tier_filter: list[str] | None = None,
+    sent_only: bool = False,
+    not_sent_only: bool = False,
+    enriched_only: bool = False,
+    hiring_filter: str = "any",
+) -> int:
+    """COUNT(*) for the current filter set — used for pagination metadata."""
+    from sqlalchemy import or_
+
+    stmt = (
+        select(func.count(func.distinct(Lead.id)))
+        .select_from(Lead)
+        .outerjoin(Score, Score.lead_id == Lead.id)
+        .outerjoin(Enrichment, Enrichment.lead_id == Lead.id)
+    )
+
+    email_sub = None
+    if sent_only or not_sent_only:
+        email_sub = _email_content_subq(workspace_id=workspace_id)
+        stmt = stmt.outerjoin(email_sub, email_sub.c.lead_id == Lead.id)
+
+    _hf = (hiring_filter or "any").lower()
+    hiring_sub = None
+    if _hf != "any":
+        hiring_sub = _hiring_signal_subq(workspace_id=workspace_id)
+        stmt = stmt.outerjoin(hiring_sub, hiring_sub.c.lead_id == Lead.id)
+
+    if workspace_id is not None:
+        stmt = stmt.where(Lead.workspace_id == workspace_id)
+    if search and search.strip():
+        q = f"%{search.strip()}%"
+        stmt = stmt.where(
+            or_(
+                Lead.first_name.ilike(q),
+                Lead.last_name.ilike(q),
+                Lead.email.ilike(q),
+            )
+        )
+    if tier_filter:
+        stmt = stmt.where(Score.tier.in_(tier_filter))
+    if enriched_only:
+        stmt = stmt.where(Enrichment.id.is_not(None))
+    if sent_only and email_sub is not None:
+        stmt = stmt.where(email_sub.c.any_delivered == 1)
+    elif not_sent_only and email_sub is not None:
+        stmt = stmt.where(
+            or_(email_sub.c.any_delivered == 0, email_sub.c.any_delivered.is_(None))
+        )
+
+    if hiring_sub is not None:
+        if _hf in ("high", "medium", "low"):
+            stmt = stmt.where(hiring_sub.c.hiring_strength == _hf)
+        elif _hf == "none":
+            stmt = stmt.where(
+                or_(
+                    hiring_sub.c.hiring_strength.is_(None),
+                    hiring_sub.c.hiring_strength == "none",
+                    hiring_sub.c.hiring_found.is_(False),
+                )
+            )
+
+    with session_scope() as session:
+        return int(session.execute(stmt).scalar() or 0)
+
+
+def get_scored_lead_ids(lead_ids: list[int]) -> set[int]:
+    """Return the subset of lead_ids that already have a Score row.
+
+    Used by the pipeline runner to skip leads whose scoring already succeeded.
+    """
+    if not lead_ids:
+        return set()
+    with session_scope() as session:
+        rows = session.execute(
+            select(Score.lead_id).where(Score.lead_id.in_(lead_ids))
+        ).all()
+    return {r[0] for r in rows}
+
+
+def get_all_lead_ids() -> list[int]:
+    """Return every lead ID currently in the database, ordered ascending.
+
+    Used by the Run Pipeline page to snapshot the lead set before and after
+    a CSV ingest so newly-inserted IDs can be identified by set diff.
+    """
+    with session_scope() as session:
+        rows = session.execute(select(Lead.id).order_by(Lead.id.asc())).all()
+    return [r[0] for r in rows]
+
+
+def get_unenriched_lead_ids(workspace_id: int | None = None) -> list[int]:
+    """Return IDs of all leads with no Enrichment row, ordered by id."""
+    enriched_subq = select(Enrichment.lead_id).subquery()
+    stmt = (
+        select(Lead.id)
+        .where(Lead.id.notin_(select(enriched_subq.c.lead_id)))
+        .order_by(Lead.id.asc())
+    )
+    if workspace_id is not None:
+        stmt = stmt.where(Lead.workspace_id == workspace_id)
+    with session_scope() as session:
+        rows = session.execute(stmt).all()
+    return [r[0] for r in rows]
+
+
+def get_unscored_lead_ids(workspace_id: int | None = None) -> list[int]:
+    """Return IDs of leads that have enrichment but no Score row yet."""
+    enriched_subq = select(Enrichment.lead_id).subquery()
+    scored_subq = select(Score.lead_id).subquery()
+    stmt = (
+        select(Lead.id)
+        .where(
+            Lead.id.in_(select(enriched_subq.c.lead_id)),
+            Lead.id.notin_(select(scored_subq.c.lead_id)),
+        )
+        .order_by(Lead.id.asc())
+    )
+    if workspace_id is not None:
+        stmt = stmt.where(Lead.workspace_id == workspace_id)
+    with session_scope() as session:
+        rows = session.execute(stmt).all()
+    return [r[0] for r in rows]
+
+
+def get_content_pending_lead_ids(workspace_id: int | None = None) -> list[int]:
+    """Return IDs of leads that have a Score but no GeneratedContent row yet."""
+    scored_subq = select(Score.lead_id).subquery()
+    content_subq = select(GeneratedContent.lead_id).subquery()
+    stmt = (
+        select(Lead.id)
+        .where(
+            Lead.id.in_(select(scored_subq.c.lead_id)),
+            Lead.id.notin_(select(content_subq.c.lead_id)),
+        )
+        .order_by(Lead.id.asc())
+    )
+    if workspace_id is not None:
+        stmt = stmt.where(Lead.workspace_id == workspace_id)
+    with session_scope() as session:
+        rows = session.execute(stmt).all()
+    return [r[0] for r in rows]
+
+
+def get_lead_ids_by_tiers(tiers: list[str], workspace_id: int | None = None) -> list[int]:
+    """Return lead IDs whose Score.tier is in `tiers`, ascending by lead id.
+
+    Same tier source as the Leads table (`list_leads` joins `Score` 1:1 with
+    `Lead`). Leads without a Score row are excluded — they have no tier.
+    """
+    if not tiers:
+        return []
+    normalized = [t.upper() for t in tiers if t]
+    if not normalized:
+        return []
+    stmt = (
+        select(Lead.id)
+        .join(Score, Score.lead_id == Lead.id)
+        .where(Score.tier.in_(normalized))
+        .order_by(Lead.id.asc())
+    )
+    if workspace_id is not None:
+        stmt = stmt.where(Lead.workspace_id == workspace_id)
+    with session_scope() as session:
+        rows = session.execute(stmt).all()
+    return [r[0] for r in rows]
+
+
+def get_leads_with_content_by_tier(
+    tiers: list[str], workspace_id: int | None = None
+) -> list[int]:
+    """Return lead IDs whose Score.tier is in `tiers` AND that have at least
+    one active (non-superseded) GeneratedContent row. Used by the bulk
+    regenerate UI to scope a tier-targeted refresh."""
+    if not tiers:
+        return []
+    stmt = (
+        select(Lead.id)
+        .join(Score, Score.lead_id == Lead.id)
+        .join(GeneratedContent, GeneratedContent.lead_id == Lead.id)
+        .where(
+            Score.tier.in_(tiers),
+            GeneratedContent.superseded_by_id.is_(None),
+        )
+        .distinct()
+    )
+    if workspace_id is not None:
+        stmt = stmt.where(Lead.workspace_id == workspace_id)
+    with session_scope() as session:
+        rows = session.execute(stmt).all()
+    return sorted(r[0] for r in rows)
+
+
+def get_content_lead_ids(lead_ids: list[int], kind: str) -> set[int]:
+    """Return the subset of lead_ids that already have a GeneratedContent row
+    of the given kind with non-empty body (and non-empty subject for email)."""
+    if not lead_ids:
+        return set()
+    stmt = select(GeneratedContent.lead_id).where(
+        GeneratedContent.lead_id.in_(lead_ids),
+        GeneratedContent.kind == kind,
+        GeneratedContent.body.is_not(None),
+        GeneratedContent.body != "",
+    )
+    if kind == "email":
+        stmt = stmt.where(
+            GeneratedContent.subject.is_not(None),
+            GeneratedContent.subject != "",
+        )
+    with session_scope() as session:
+        rows = session.execute(stmt).all()
+    return {r[0] for r in rows}
+
+
+def get_lead_full(
+    lead_id: int, workspace_id: int | None = None
+) -> dict[str, Any] | None:
+    """Bundle Lead + Enrichment + Score + GeneratedContent[] + Engagement[] as plain dicts.
+
+    Returns None when the lead does not exist or when workspace_id is given
+    and the lead belongs to a different workspace (requirement 7: do not fall
+    back to another workspace).  All ORM attributes are read inside the session
+    so the caller never touches detached objects.
+    """
+    with session_scope() as session:
+        lead = session.get(Lead, lead_id)
+        if lead is None:
+            return None
+        if workspace_id is not None and lead.workspace_id != workspace_id:
+            return None
+
+        lead_dict = {
+            "id": lead.id,
+            "first_name": lead.first_name,
+            "last_name": lead.last_name,
+            "email": lead.email,
+            "title": lead.title,
+            "company": lead.company,
+            "company_domain": lead.company_domain,
+            "linkedin_url": lead.linkedin_url,
+            "company_linkedin_url": lead.company_linkedin_url,
+            "industry": lead.industry,
+            "email_verification_status": lead.email_verification_status,
+            "email_verification_provider": lead.email_verification_provider,
+            "email_verified_at": lead.email_verified_at,
+            "created_at": lead.created_at,
+            # Source signal layer (imported enrichment from OSP Lead Engine).
+            "external_contact_id": lead.external_contact_id,
+            "external_source": lead.external_source,
+            "external_client_slug": lead.external_client_slug,
+            "source_tier": getattr(lead, "source_tier", None),
+            "source_tier_score": getattr(lead, "source_tier_score", None),
+            "lead_source_raw": lead.lead_source_raw,
+        }
+
+        enrichment = session.execute(
+            select(Enrichment).where(Enrichment.lead_id == lead_id)
+        ).scalar_one_or_none()
+        enrichment_dict: dict[str, Any] | None = None
+        if enrichment is not None:
+            enrichment_dict = {
+                "linkedin_profile": enrichment.linkedin_profile,
+                "company_details": enrichment.company_details,
+                "company_news": enrichment.company_news,
+                "industry_news": enrichment.industry_news,
+                "buyer_accounts": enrichment.buyer_accounts,
+                "source_status": enrichment.source_status or {},
+                "enriched_at": enrichment.enriched_at,
+            }
+
+        score = session.execute(
+            select(Score).where(Score.lead_id == lead_id)
+        ).scalar_one_or_none()
+        score_dict: dict[str, Any] | None = None
+        if score is not None:
+            score_dict = {
+                "score": int(score.score),
+                "tier": score.tier,
+                "rationale": score.rationale,
+                "signals_used": list(score.signals_used or []),
+                "model": score.model,
+                "scored_at": score.scored_at,
+            }
+
+        contents = (
+            session.execute(
+                select(GeneratedContent)
+                .where(GeneratedContent.lead_id == lead_id)
+                .order_by(GeneratedContent.kind.asc(), GeneratedContent.id.desc())
+            )
+            .scalars()
+            .all()
+        )
+        contents_list: list[dict[str, Any]] = []
+        for c in contents:
+            contents_list.append(
+                {
+                    "id": c.id,
+                    "kind": c.kind,
+                    "subject": c.subject,
+                    "body": c.body,
+                    "signals_cited": list(c.signals_cited or []),
+                    "prompt_version": c.prompt_version,
+                    "model": c.model,
+                    "created_at": c.created_at,
+                    "delivered_at": c.delivered_at,
+                    "delivery_provider": c.delivery_provider,
+                    "delivery_id": c.delivery_id,
+                    "skip_reason": c.skip_reason,
+                    "delivery_status": c.delivery_status,
+                    "error_message": c.error_message,
+                    "superseded_by_id": c.superseded_by_id,
+                }
+            )
+
+        content_ids = [c["id"] for c in contents_list]
+        engagements_list: list[dict[str, Any]] = []
+        if content_ids:
+            engs = (
+                session.execute(
+                    select(Engagement)
+                    .where(Engagement.content_id.in_(content_ids))
+                    .order_by(Engagement.synced_at.desc())
+                )
+                .scalars()
+                .all()
+            )
+            for e in engs:
+                engagements_list.append(
+                    {
+                        "id": e.id,
+                        "content_id": e.content_id,
+                        "sent": bool(e.sent),
+                        "delivered": bool(e.delivered),
+                        "opened": bool(e.opened),
+                        "clicked": bool(e.clicked),
+                        "replied": bool(e.replied),
+                        "reply_sentiment": e.reply_sentiment,
+                        "bounced": bool(e.bounced),
+                        "raw": e.raw,
+                        "synced_at": e.synced_at,
+                    }
+                )
+
+        # Hiring signal (C-tier rescue layer) + imported source signal.
+        # Best-effort: the table may not exist on a pre-migration DB, so a
+        # failure degrades to None.
+        hiring_signal_dict: dict[str, Any] | None = None
+        source_signal_dict: dict[str, Any] | None = None
+        try:
+            from src.models import LeadSignal
+            sig = session.execute(
+                select(LeadSignal).where(
+                    LeadSignal.lead_id == lead_id,
+                    LeadSignal.signal_type == "hiring",
+                )
+            ).scalar_one_or_none()
+            src_sig = session.execute(
+                select(LeadSignal).where(
+                    LeadSignal.lead_id == lead_id,
+                    LeadSignal.signal_type == "source_import",
+                )
+            ).scalar_one_or_none()
+            if src_sig is not None:
+                _src_raw = src_sig.raw_payload or {}
+                source_signal_dict = {
+                    "signal_found": bool(src_sig.signal_found),
+                    "signal_strength": src_sig.signal_strength,
+                    "signal_names": list(src_sig.relevant_roles or []),
+                    "matched_icps": list(src_sig.relevant_departments or []),
+                    "summary": src_sig.summary,
+                    "source_urls": list(src_sig.source_urls or []),
+                    "recommended_email_angle": src_sig.recommended_email_angle,
+                    "tier_uplift_recommendation": src_sig.tier_uplift_recommendation,
+                    "applied_uplift": src_sig.applied_uplift,
+                    # Full normalized per-signal rows (type/value/confidence/
+                    # source/source_url/detected_at) + count, pulled from the
+                    # stored ParsedSourceSignals payload so Lead Detail can show
+                    # the exact Dele signal shape.
+                    "signal_count": _src_raw.get("signal_count"),
+                    "signals": list(_src_raw.get("signals") or []),
+                    "source_system": _src_raw.get("source_system"),
+                    "source_metadata": _src_raw.get("source_metadata") or {},
+                    "raw_payload": src_sig.raw_payload,
+                    "updated_at": src_sig.updated_at,
+                }
+            if sig is not None:
+                hiring_signal_dict = {
+                    "signal_found": bool(sig.signal_found),
+                    "signal_strength": sig.signal_strength,
+                    "relevant_roles": list(sig.relevant_roles or []),
+                    "relevant_departments": list(sig.relevant_departments or []),
+                    "recency_estimate": sig.recency_estimate,
+                    "summary": sig.summary,
+                    "why_it_matters": sig.why_it_matters,
+                    "source_urls": list(sig.source_urls or []),
+                    "recommended_email_angle": sig.recommended_email_angle,
+                    "tier_uplift_recommendation": sig.tier_uplift_recommendation,
+                    "applied_uplift": sig.applied_uplift,
+                    "base_tier": sig.base_tier,
+                    "base_score": sig.base_score,
+                    "status": getattr(sig, "status", None),
+                    "last_run_at": getattr(sig, "last_run_at", None),
+                    "error": getattr(sig, "error", None),
+                    "updated_at": sig.updated_at,
+                }
+        except Exception:
+            hiring_signal_dict = None
+
+        return {
+            "lead": lead_dict,
+            "enrichment": enrichment_dict,
+            "score": score_dict,
+            "contents": contents_list,
+            "engagements": engagements_list,
+            "hiring_signal": hiring_signal_dict,
+            "source_signal": source_signal_dict,
+        }
+
+
+def latest_instantly_snapshot(workspace_id: int | None = None) -> dict[str, Any] | None:
+    """Most-recent Instantly analytics snapshot, as a plain dict.
+
+    Returns None when no snapshot exists yet (e.g. the GitHub Actions job
+    hasn't run since the table was added). Caller uses this for the
+    "Source: Instantly campaign analytics" KPI row and the debug expander.
+
+    For positive_reply_count / opportunity_count / conversion_count, prefers
+    the dedicated model column (populated on new rows) then falls back to
+    extracting from the raw JSON dict for rows created before the schema
+    addition so no data is lost across the migration.
+    """
+    with session_scope() as session:
+        snap_q = (
+            select(InstantlyAnalyticsSnapshot)
+            .order_by(InstantlyAnalyticsSnapshot.synced_at.desc())
+            .limit(1)
+        )
+        if workspace_id is not None:
+            snap_q = snap_q.where(
+                InstantlyAnalyticsSnapshot.workspace_id == workspace_id
+            )
+        snap = session.execute(snap_q).scalar_one_or_none()
+        if snap is None:
+            return None
+        raw = snap.raw or {}
+
+        def _col_or_raw(col_val: Any, *raw_keys: str) -> int | None:
+            """Return model column value if not None, else try raw dict keys."""
+            if col_val is not None:
+                return int(col_val)
+            for key in raw_keys:
+                v = raw.get(key)
+                if v is not None:
+                    try:
+                        return int(v)
+                    except (TypeError, ValueError):
+                        pass
+            return None
+
+        return {
+            "id": snap.id,
+            "campaign_id": snap.campaign_id,
+            "leads_count": int(snap.leads_count or 0),
+            "contacted_count": int(snap.contacted_count or 0),
+            "emails_sent_count": int(snap.emails_sent_count or 0),
+            "open_count": int(snap.open_count or 0),
+            "unique_open_count": (
+                int(snap.unique_open_count)
+                if snap.unique_open_count is not None
+                else None
+            ),
+            "reply_count": int(snap.reply_count or 0),
+            "bounced_count": int(snap.bounced_count or 0),
+            "click_count": int(snap.click_count or 0),
+            "unsubscribed_count": int(snap.unsubscribed_count or 0),
+            "completed_count": int(snap.completed_count or 0),
+            # v2 positive-engagement fields. None means "not reported by Instantly"
+            # (absent from the API response), distinct from 0 ("reported as zero").
+            "positive_reply_count": _col_or_raw(
+                snap.positive_reply_count,
+                "positive_reply_count", "positive_replies_count", "interested_count",
+            ),
+            "opportunity_count": _col_or_raw(
+                snap.opportunity_count,
+                "opportunity_count", "opportunities_count", "opportunities",
+            ),
+            "conversion_count": _col_or_raw(
+                snap.conversion_count,
+                "conversion_count", "conversions_count", "conversions",
+            ),
+            # Source attribution — which raw field or fallback produced the counts.
+            "raw_positive_reply_source": getattr(snap, "raw_positive_reply_source", None),
+            "raw_opportunity_source": getattr(snap, "raw_opportunity_source", None),
+            "raw": raw,
+            "synced_at": snap.synced_at,
+        }
+
+
+def local_sent_count(workspace_id: int | None = None) -> int:
+    """Count of email GeneratedContent rows with delivery_status='sent'.
+
+    Used to surface the Instantly-vs-local discrepancy on the Engagement
+    page. Mirrors the count behind the "Sent folder" list.
+    """
+    with session_scope() as session:
+        stmt = select(func.count(GeneratedContent.id)).where(
+            GeneratedContent.kind == "email",
+            GeneratedContent.delivery_status == "sent",
+        )
+        if workspace_id is not None:
+            stmt = stmt.where(GeneratedContent.workspace_id == workspace_id)
+        return int(session.execute(stmt).scalar() or 0)
+
+
+def last_sync_time(workspace_id: int | None = None) -> datetime | None:
+    with session_scope() as session:
+        stmt = select(func.max(Engagement.synced_at))
+        if workspace_id is not None:
+            stmt = (
+                stmt
+                .join(GeneratedContent, Engagement.content_id == GeneratedContent.id)
+                .where(GeneratedContent.workspace_id == workspace_id)
+            )
+        ts = session.execute(stmt).scalar()
+    return ts
+
+
+def recent_engagement(limit: int = 20, workspace_id: int | None = None) -> "pd.DataFrame":
+    """Most-recent successful email pushes, joined with optional engagement.
+
+    Source is `GeneratedContent` (delivery_status='sent', kind='email') —
+    NOT `Engagement` — so a lead that was just pushed shows up immediately
+    without waiting for the next "Sync engagement from Instantly" run.
+    Engagement is LEFT-joined so opens / replies / clicks surface once
+    they've been synced from Instantly.
+
+    Ordering: COALESCE(delivered_at, created_at) DESC so the newest send
+    is always on top. Email lead/company/subject/body come back inline so
+    the page can render the row + expand-to-email without a second query.
+    """
+    import pandas as pd  # optional: UI/analysis only
+    stmt = (
+        select(
+            GeneratedContent.id.label("content_id"),
+            GeneratedContent.delivered_at.label("delivered_at"),
+            GeneratedContent.created_at.label("created_at"),
+            GeneratedContent.delivery_status.label("delivery_status"),
+            GeneratedContent.kind.label("kind"),
+            GeneratedContent.subject.label("subject"),
+            GeneratedContent.body.label("body"),
+            Lead.first_name.label("first_name"),
+            Lead.last_name.label("last_name"),
+            Lead.company.label("company"),
+            Lead.email.label("email"),
+            Engagement.synced_at.label("synced_at"),
+            Engagement.sent.label("eng_sent"),
+            Engagement.delivered.label("eng_delivered"),
+            Engagement.opened.label("eng_opened"),
+            Engagement.clicked.label("eng_clicked"),
+            Engagement.replied.label("eng_replied"),
+            Engagement.bounced.label("eng_bounced"),
+        )
+        .select_from(GeneratedContent)
+        .join(Lead, Lead.id == GeneratedContent.lead_id)
+        .outerjoin(Engagement, Engagement.content_id == GeneratedContent.id)
+        .where(
+            GeneratedContent.kind == "email",
+            GeneratedContent.delivery_status == "sent",
+        )
+        .order_by(
+            func.coalesce(
+                GeneratedContent.delivered_at, GeneratedContent.created_at
+            ).desc(),
+            GeneratedContent.id.desc(),
+        )
+        .limit(limit)
+    )
+    if workspace_id is not None:
+        stmt = stmt.where(GeneratedContent.workspace_id == workspace_id)
+    with session_scope() as session:
+        rows = session.execute(stmt).all()
+    return pd.DataFrame.from_records(
+        [
+            {
+                # Use the delivered_at timestamp when present (true "sent time"),
+                # otherwise the engagement synced_at, otherwise content created_at.
+                # The page's row label calls this "Sent" so it must be a send-time
+                # value, not a sync-time value.
+                "synced_at": r.delivered_at or r.synced_at or r.created_at,
+                "delivered_at": r.delivered_at,
+                "delivery_status": r.delivery_status or "sent",
+                "lead": f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip(),
+                "company": r.company or "",
+                "email": r.email or "",
+                "content_id": int(r.content_id),
+                "kind": r.kind,
+                "subject": r.subject or "",
+                "body": r.body or "",
+                "sent": True,  # delivery_status='sent' guarantees this
+                "delivered": bool(r.eng_delivered) if r.eng_delivered is not None else False,
+                "opened": bool(r.eng_opened) if r.eng_opened is not None else False,
+                "clicked": bool(r.eng_clicked) if r.eng_clicked is not None else False,
+                "replied": bool(r.eng_replied) if r.eng_replied is not None else False,
+                "bounced": bool(r.eng_bounced) if r.eng_bounced is not None else False,
+            }
+            for r in rows
+        ],
+        columns=[
+            "synced_at", "delivered_at", "delivery_status",
+            "lead", "company", "email", "content_id", "kind",
+            "subject", "body",
+            "sent", "delivered", "opened", "clicked", "replied", "bounced",
+        ],
+    )
+
+
+def sent_emails(workspace_id: int | None = None) -> "pd.DataFrame":
+    """All email GeneratedContent rows that were successfully pushed to Instantly.
+
+    Filters on delivery_status = "sent" (the Phase 9 outcome flag for a
+    successful API push), kind = "email". Sort newest-first by delivered_at
+    so the Engagement "Sent folder" shows the most recent sends on top.
+    Includes the full body so the page can expand each row without a
+    second query.
+    """
+    import pandas as pd  # optional: UI/analysis only
+    stmt = (
+        select(
+            GeneratedContent.id.label("content_id"),
+            GeneratedContent.delivered_at.label("sent_at"),
+            GeneratedContent.subject.label("subject"),
+            GeneratedContent.body.label("body"),
+            Lead.first_name.label("first_name"),
+            Lead.last_name.label("last_name"),
+            Lead.company.label("company"),
+        )
+        .join(Lead, Lead.id == GeneratedContent.lead_id)
+        .where(
+            GeneratedContent.kind == "email",
+            GeneratedContent.delivery_status == "sent",
+        )
+        .order_by(
+            GeneratedContent.delivered_at.desc().nulls_last(),
+            GeneratedContent.id.desc(),
+        )
+    )
+    if workspace_id is not None:
+        stmt = stmt.where(GeneratedContent.workspace_id == workspace_id)
+    with session_scope() as session:
+        rows = session.execute(stmt).all()
+    return pd.DataFrame.from_records(
+        [
+            {
+                "content_id": int(r.content_id),
+                "sent_at": r.sent_at,
+                "lead": f"{(r.first_name or '').strip()} {(r.last_name or '').strip()}".strip(),
+                "company": r.company or "",
+                "subject": r.subject or "",
+                "body": r.body or "",
+            }
+            for r in rows
+        ],
+        columns=["content_id", "sent_at", "lead", "company", "subject", "body"],
+    )
+
+
+def reply_rate_series(days: int = 30, workspace_id: int | None = None) -> "pd.DataFrame":
+    """Aggregate replies / sends by date(synced_at) over the last N days."""
+    import pandas as pd  # optional: UI/analysis only
+    cutoff = now_utc() - timedelta(days=days)
+    with session_scope() as session:
+        stmt = (
+            select(
+                func.date(Engagement.synced_at).label("day"),
+                func.count(Engagement.id).label("sent"),
+                func.sum(case((Engagement.replied.is_(True), 1), else_=0)).label("replied"),
+            )
+            .join(GeneratedContent, Engagement.content_id == GeneratedContent.id)
+            .where(
+                and_(
+                    GeneratedContent.kind == "email",
+                    Engagement.synced_at >= cutoff,
+                )
+            )
+            .group_by(func.date(Engagement.synced_at))
+            .order_by(func.date(Engagement.synced_at).asc())
+        )
+        if workspace_id is not None:
+            stmt = stmt.where(GeneratedContent.workspace_id == workspace_id)
+        rows = session.execute(stmt).all()
+    df = pd.DataFrame(
+        [{"date": r.day, "sent": int(r.sent or 0), "replied": int(r.replied or 0)} for r in rows]
+    )
+    if df.empty:
+        return pd.DataFrame(columns=["date", "sent", "replied", "reply_rate"])
+    df["reply_rate"] = df.apply(
+        lambda r: (r["replied"] / r["sent"]) if r["sent"] else 0.0, axis=1
+    )
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Phase 5e — review queue + rating trends for the Dashboard
+# ---------------------------------------------------------------------------
+
+_KIND_LABELS = {
+    "email": "Email",
+    "call_script": "Call Script",
+    "linkedin_msg": "LinkedIn DM",
+}
+
+
+def list_unrated_content(
+    content_type: str | None = None,
+    limit: int = 50,
+) -> "pd.DataFrame":
+    """Review-queue DataFrame: head, unrated content rows joined with lead/tier.
+
+    Wraps `src.feedback.ratings.get_unrated_content` and decorates with lead
+    name and company in a single follow-up DB pass.
+    """
+    import pandas as pd  # optional: UI/analysis only
+    rows = get_unrated_content(content_type=content_type, limit=limit)
+    if not rows:
+        return pd.DataFrame(
+            columns=["id", "lead_id", "Lead", "Company", "Type", "Tier", "Created"]
+        )
+
+    lead_ids = list({r["lead_id"] for r in rows})
+    with session_scope() as session:
+        lead_rows = session.execute(
+            select(Lead.id, Lead.first_name, Lead.last_name, Lead.company)
+            .where(Lead.id.in_(lead_ids))
+        ).all()
+    lead_lookup = {
+        lid: {
+            "name": f"{(fn or '').strip()} {(ln or '').strip()}".strip(),
+            "company": comp or "",
+        }
+        for (lid, fn, ln, comp) in lead_rows
+    }
+
+    records: list[dict[str, Any]] = []
+    for r in rows:
+        info = lead_lookup.get(r["lead_id"], {"name": "", "company": ""})
+        records.append(
+            {
+                "id": r["id"],
+                "lead_id": r["lead_id"],
+                "Lead": info["name"],
+                "Company": info["company"],
+                "Type": _KIND_LABELS.get(r["kind"], r["kind"]),
+                "Tier": r["tier"] or "—",
+                "Created": r["created_at"],
+            }
+        )
+    return pd.DataFrame.from_records(
+        records,
+        columns=["id", "lead_id", "Lead", "Company", "Type", "Tier", "Created"],
+    )
+
+
+def rating_summary_per_content_type(days: int = 30) -> "pd.DataFrame":
+    """Pivoted up-rate frame for the trends chart.
+
+    Returns a DataFrame indexed by date with one column per content_type
+    holding the daily up-rate (replied:sent ratio for ratings, on a 0–1 scale).
+    Empty if no ratings exist within the window.
+    """
+    import pandas as pd  # optional: UI/analysis only
+    trends = get_rating_trends(days=days)
+    if not trends:
+        return pd.DataFrame()
+
+    long_rows: list[dict[str, Any]] = []
+    for kind, entries in trends.items():
+        for e in entries:
+            long_rows.append(
+                {
+                    "date": e["date"],
+                    "kind": _KIND_LABELS.get(kind, kind),
+                    "up_rate": float(e["up_rate"]),
+                }
+            )
+    long_df = pd.DataFrame(long_rows)
+    if long_df.empty:
+        return long_df
+
+    pivot = long_df.pivot(index="date", columns="kind", values="up_rate").sort_index()
+    return pivot

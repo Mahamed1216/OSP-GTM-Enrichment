@@ -1,15 +1,15 @@
-"""Internal-API processing: adapt SalesOS payloads → existing pipeline.
+"""Internal-API processing: adapt inbound payloads → existing pipeline.
 
 This module orchestrates the EXISTING business logic — it does not reimplement
 import/dedup, signal normalization, enrichment, scoring, or content. It:
 
-  1. Adapts the nested SalesOS lead shape into the flat ContactOut shape that
+  1. Adapts the nested inbound lead shape into the flat ContactOut shape that
      src.lead_source.ingest.import_contacts already understands (so dedup, raw
      payload storage, source-signal normalization, source-tier separation, and
      email_verified mapping all happen via the existing code path).
   2. Runs the option-gated steps (enrichment incl. buyer research, hiring
      signals, scoring, email) using the existing primitives.
-  3. Builds the processed-lead payload SalesOS expects (research/score/content/
+  3. Builds the processed-lead payload the caller expects (research/score/content/
      safety) for the connector layer to route.
 
 Hard guarantees: NEVER pushes to Instantly, NEVER sends email, NEVER generates
@@ -56,13 +56,13 @@ def normalize_options(opts: Any) -> dict[str, bool]:
 
 
 # ---------------------------------------------------------------------------
-# Adapter: SalesOS nested lead → flat ContactOut dict
+# Adapter: nested inbound lead → flat ContactOut dict
 # ---------------------------------------------------------------------------
 
-def salesos_lead_to_contact(lead: dict, *, source: str = "salesos") -> dict:
-    """Flatten one SalesOS lead into the ContactOut shape import_contacts expects.
+def api_lead_to_contact(lead: dict, *, source: str = "api") -> dict:
+    """Flatten one inbound lead into the ContactOut shape import_contacts expects.
 
-    The full original SalesOS payload is preserved under ``salesos_payload`` so
+    The full original request payload is preserved under ``source_payload`` so
     the raw source payload is stored verbatim (in addition to the flattened
     fields used for mapping/dedup).
     """
@@ -93,7 +93,7 @@ def salesos_lead_to_contact(lead: dict, *, source: str = "salesos") -> dict:
         "tier_score": lead.get("source_tier_score"),
         "source": contact.get("source") or source,
         # Verbatim original for provenance/audit.
-        "salesos_payload": lead,
+        "source_payload": lead,
     })
     return contact
 
@@ -209,7 +209,7 @@ def _buyer_summary(ba: dict) -> str | None:
 
 
 def build_processed_payload(lead_id: int, workspace_id: int | None) -> dict:
-    """Assemble the SalesOS-facing processed payload for one lead."""
+    """Assemble the caller-facing processed payload for one lead."""
     from src.delivery.eligibility import (
         _is_verified,
         filter_eligible,
@@ -349,7 +349,7 @@ def build_processed_payload(lead_id: int, workspace_id: int | None) -> dict:
         },
         "recommended_action": {
             "action": action,
-            "destination_options": ["SalesOS_connector_layer"],
+            "destination_options": ["connector_layer"],
         },
         "metadata": {
             "processed_at": now_utc().isoformat(),
@@ -392,7 +392,7 @@ async def process_run(run_id: str) -> dict:
     mark_running(run_id)
     req = run.get("request_payload") or {}
     workspace_id = run.get("workspace_id")
-    source = run.get("source") or "salesos"
+    source = run.get("source") or "api"
     options = normalize_options(req.get("options"))
     leads = req.get("leads") or []
 
@@ -401,7 +401,7 @@ async def process_run(run_id: str) -> dict:
     failed = 0
 
     try:
-        contacts = [salesos_lead_to_contact(l, source=source) for l in leads]
+        contacts = [api_lead_to_contact(l, source=source) for l in leads]
         import_id = start_import_log(
             workspace_id, source, requested_limit=len(contacts),
             base_url="", auto_run=True,

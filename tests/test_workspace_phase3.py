@@ -27,7 +27,7 @@ from src.workspace import (
     get_default_workspace_id,
     seed_default_workspace,
 )
-from app.lib.db_queries import (
+from src.lib.db_queries import (
     get_content_pending_lead_ids,
     get_lead_full,
     get_lead_ids_by_tiers,

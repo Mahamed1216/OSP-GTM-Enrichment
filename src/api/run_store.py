@@ -127,3 +127,30 @@ def list_queued_run_ids(limit: int = 10) -> list[str]:
             .limit(limit)
         ).scalars().all()
         return list(rows)
+
+
+def list_recent_runs(limit: int = 25, workspace_id: int | None = None) -> list[dict[str, Any]]:
+    """Recent runs, newest first, for the operator console.
+
+    Returns a compact summary — the full request/result payloads can be large,
+    so they are fetched per-run via ``get_run`` instead.
+    """
+    with session_scope() as session:
+        query = select(ApiRun).order_by(ApiRun.id.desc()).limit(max(1, min(100, limit)))
+        if workspace_id is not None:
+            query = query.where(ApiRun.workspace_id == workspace_id)
+        return [
+            {
+                "run_id": row.run_id,
+                "status": row.status,
+                "run_mode": row.run_mode,
+                "source": row.source,
+                "lead_count": row.lead_count,
+                "processed_count": row.processed_count,
+                "failed_count": row.failed_count,
+                "error": row.error,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+            }
+            for row in session.execute(query).scalars().all()
+        ]

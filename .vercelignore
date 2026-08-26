@@ -1,6 +1,6 @@
-# Keeps the upload small. NOTE: the Python function imports src/ and
-# app/lib/config.py, and Vercel builds the Next.js UI from package.json,
-# next.config.js, pages/ and styles/ — none of those may be ignored here.
+# Keeps the upload small. NOTE: the Python function imports src/, and Vercel
+# builds the Next.js UI from package.json, next.config.js, pages/, components/,
+# lib/ and styles/ — none of those may be ignored here.
 .env
 .env.local
 .git
@@ -22,18 +22,9 @@ tests/
 docs/
 supabase/
 scripts/
-aws/
 memory/
 logs/
-app/pages/
-app/PHASE*.md
 *.db
 *.sqlite
 *.sqlite3
-.streamlit/
-Dockerfile
-.dockerignore
-docker-compose.yml
-requirements-ui.txt
-run_webhook.py
 README.md

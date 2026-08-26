@@ -3,7 +3,7 @@ content-generation system prompts (email / linkedin_msg / call_script).
 
 Storage: Supabase Postgres via the `prompt_configs` table (one row per
 (channel, workspace_id) pair). Previously this lived in
-``data/prompts_config.json`` but local disk on Streamlit Cloud is ephemeral,
+``data/prompts_config.json`` but local disk on the deployment is ephemeral,
 so every deploy reset the user's edits. The JSON file is still read as a
 **deprecated fallback** for local dev / older checkouts — DB takes precedence
 whenever a row exists. Writes go to the DB only.

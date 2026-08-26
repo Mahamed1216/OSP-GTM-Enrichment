@@ -3,7 +3,7 @@ import json
 import logging
 import time
 
-from app.lib.config import get_secret
+from src.secrets import get_secret
 
 from pydantic import BaseModel, Field
 from sqlalchemy import select

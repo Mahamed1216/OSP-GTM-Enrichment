@@ -4,7 +4,7 @@ Auth: Authorization: Bearer <api_key>  (Postman-confirmed format)
 Health endpoint: no auth required (spec: "No auth required")
 
 All methods are synchronous (httpx without async) so they can be called
-from Streamlit event handlers and test fixtures without an event loop.
+from sync entry points and test fixtures without an event loop.
 
 Security: the api_key only appears in the Authorization header value.
 It never appears in log output — we log only base_url and slug.

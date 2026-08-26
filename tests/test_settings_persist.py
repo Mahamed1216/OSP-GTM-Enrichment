@@ -71,45 +71,6 @@ def _patch_config(monkeypatch, tmp_path, file_company_name: str):
 # Test 1: Lead Sources appears in authenticated navigation
 # ---------------------------------------------------------------------------
 
-def test_lead_sources_in_authenticated_navigation():
-    main_py = (_PROJECT_ROOT / "app" / "main.py").read_text(encoding="utf-8")
-    assert "8_lead_sources" in main_py, (
-        "8_lead_sources.py must be registered in app/main.py navigation"
-    )
-    assert "lead_sources" in main_py.lower(), (
-        "A lead_sources page variable must exist in app/main.py"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 2: Lead Sources is registered after the auth gate (not unauthenticated-only)
-# ---------------------------------------------------------------------------
-
-def test_lead_sources_registered_after_auth_gate():
-    main_py = (_PROJECT_ROOT / "app" / "main.py").read_text(encoding="utf-8")
-
-    # The auth gate ends with st.stop() inside the not-authenticated block.
-    auth_stop_pos = main_py.find("st.stop()")
-    assert auth_stop_pos > 0, "Auth gate st.stop() must exist in main.py"
-
-    # lead_sources registration must appear AFTER the auth gate st.stop().
-    ls_pos = main_py.lower().find("8_lead_sources")
-    assert ls_pos > auth_stop_pos, (
-        "8_lead_sources must be registered after the auth gate so it is "
-        "only visible to authenticated users"
-    )
-
-    # Also verify it's in the st.navigation([...]) call
-    nav_call_pos = main_py.find("st.navigation(")
-    assert nav_call_pos > 0, "st.navigation() must be called in main.py"
-    assert "lead_sources" in main_py[nav_call_pos:nav_call_pos + 500], (
-        "lead_sources_page must be in the st.navigation([...]) call"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Test 3: Saving OSP workspace settings persists to DB
-# ---------------------------------------------------------------------------
 
 def test_saving_osp_settings_persists_to_db():
     ws_id = _seed_osp()

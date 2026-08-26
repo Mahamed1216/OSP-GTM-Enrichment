@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from sqlalchemy import select
 
-from app.lib.db_queries import get_lead_full
-from app.lib.research_display import research_display_state
+from src.lib.db_queries import get_lead_full
+from src.lib.research_display import research_display_state
 from src.db import session_scope
 from src.models import Enrichment, GeneratedContent, Lead
 from src.workspace import get_default_workspace_id, seed_default_workspace

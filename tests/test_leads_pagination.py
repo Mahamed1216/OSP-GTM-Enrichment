@@ -21,7 +21,7 @@ from src.db import session_scope
 from src.models import Enrichment, Lead, Score, Workspace
 from src.workspace import seed_default_workspace, get_default_workspace_id
 
-from app.lib.db_queries import count_leads, list_leads
+from src.lib.db_queries import count_leads, list_leads
 
 
 # ---------------------------------------------------------------------------

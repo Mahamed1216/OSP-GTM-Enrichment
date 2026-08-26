@@ -427,7 +427,7 @@ class TestCsvImportWorkspaceScoping:
 
     def test_imported_leads_not_visible_in_other_workspace(self):
         from src.ingest_writer import ingest_rows
-        from app.lib.db_queries import list_leads
+        from src.lib.db_queries import list_leads
         osp_id = _seed_osp()
         other_ws = create_workspace(name="Isolated Import WS", slug="isolated-import-ws", instantly_campaign_id="c-ii")
 

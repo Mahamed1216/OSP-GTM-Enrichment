@@ -3,7 +3,7 @@
 Phase 1: workspace lookup, campaign-ID resolver, default OSP seeding.
 Phase 2: workspace_id backfill, per-table coverage stats, insert-time
          helpers for safe workspace assignment on new rows.
-Phase 3: workspace switching (session-state wrappers in app/lib/workspace_state.py).
+Phase 3: workspace switching.
 Phase 4: workspace creation UI helper — create_workspace() with validation,
          prompt copying, seed-winner copying.
 

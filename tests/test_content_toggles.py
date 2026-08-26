@@ -157,7 +157,7 @@ def test_bulk_pipeline_skips_disabled_kinds(monkeypatch):
     async def _boom(*a, **k):
         raise AssertionError("disabled generator was invoked")
 
-    import app.lib.pipeline_runner as pr
+    import src.lib.pipeline_runner as pr
     monkeypatch.setattr(pr, "_KIND_GENERATOR", {
         "email": _fake_email,
         "call_script": _boom,

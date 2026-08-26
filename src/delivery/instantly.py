@@ -33,8 +33,6 @@ SkipReason = Literal[
     "workspace_not_configured",
     "missing_instantly_api_key",
     "missing_instantly_campaign_id",
-    # SalesOS integration mode only — a CSM approval is required before any send.
-    "missing_salesos_csm_approval",
 ]
 
 
@@ -286,15 +284,6 @@ async def deliver_email(
     verify = await verify_email(lead_id)
     if not _accept_verification(verify.status, strict=strict_verification):
         return await _record_skip(content_id, "email_invalid", lead_id, tier_snapshot, verify_status=verify.status)
-
-    # Guard 5: SalesOS CSM approval (integration mode only). Runs LAST — tier
-    # alone is never enough in integration mode. Standalone mode is unchanged.
-    if settings.salesos_integration_mode:
-        from src.integrations.salesos.approvals import is_engine_content_approved
-        if not is_engine_content_approved(content_id):
-            return await _record_skip(
-                content_id, "missing_salesos_csm_approval", lead_id, tier_snapshot
-            )
 
     # All guards passed — build payload + send.
     # Credentials: API key always from env/secrets/config (shared infra, never

@@ -19,7 +19,7 @@ def _engine_kwargs() -> dict:
     On Vercel every request can land on a fresh, short-lived instance, so a
     per-instance connection pool just leaks Postgres connections. Use NullPool
     (connect/close per checkout) plus pre-ping there. Long-lived processes
-    (Streamlit, the CLI, the worker) keep SQLAlchemy's default pool.
+    (the CLI, the worker) keep SQLAlchemy's default pool.
     """
     if os.environ.get("VERCEL"):
         return {"poolclass": NullPool, "pool_pre_ping": True}
@@ -46,9 +46,8 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 # Process-level flag — True once init_db() has completed for this Python process.
-# Unlike st.session_state (which is per browser session and can be rehydrated by
-# Streamlit Cloud across server restarts), this flag resets to False whenever the
-# OS process is restarted, so init_db() always runs on a fresh deploy.
+# Resets to False whenever the OS process restarts, so init_db() always runs on a
+# fresh deploy.
 _db_initialized: bool = False
 
 
@@ -68,7 +67,7 @@ _RUNTIME_NEW_TABLES: tuple[str, ...] = (
     "reply_threads",
     "lead_source_imports",   # Phase 7: external lead source import log
     "lead_signals",          # Hiring signal C-tier rescue layer
-    "api_runs",              # Internal API (SalesOS) run tracking
+    "api_runs",              # Internal API run tracking
 )
 
 
@@ -116,7 +115,7 @@ _RUNTIME_COLUMN_ADDS: list[tuple[str, str, str]] = [
     # a row, rather than relying on the unchanging prompt_version constant.
     ("generated_contents", "prompt_fingerprint", "VARCHAR(64)"),
     # Self-improvement-loop audit columns. Added in the schema-mismatch
-    # fix after a DataError on Streamlit Cloud Postgres — the loop's
+    # fix after a production Postgres DataError — the loop's
     # status vocabulary outgrew the original VARCHAR(16) `status` column
     # and the audit fields below were never persisted at all.
     ("prompt_recommendations", "loop_status", "VARCHAR(32)"),
@@ -210,7 +209,7 @@ _RUNTIME_COLUMN_ADDS: list[tuple[str, str, str]] = [
 
 # Postgres-only column widenings. SQLite ignores VARCHAR length caps so
 # there's nothing to do for it — the same insert that succeeds on SQLite
-# 1-line-tests is the one that errors on Streamlit Cloud's Postgres.
+# 1-line-tests is the one that errors on Postgres.
 # (table, column, new type)
 _RUNTIME_COLUMN_WIDENS_PG: list[tuple[str, str, str]] = [
     # "ready_for_approval" = 19 chars; original column was VARCHAR(16).
@@ -385,16 +384,6 @@ def init_db() -> None:
         backfill_default_workspace_ids()
         backfill_osp_icp_config()
         migrate_json_winners_to_osp_db()
-        # SalesOS integration: create the shared-Supabase contract tables only
-        # when integration mode is on, so a standalone deployment never grows
-        # unused salesos_* tables. The workers also ensure these lazily at boot.
-        if settings.salesos_integration_mode:
-            try:
-                from src.integrations.salesos import ensure_salesos_tables
-                ensure_salesos_tables()
-            except Exception:
-                import logging as _logging
-                _logging.getLogger(__name__).warning("salesos_ensure_tables_failed")
     except Exception:
         _db_initialized = False  # Allow the next caller to retry.
         raise

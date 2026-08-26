@@ -155,7 +155,7 @@ def test_get_lead_full_exposes_source_signal():
     with session_scope() as s:
         lead_id = s.execute(select(Lead.id).where(Lead.email == "alice@acme.com")).scalar_one()
 
-    from app.lib.db_queries import get_lead_full
+    from src.lib.db_queries import get_lead_full
     bundle = get_lead_full(lead_id, workspace_id=osp)
     assert bundle["lead"]["lead_source_raw"] is not None      # raw payload expandable
     assert bundle["lead"]["source_tier"] == "A"
@@ -169,7 +169,7 @@ def test_get_lead_full_no_source_signal_when_payload_empty():
     with session_scope() as s:
         lead_id = s.execute(select(Lead.id).where(Lead.email == "alice@acme.com")).scalar_one()
 
-    from app.lib.db_queries import get_lead_full
+    from src.lib.db_queries import get_lead_full
     bundle = get_lead_full(lead_id, workspace_id=osp)
     # UI renders "No source signals were included in the imported payload."
     assert bundle["source_signal"] is None

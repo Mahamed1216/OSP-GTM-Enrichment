@@ -387,7 +387,7 @@ def test_pipeline_runs_hiring_signal_phase(monkeypatch):
 
     monkeypatch.setattr("src.signals.hiring.enrich_hiring_signal", fake_hiring)
 
-    from app.lib.pipeline_runner import process_single_lead
+    from src.lib.pipeline_runner import process_single_lead
     process_single_lead(
         lead_id, dry_run=True,
         run_enrichment=False, run_scoring=False,
@@ -406,7 +406,7 @@ def test_pipeline_emits_hiring_signal_status(monkeypatch):
 
     monkeypatch.setattr("src.signals.hiring.enrich_hiring_signal", fake_hiring)
 
-    from app.lib.pipeline_runner import process_single_lead
+    from src.lib.pipeline_runner import process_single_lead
     updates = []
     process_single_lead(
         lead_id, dry_run=True,
@@ -424,7 +424,7 @@ def test_get_lead_full_includes_hiring_status():
     lead_id = _make_lead("c@x.com", osp)
     upsert_hiring_signal(lead_id, _high_signal(["RevOps"]), workspace_id=osp, status="completed")
 
-    from app.lib.db_queries import get_lead_full
+    from src.lib.db_queries import get_lead_full
     bundle = get_lead_full(lead_id, workspace_id=osp)
     assert bundle["hiring_signal"] is not None
     assert bundle["hiring_signal"]["status"] == "completed"
@@ -436,7 +436,7 @@ def test_get_lead_full_hiring_none_when_not_run():
     osp = _seed_osp()
     lead_id = _make_lead("c@x.com", osp)
 
-    from app.lib.db_queries import get_lead_full
+    from src.lib.db_queries import get_lead_full
     bundle = get_lead_full(lead_id, workspace_id=osp)
     assert bundle["hiring_signal"] is None  # UI renders "has not run"
 
@@ -453,7 +453,7 @@ def test_manual_button_runs_for_single_lead(monkeypatch):
 
     monkeypatch.setattr("src.signals.hiring.research_hiring_signal", fake_research)
 
-    from app.lib.rating_runner import research_hiring_signal_sync
+    from src.lib.rating_runner import research_hiring_signal_sync
     out = research_hiring_signal_sync(lead_a, workspace_id=osp)
     assert out["status"] == "completed"
     assert has_hiring_signal(lead_a)

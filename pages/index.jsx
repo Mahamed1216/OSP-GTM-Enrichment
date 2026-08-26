@@ -1,221 +1,80 @@
 import Head from "next/head";
 import { useCallback, useEffect, useState } from "react";
 
+import Content from "../components/Content";
+import LeadDetail from "../components/LeadDetail";
+import Leads from "../components/Leads";
+import Overview from "../components/Overview";
+import Processing from "../components/Processing";
+import Settings from "../components/Settings";
+import { readStoredKey, useApi, writeStoredKey } from "../lib/api";
+
 /**
- * Operator console.
+ * Operator console for the standalone GTM enrichment app.
  *
- * Auth note: /api/v1/* requires the INTERNAL_API_KEY as a bearer token. The key
- * is NOT baked into this bundle and there is no unauthenticated server-side
- * proxy — the operator pastes it here, it is kept in sessionStorage (this
- * browser tab only, cleared when the tab closes) and sent straight to the
- * same-origin API.
+ * Statically prerendered: no getServerSideProps, no environment variables, no
+ * database. Every panel fetches client-side and renders its own error state, so
+ * the page loads even when the API is down.
+ *
+ * The INTERNAL_API_KEY is never in this bundle. The operator pastes it in and
+ * it stays in sessionStorage for the tab.
  */
 
-const KEY_STORE = "osp.internalApiKey";
-const RUNS_STORE = "osp.recentRuns";
-
-const SAMPLE_LEADS = `[
-  {
-    "email": "jane@example.com",
-    "first_name": "Jane",
-    "last_name": "Doe",
-    "company": "Example Ltd",
-    "title": "Head of Operations",
-    "linkedin_url": "https://www.linkedin.com/in/example"
-  }
-]`;
-
-function readSession(key, fallback) {
-  if (typeof window === "undefined") return fallback;
-  try {
-    const raw = window.sessionStorage.getItem(key);
-    return raw === null ? fallback : JSON.parse(raw);
-  } catch {
-    return fallback;
-  }
-}
-
-function writeSession(key, value) {
-  if (typeof window === "undefined") return;
-  try {
-    window.sessionStorage.setItem(key, JSON.stringify(value));
-  } catch {
-    // Private mode or storage disabled: the console still works, the key just
-    // does not persist across a reload.
-  }
-}
-
-/**
- * Never throws. A dead API, a 500 HTML error page, an offline browser — all
- * come back as a result object so a card can render "Unavailable" instead of
- * the failure escaping into React.
- */
-async function callApi(path, { method = "GET", body, apiKey } = {}) {
-  const headers = {};
-  if (body !== undefined) headers["Content-Type"] = "application/json";
-  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-  let res;
-  try {
-    res = await fetch(path, {
-      method,
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-  } catch (e) {
-    return { ok: false, status: 0, unreachable: true, data: { error: String(e) } };
-  }
-  let text = "";
-  try {
-    text = await res.text();
-  } catch {
-    /* body already consumed or connection dropped mid-read */
-  }
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    // A Vercel 500 page or any other HTML response lands here.
-    data = { error: `Non-JSON response (HTTP ${res.status})`, raw: text.slice(0, 500) };
-  }
-  return { ok: res.ok, status: res.status, data };
-}
+const TABS = [
+  ["overview", "Overview"],
+  ["leads", "Leads"],
+  ["content", "Content"],
+  ["processing", "Processing"],
+  ["settings", "Settings"],
+];
 
 export default function Home() {
+  const [tab, setTab] = useState("overview");
   const [apiKey, setApiKey] = useState("");
-  const [keySaved, setKeySaved] = useState(false);
-
-  const [health, setHealth] = useState({ state: "loading" });
-  const [info, setInfo] = useState(null);
-
-  const [workspace, setWorkspace] = useState("");
-  const [runMode, setRunMode] = useState("async");
-  const [leadsJson, setLeadsJson] = useState(SAMPLE_LEADS);
-  const [processing, setProcessing] = useState(false);
-  const [processOut, setProcessOut] = useState(null);
-
-  const [runId, setRunId] = useState("");
-  const [runOut, setRunOut] = useState(null);
-  const [recentRuns, setRecentRuns] = useState([]);
+  const [keyInput, setKeyInput] = useState("");
+  const [openLeadId, setOpenLeadId] = useState(null);
+  const [prefillLead, setPrefillLead] = useState(null);
+  const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    const stored = readSession(KEY_STORE, "");
-    if (stored) {
-      setApiKey(stored);
-      setKeySaved(true);
-    }
-    setRecentRuns(readSession(RUNS_STORE, []));
+    const stored = readStoredKey();
+    setApiKey(stored);
+    setKeyInput(stored);
+    setReady(true);
   }, []);
 
-  const refreshHealth = useCallback(async () => {
-    setHealth({ state: "loading" });
-    try {
-      const [h, i] = await Promise.all([callApi("/health"), callApi("/api/info")]);
-      // /health answers 503 with a diagnosis when the backend is degraded —
-      // that body is more useful than the status code, so keep it either way.
-      const body = h.data && typeof h.data === "object" ? h.data : null;
-      setHealth(
-        body && body.status
-          ? { state: h.ok ? "ok" : "degraded", data: body }
-          : { state: "err", status: h.status, data: body },
-      );
-      setInfo(i.data && typeof i.data === "object" ? i.data : null);
-    } catch (e) {
-      // Defensive: callApi already swallows failures, so this should be dead
-      // code. The homepage must never throw during render or effects.
-      setHealth({ state: "err", data: { error: String(e) } });
-    }
+  // Public endpoint: works with no key, so the shell always has something true
+  // to show even before the operator authenticates.
+  const health = useApi("/health", null);
+
+  const saveKey = useCallback(() => {
+    writeStoredKey(keyInput.trim());
+    setApiKey(keyInput.trim());
+  }, [keyInput]);
+
+  const forgetKey = useCallback(() => {
+    writeStoredKey("");
+    setApiKey("");
+    setKeyInput("");
   }, []);
 
-  useEffect(() => {
-    refreshHealth();
-  }, [refreshHealth]);
+  const openLead = useCallback((id) => setOpenLeadId(id), []);
 
-  function rememberRun(id) {
-    if (!id) return;
-    setRecentRuns((prev) => {
-      const next = [id, ...prev.filter((r) => r !== id)].slice(0, 8);
-      writeSession(RUNS_STORE, next);
-      return next;
+  const reprocess = useCallback((lead) => {
+    setPrefillLead({
+      email: lead.email,
+      first_name: lead.first_name,
+      last_name: lead.last_name,
+      company: lead.company,
+      title: lead.title,
+      linkedin_url: lead.linkedin_url,
     });
-  }
+    setOpenLeadId(null);
+    setTab("processing");
+  }, []);
 
-  async function submitLeads(event) {
-    event.preventDefault();
-    if (!apiKey) {
-      setProcessOut({ error: "Enter the internal API key first." });
-      return;
-    }
-    let leads;
-    try {
-      leads = JSON.parse(leadsJson);
-    } catch (e) {
-      setProcessOut({ error: `Leads JSON is not valid: ${e.message}` });
-      return;
-    }
-    if (!Array.isArray(leads) || leads.length === 0) {
-      setProcessOut({ error: "Leads must be a non-empty JSON array." });
-      return;
-    }
-
-    setProcessing(true);
-    setProcessOut(null);
-    const body = { leads, run_mode: runMode, source: "operator-console" };
-    if (workspace.trim()) body.workspace_slug = workspace.trim();
-    const res = await callApi("/api/v1/leads/process", { method: "POST", body, apiKey });
-    setProcessing(false);
-    setProcessOut(res);
-    if (res.ok && res.data && res.data.run_id) {
-      rememberRun(res.data.run_id);
-      setRunId(res.data.run_id);
-    }
-  }
-
-  async function checkRun(id) {
-    const target = (id || runId).trim();
-    if (!target) return;
-    if (!apiKey) {
-      setRunOut({ error: "Enter the internal API key first." });
-      return;
-    }
-    setRunId(target);
-    setRunOut({ loading: true });
-    const res = await callApi(`/api/v1/runs/${encodeURIComponent(target)}`, { apiKey });
-    setRunOut(res);
-    if (res.ok) rememberRun(target);
-  }
-
-  async function drain() {
-    if (!apiKey) {
-      setRunOut({ error: "Enter the internal API key first." });
-      return;
-    }
-    setRunOut({ loading: true });
-    setRunOut(await callApi("/api/v1/drain?batch=3", { method: "POST", apiKey }));
-  }
-
-  const healthDot =
-    health.state === "ok"
-      ? "ok"
-      : health.state === "loading" || health.state === "degraded"
-        ? "warn"
-        : "err";
-
-  const healthLabel =
-    health.state === "ok"
-      ? "API ok"
-      : health.state === "degraded"
-        ? "API degraded"
-        : health.state === "loading"
-          ? "checking API…"
-          : "API unavailable";
-
-  // /health, /api/info and a raw error body can each carry the diagnosis.
-  const hd = health.data || {};
-  const problem =
-    hd.backend_error ||
-    hd.database_error ||
-    (info && info.backend_error) ||
-    (health.state === "err" ? hd.error || `HTTP ${health.status || "?"}` : null);
+  const healthTone =
+    health.loading ? "warn" : health.data?.status === "ok" ? "ok" : "err";
 
   return (
     <>
@@ -225,265 +84,100 @@ export default function Home() {
         <meta name="robots" content="noindex" />
       </Head>
 
-      <main className="wrap">
-        <header className="top">
-          <h1>OSP GTM Enrichment</h1>
-          <span className="pill">
-            <span className={`dot ${healthDot}`} />
-            {healthLabel}
+      <div className="shell">
+        <header className="topbar">
+          <div className="brand">
+            <h1>OSP GTM Enrichment</h1>
+            <span className="marker">REAL STANDALONE VERCEL UI LOADED</span>
+          </div>
+          <span className={`pill ${healthTone}`}>
+            <span className={`dot ${healthTone}`} />
+            {health.loading
+              ? "checking API…"
+              : health.data?.status === "ok"
+                ? "API ok"
+                : health.data?.status === "degraded"
+                  ? "API degraded"
+                  : "API unavailable"}
           </span>
         </header>
-        <p className="sub">
-          Operator console. The enrichment pipeline runs behind the API on this
-          same origin — endpoints stay available under <code>/api</code>.
-        </p>
 
-        <div className="grid">
-          <section className="card span">
-            <h2>Access</h2>
+        <nav className="tabs">
+          {TABS.map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              className={tab === id ? "tab active" : "tab"}
+              onClick={() => setTab(id)}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
+
+        {ready && !apiKey && (
+          <section className="card span keygate">
+            <h2>Enter the internal API key</h2>
             <p className="hint">
-              <code>/api/v1/*</code> needs the internal API key. It is never
-              stored in this deployment — it stays in this browser tab
-              (sessionStorage) and is sent directly to the same-origin API.
+              Lead data requires <code>INTERNAL_API_KEY</code>. It is not stored
+              in this deployment — it stays in this browser tab and is sent
+              directly to the same-origin API. Health status works without it.
             </p>
             <div className="row">
-              <div>
-                <label htmlFor="key">INTERNAL_API_KEY</label>
+              <div className="grow">
                 <input
-                  id="key"
                   type="password"
-                  value={apiKey}
+                  value={keyInput}
                   placeholder="paste the internal API key"
                   autoComplete="off"
-                  onChange={(e) => {
-                    setApiKey(e.target.value);
-                    setKeySaved(false);
-                  }}
+                  onChange={(e) => setKeyInput(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && saveKey()}
                 />
               </div>
-              <div className="shrink">
-                <button
-                  type="button"
-                  onClick={() => {
-                    writeSession(KEY_STORE, apiKey);
-                    setKeySaved(true);
-                  }}
-                  disabled={!apiKey}
-                >
-                  {keySaved ? "Saved for this tab" : "Keep for this tab"}
-                </button>
-              </div>
-              <div className="shrink">
-                <button
-                  type="button"
-                  className="ghost"
-                  onClick={() => {
-                    setApiKey("");
-                    setKeySaved(false);
-                    writeSession(KEY_STORE, "");
-                  }}
-                >
-                  Forget key
-                </button>
-              </div>
+              <button type="button" onClick={saveKey} disabled={!keyInput.trim()}>
+                Unlock
+              </button>
             </div>
           </section>
+        )}
 
-          <section className="card">
-            <h2>Health</h2>
-            <p className="hint">
-              <code>GET /health</code> — public, no key required.
-            </p>
-            <dl className="kv">
-              <dt>Status</dt>
-              <dd>
-                {health.state === "loading"
-                  ? "checking…"
-                  : hd.status || (health.state === "err" ? "unavailable" : "—")}
-              </dd>
-              <dt>Service</dt>
-              <dd>{hd.service || "—"}</dd>
-              <dt>Pipeline code</dt>
-              <dd>
-                {hd.backend_importable === undefined
-                  ? "—"
-                  : hd.backend_importable
-                    ? "importable"
-                    : "import failed"}
-              </dd>
-              <dt>Database</dt>
-              <dd>
-                {hd.database_configured === undefined
-                  ? "—"
-                  : hd.database_configured
-                    ? "DATABASE_URL configured"
-                    : "not configured"}
-              </dd>
-            </dl>
-            {problem && (
-              <p className="hint err" style={{ marginTop: ".7rem" }}>
-                {problem}
-              </p>
-            )}
-            <div className="row" style={{ marginTop: ".9rem" }}>
-              <div className="shrink">
-                <button type="button" className="ghost" onClick={refreshHealth}>
-                  Refresh
-                </button>
-              </div>
-            </div>
-          </section>
+        <main>
+          {tab === "overview" && (
+            <Overview apiKey={apiKey} health={health} onOpenLead={openLead} />
+          )}
+          {tab === "leads" && <Leads apiKey={apiKey} onOpenLead={openLead} />}
+          {tab === "content" && <Content apiKey={apiKey} onOpenLead={openLead} />}
+          {tab === "processing" && (
+            <Processing
+              apiKey={apiKey}
+              prefillLead={prefillLead}
+              onPrefillConsumed={() => setPrefillLead(null)}
+            />
+          )}
+          {tab === "settings" && <Settings apiKey={apiKey} health={health} />}
+        </main>
 
-          <section className="card">
-            <h2>Runs &amp; status</h2>
-            <p className="hint">
-              <code>GET /api/v1/runs/{"{run_id}"}</code>. Async runs are drained
-              by <code>POST /api/v1/drain</code>.
-            </p>
-            <label htmlFor="runid">Run ID</label>
-            <div className="row">
-              <div>
-                <input
-                  id="runid"
-                  value={runId}
-                  placeholder="run_…"
-                  onChange={(e) => setRunId(e.target.value)}
-                />
-              </div>
-              <div className="shrink">
-                <button type="button" onClick={() => checkRun()}>
-                  Check
-                </button>
-              </div>
-              <div className="shrink">
-                <button type="button" className="ghost" onClick={drain}>
-                  Drain queued
-                </button>
-              </div>
-            </div>
-            {recentRuns.length > 0 && (
-              <>
-                <label>Recent (this tab)</label>
-                <ul className="plain">
-                  {recentRuns.map((r) => (
-                    <li key={r}>
-                      <button
-                        type="button"
-                        className="ghost"
-                        style={{ padding: ".1rem .3rem", border: 0 }}
-                        onClick={() => checkRun(r)}
-                      >
-                        <code>{r}</code>
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              </>
-            )}
-            {runOut && (
-              <pre className="out">
-                {runOut.loading
-                  ? "Loading…"
-                  : JSON.stringify(runOut.error || runOut, null, 2)}
-              </pre>
-            )}
-          </section>
+        {openLeadId !== null && (
+          <LeadDetail
+            leadId={openLeadId}
+            apiKey={apiKey}
+            onClose={() => setOpenLeadId(null)}
+            onAction={reprocess}
+          />
+        )}
 
-          <section className="card span">
-            <h2>Process leads</h2>
-            <p className="hint">
-              <code>POST /api/v1/leads/process</code>. Never pushes to Instantly
-              and never sends email. <code>sync</code> must finish inside the
-              function timeout — use <code>async</code> for anything larger than
-              a couple of leads.
-            </p>
-            <form onSubmit={submitLeads}>
-              <div className="row">
-                <div>
-                  <label htmlFor="ws">Workspace slug</label>
-                  <input
-                    id="ws"
-                    value={workspace}
-                    placeholder="e.g. osp"
-                    onChange={(e) => setWorkspace(e.target.value)}
-                  />
-                </div>
-                <div>
-                  <label htmlFor="mode">Run mode</label>
-                  <select
-                    id="mode"
-                    value={runMode}
-                    onChange={(e) => setRunMode(e.target.value)}
-                  >
-                    <option value="async">async (queue, then drain)</option>
-                    <option value="sync">sync (wait for results)</option>
-                  </select>
-                </div>
-              </div>
-              <label htmlFor="leads">Leads (JSON array)</label>
-              <textarea
-                id="leads"
-                value={leadsJson}
-                spellCheck={false}
-                onChange={(e) => setLeadsJson(e.target.value)}
-              />
-              <div className="row" style={{ marginTop: ".8rem" }}>
-                <div className="shrink">
-                  <button type="submit" disabled={processing}>
-                    {processing ? "Processing…" : "Process leads"}
-                  </button>
-                </div>
-              </div>
-            </form>
-            {processOut && (
-              <pre className="out">
-                {JSON.stringify(processOut.error || processOut, null, 2)}
-              </pre>
-            )}
-          </section>
-
-          <section className="card span">
-            <h2>Webhooks &amp; scheduled jobs</h2>
-            <p className="hint">
-              Machine-to-machine endpoints. They authenticate with their own
-              secret headers, set as environment variables on this deployment —
-              there is nothing to trigger from the browser.
-            </p>
-            <ul className="plain">
-              <li>
-                <span className="method">POST</span>
-                <code>/api/instantly/reply-webhook</code> — header{" "}
-                <code>X-Webhook-Secret</code>. Point the Instantly &ldquo;Lead
-                Replied&rdquo; automation here.
-              </li>
-              <li>
-                <span className="method">POST</span>
-                <code>/api/lead-source/run-scheduled</code> — header{" "}
-                <code>X-Job-Secret</code>. Evergreen lead-source import.
-              </li>
-              <li>
-                <span className="method">POST</span>
-                <code>/api/v1/drain</code> — bearer key or{" "}
-                <code>CRON_SECRET</code>. Drains queued async runs; wire it to a
-                Vercel Cron.
-              </li>
-              <li>
-                <span className="method">GET</span>
-                <code>/api/v1/leads/{"{id}"}/processed</code> — bearer key.
-                Processed payload for one lead.
-              </li>
-            </ul>
-          </section>
-        </div>
-
-        <p className="note">
-          This console covers the API surface only. The full operator UI (leads,
-          lead detail, prompts, settings) is the Streamlit app in{" "}
-          <code>app/</code>, which cannot run on Vercel — it needs a long-lived
-          stateful process, so it stays on Streamlit Cloud against the same{" "}
-          <code>DATABASE_URL</code>.
-        </p>
-      </main>
+        <footer className="foot">
+          <span className="muted">
+            API endpoints stay available under <code>/api</code> —{" "}
+            <code>/health</code> and <code>/api/info</code> are public.
+          </span>
+          {apiKey && (
+            <button type="button" className="linkish" onClick={forgetKey}>
+              Forget API key
+            </button>
+          )}
+        </footer>
+      </div>
     </>
   );
 }

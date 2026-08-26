@@ -99,15 +99,23 @@ def test_a_nextjs_homepage_exists():
 
 
 def test_homepage_does_not_use_server_side_rendering():
-    """`/` must be statically prerenderable: no SSR, no env vars, no DB."""
+    """`/` must be statically prerenderable: no SSR, no env vars, no DB.
+
+    Matches the *export* form, which is the only way Next.js picks these up —
+    a comment saying "no getServerSideProps" must not trip the check.
+    """
     source = next(
         p for p in (_PAGES / "index.jsx", _PAGES / "index.tsx") if p.is_file()
     ).read_text(encoding="utf-8")
-    for banned in ("getServerSideProps", "getInitialProps", "process.env"):
-        assert banned not in source, (
-            f"pages/index uses {banned}; the homepage must render without the "
-            "backend, a database or any environment variable."
+    for banned in ("getServerSideProps", "getInitialProps", "getStaticProps"):
+        assert not re.search(rf"export\s+(async\s+)?(function|const)\s+{banned}\b", source), (
+            f"pages/index exports {banned}; the homepage must render without "
+            "the backend, a database or any environment variable."
         )
+    assert "process.env" not in source, (
+        "pages/index reads process.env; the homepage must not depend on build- "
+        "or run-time configuration."
+    )
 
 
 def test_package_json_builds_nextjs():

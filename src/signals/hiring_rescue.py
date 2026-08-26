@@ -131,7 +131,7 @@ def run_hiring_rescue_sync(
     limit: int = 25,
     force: bool = False,
 ) -> RescueReport:
-    """Synchronous entry point for the Streamlit UI button."""
+    """Synchronous entry point for sync callers."""
     import asyncio
 
     coro = run_hiring_rescue(workspace_id, limit=limit, force=force)

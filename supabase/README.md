@@ -67,6 +67,10 @@ running deployment does not pick up new ones until it is redeployed.
 Do **not** put the Supabase anon or service-role key here. The app talks to
 Postgres directly over SQLAlchemy; it never uses the Supabase client SDKs.
 
+Leave optional variables **unset** rather than blank. A blank value used to
+crash `Settings()` at import; it now falls back to the default, but an empty
+variable is ambiguous to read later.
+
 ## 5. Test the connection
 
 Locally, against the same database:
@@ -185,8 +189,8 @@ creating:
 | `generated_contents.delivery_status` | `sent`, `error`, `in_progress`, `NULL` |
 | `prompt_configs.channel` | `email` (`NULL` for non-prompt actions) |
 
-### A second schema exists — you do not need it
+### There is only one schema
 
-`src/integrations/salesos/models.py` defines 7 more `salesos_*` tables. They are
-only created when `SALESOS_INTEGRATION_MODE=true`, which is off by default and
-out of scope for this deployment. `schema.sql` deliberately excludes them.
+The 16 tables above are the whole database. An earlier `salesos_*` contract
+layer was removed with the rest of the handoff architecture;
+`tests/test_architecture.py` fails if those tables reappear in `schema.sql`.

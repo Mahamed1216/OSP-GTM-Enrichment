@@ -20,6 +20,10 @@ from typing import NamedTuple
 
 TIMEOUT = 30
 
+# Temporary build marker rendered by pages/index.jsx. Confirms the deployment is
+# serving the current UI rather than an older build.
+MARKER = "REAL STANDALONE VERCEL UI LOADED"
+
 
 class Result(NamedTuple):
     path: str
@@ -71,6 +75,11 @@ def main() -> int:
             )
         elif "OSP GTM Enrichment" not in home.body:
             failures.append("/ is HTML but does not look like the operator console")
+        elif MARKER not in home.body:
+            failures.append(
+                f"/ is the console but is missing the {MARKER!r} marker — an "
+                "older build is still deployed."
+            )
 
     # 2. The API must answer with JSON.
     for path in ("/health", "/api/info"):
@@ -95,6 +104,16 @@ def main() -> int:
                     f"/health is {payload.get('status')!r}: "
                     f"{payload.get('backend_error') or payload.get('database_error')}"
                 )
+
+    # 3. An unknown path must be handled by Next.js, never by FastAPI.
+    stray = fetch(base, "/this-path-does-not-exist")
+    if stray is not None:
+        print(f"  {'/<random>':12} {stray.status}  {stray.content_type.split(';')[0]}")
+        if "application/json" in stray.content_type.lower():
+            failures.append(
+                "a random path returned JSON — the Python function is catching "
+                "routes that belong to Next.js"
+            )
 
     print()
     if failures:
