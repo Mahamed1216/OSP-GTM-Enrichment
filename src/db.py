@@ -26,7 +26,23 @@ def _engine_kwargs() -> dict:
     return {}
 
 
-engine = create_engine(settings.database_url, echo=False, future=True, **_engine_kwargs())
+def _normalized_url(raw: str) -> str:
+    """Accept the connection strings hosts actually hand out.
+
+    Supabase/Heroku-style ``postgres://`` is not a SQLAlchemy 2.0 dialect name —
+    it raises ``NoSuchModuleError: Can't load plugin: sqlalchemy.dialects:postgres``
+    at import time, which on a serverless host is an opaque crash rather than a
+    readable error. Rewrite it to the dialect SQLAlchemy expects.
+    """
+    url = (raw or "").strip()
+    if url.startswith("postgres://"):
+        return "postgresql://" + url[len("postgres://"):]
+    return url
+
+
+engine = create_engine(
+    _normalized_url(settings.database_url), echo=False, future=True, **_engine_kwargs()
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 # Process-level flag — True once init_db() has completed for this Python process.

@@ -29,7 +29,7 @@ local `uvicorn` process backs the dev server. Override the origin with
 
 | Route | Backed by | Auth |
 | --- | --- | --- |
-| `GET /health` | `src/api/server.py` | public |
+| `GET /health` | `api/index.py` | public |
 | `GET /api/info` | `api/index.py` | public (booleans only) |
 | `POST /api/v1/leads/process` | `src/api/server.py` | `Authorization: Bearer $INTERNAL_API_KEY` |
 | `GET /api/v1/runs/{run_id}` | `src/api/server.py` | bearer `$INTERNAL_API_KEY` |
@@ -41,6 +41,28 @@ local `uvicorn` process backs the dev server. Override the origin with
 `api/index.py` puts the repo root on `sys.path` and dispatches by path prefix to
 the two existing FastAPI apps, so their routes, middleware (webhook body-size +
 rate-limit guards) and auth are unchanged.
+
+### Nothing crashes out of the function
+
+A crash out of a Vercel function is an opaque `FUNCTION_INVOCATION_FAILED` page
+with no way to tell what went wrong from the outside. So `api/index.py` imports
+nothing heavier than the standard library at module scope, loads the backend
+lazily, and converts every failure into JSON that names the cause:
+
+| Situation | Response |
+| --- | --- |
+| Pipeline code missing from the bundle | `503 {"error": "ModuleNotFoundError: No module named 'src'", "hint": …}` |
+| `DATABASE_URL` unset on Vercel | `503 {"error": "DATABASE_URL not configured"}` |
+| Anything unhandled in a FastAPI app | `500 {"error": "<type>: <message>"}` |
+
+`GET /health` answers in every one of those cases — 200 when healthy, 503 with
+`backend_error` / `database_error` when not. It is the first thing to check on a
+misbehaving deployment.
+
+`vercel.json`'s `includeFiles` is what puts `src/`, `app/` and `data/` in the
+function bundle. Vercel traces imports statically and cannot see the runtime
+`sys.path` insert, so without it the function would deploy and then fail with
+`ModuleNotFoundError: No module named 'src'`.
 
 ## How the console authenticates
 
@@ -68,8 +90,8 @@ the key. If you want the console behind a login as well, use Vercel's
 
 Leave all four build overrides **off**. Vercel builds the Next.js app from
 `package.json` and, separately, builds `api/index.py` into a Python function
-using the root `requirements.txt`. `vercel.json` now only sets the function's
-`maxDuration`.
+using the root `requirements.txt`. `vercel.json` only configures that function —
+its `maxDuration` and `includeFiles`.
 
 ## Required environment variables
 
@@ -78,7 +100,7 @@ Preview). `.env` is never uploaded (`.vercelignore`).
 
 | Variable | Why |
 | --- | --- |
-| `DATABASE_URL` | **Required.** Postgres. The default `sqlite:///sdr.db` cannot work — the serverless filesystem is read-only. Use a pooled connection string (pgBouncer / Supabase pooler / Neon pooler). |
+| `DATABASE_URL` | **Required.** Postgres. The default `sqlite:///sdr.db` cannot work — the serverless filesystem is read-only. Use a pooled connection string (Supabase pooler on port 6543, pgBouncer, Neon pooler). Setting up a fresh database: [`supabase/README.md`](../supabase/README.md). |
 | `ANTHROPIC_API_KEY` | scoring + content generation |
 | `INTERNAL_API_KEY` | bearer auth for `/api/v1/*` |
 | `INSTANTLY_WEBHOOK_SECRET` | Instantly reply webhook |
@@ -91,8 +113,10 @@ Preview). `.env` is never uploaded (`.vercelignore`).
 Nothing here is exposed to the browser — no variable is prefixed
 `NEXT_PUBLIC_`, so none is inlined into the client bundle.
 
-The schema is **not** created by the function on every cold start. Initialize it
-once from anywhere with the same `DATABASE_URL`: `python scripts/init_db.py`.
+The schema is **not** created by the function on every cold start. Create it once
+by pasting [`supabase/schema.sql`](../supabase/schema.sql) into the Supabase SQL
+editor, or by running `python scripts/init_db.py` against the same
+`DATABASE_URL`.
 
 ## Serverless caveats
 

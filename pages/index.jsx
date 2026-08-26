@@ -45,21 +45,37 @@ function writeSession(key, value) {
   }
 }
 
+/**
+ * Never throws. A dead API, a 500 HTML error page, an offline browser — all
+ * come back as a result object so a card can render "Unavailable" instead of
+ * the failure escaping into React.
+ */
 async function callApi(path, { method = "GET", body, apiKey } = {}) {
   const headers = {};
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-  const res = await fetch(path, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const text = await res.text();
+  let res;
+  try {
+    res = await fetch(path, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  } catch (e) {
+    return { ok: false, status: 0, unreachable: true, data: { error: String(e) } };
+  }
+  let text = "";
+  try {
+    text = await res.text();
+  } catch {
+    /* body already consumed or connection dropped mid-read */
+  }
   let data;
   try {
     data = JSON.parse(text);
   } catch {
-    data = { raw: text.slice(0, 2000) };
+    // A Vercel 500 page or any other HTML response lands here.
+    data = { error: `Non-JSON response (HTTP ${res.status})`, raw: text.slice(0, 500) };
   }
   return { ok: res.ok, status: res.status, data };
 }
@@ -94,10 +110,19 @@ export default function Home() {
     setHealth({ state: "loading" });
     try {
       const [h, i] = await Promise.all([callApi("/health"), callApi("/api/info")]);
-      setHealth(h.ok ? { state: "ok", data: h.data } : { state: "err", status: h.status });
-      setInfo(i.ok ? i.data : null);
+      // /health answers 503 with a diagnosis when the backend is degraded —
+      // that body is more useful than the status code, so keep it either way.
+      const body = h.data && typeof h.data === "object" ? h.data : null;
+      setHealth(
+        body && body.status
+          ? { state: h.ok ? "ok" : "degraded", data: body }
+          : { state: "err", status: h.status, data: body },
+      );
+      setInfo(i.data && typeof i.data === "object" ? i.data : null);
     } catch (e) {
-      setHealth({ state: "err", message: String(e) });
+      // Defensive: callApi already swallows failures, so this should be dead
+      // code. The homepage must never throw during render or effects.
+      setHealth({ state: "err", data: { error: String(e) } });
     }
   }, []);
 
@@ -169,7 +194,28 @@ export default function Home() {
   }
 
   const healthDot =
-    health.state === "ok" ? "ok" : health.state === "loading" ? "warn" : "err";
+    health.state === "ok"
+      ? "ok"
+      : health.state === "loading" || health.state === "degraded"
+        ? "warn"
+        : "err";
+
+  const healthLabel =
+    health.state === "ok"
+      ? "API ok"
+      : health.state === "degraded"
+        ? "API degraded"
+        : health.state === "loading"
+          ? "checking API…"
+          : "API unavailable";
+
+  // /health, /api/info and a raw error body can each carry the diagnosis.
+  const hd = health.data || {};
+  const problem =
+    hd.backend_error ||
+    hd.database_error ||
+    (info && info.backend_error) ||
+    (health.state === "err" ? hd.error || `HTTP ${health.status || "?"}` : null);
 
   return (
     <>
@@ -184,11 +230,7 @@ export default function Home() {
           <h1>OSP GTM Enrichment</h1>
           <span className="pill">
             <span className={`dot ${healthDot}`} />
-            {health.state === "ok"
-              ? `API ${health.data ? health.data.status : "ok"}`
-              : health.state === "loading"
-                ? "checking API…"
-                : "API unreachable"}
+            {healthLabel}
           </span>
         </header>
         <p className="sub">
@@ -254,23 +296,33 @@ export default function Home() {
             </p>
             <dl className="kv">
               <dt>Status</dt>
-              <dd>{health.state === "ok" ? health.data.status : health.state}</dd>
+              <dd>
+                {health.state === "loading"
+                  ? "checking…"
+                  : hd.status || (health.state === "err" ? "unavailable" : "—")}
+              </dd>
               <dt>Service</dt>
-              <dd>{health.data ? health.data.service : "—"}</dd>
-              <dt>API version</dt>
-              <dd>{health.data ? health.data.version : "—"}</dd>
+              <dd>{hd.service || "—"}</dd>
+              <dt>Pipeline code</dt>
+              <dd>
+                {hd.backend_importable === undefined
+                  ? "—"
+                  : hd.backend_importable
+                    ? "importable"
+                    : "import failed"}
+              </dd>
               <dt>Database</dt>
               <dd>
-                {info === null
+                {hd.database_configured === undefined
                   ? "—"
-                  : info.database_configured
+                  : hd.database_configured
                     ? "DATABASE_URL configured"
                     : "not configured"}
               </dd>
             </dl>
-            {info !== null && !info.database_configured && (
+            {problem && (
               <p className="hint err" style={{ marginTop: ".7rem" }}>
-                DATABASE_URL is unset — every database-backed endpoint will fail.
+                {problem}
               </p>
             )}
             <div className="row" style={{ marginTop: ".9rem" }}>
