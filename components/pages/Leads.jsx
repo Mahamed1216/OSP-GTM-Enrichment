@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 
-import { useApi } from "../lib/api";
-import { AsyncState, Bool, Panel, Tier } from "./common";
+import { useApi } from "../../lib/api";
+import { AsyncState, Bool, Card, PageHead, Tier } from "../common";
 
 const PAGE = 25;
 
@@ -39,7 +39,9 @@ export default function Leads({ apiKey, onOpenLead }) {
   const total = data?.total ?? 0;
 
   return (
-    <Panel
+    <>
+      <PageHead title="Leads" note="Every lead in the workspace, with enrichment, score and delivery state." />
+      <Card
       title="Leads"
       hint={loading ? "Loading…" : `${total} lead${total === 1 ? "" : "s"} matching the current filters.`}
       actions={
@@ -47,7 +49,6 @@ export default function Leads({ apiKey, onOpenLead }) {
           Refresh
         </button>
       }
-      wide
     >
       <div className="filters">
         <div className="grow">
@@ -147,6 +148,7 @@ export default function Leads({ apiKey, onOpenLead }) {
           Next →
         </button>
       </div>
-    </Panel>
+    </Card>
+    </>
   );
 }

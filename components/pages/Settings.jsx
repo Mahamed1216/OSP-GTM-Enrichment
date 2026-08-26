@@ -1,5 +1,5 @@
-import { useApi } from "../lib/api";
-import { AsyncState, KV, Panel, Tier } from "./common";
+import { useApi } from "../../lib/api";
+import { AsyncState, Card, KV, PageHead, Tier } from "../common";
 
 const REQUIRED = ["DATABASE_URL", "INTERNAL_API_KEY"];
 
@@ -28,11 +28,11 @@ export default function Settings({ apiKey, health }) {
 
   return (
     <>
-      <Panel
+      <PageHead title="Settings" note="Configuration presence, scoring thresholds and machine endpoints. No secret value is ever sent to the browser." />
+      <Card
         title="Configuration"
         hint="Presence only — no value is ever sent to the browser."
         actions={<button type="button" className="ghost" onClick={reload}>Refresh</button>}
-        wide
       >
         <AsyncState loading={loading} error={error}>
           <div className="table-scroll">
@@ -64,10 +64,10 @@ export default function Settings({ apiKey, health }) {
           </div>
           <p className="hint">* required — the API cannot serve data without it.</p>
         </AsyncState>
-      </Panel>
+      </Card>
 
       <div className="grid">
-        <Panel title="Runtime" hint="Reported by the public health endpoint.">
+        <Card title="Runtime" hint="Reported by the public health endpoint.">
           <KV rows={[
             ["Service", health.data?.service],
             ["API status", health.data?.status],
@@ -75,9 +75,9 @@ export default function Settings({ apiKey, health }) {
             ["Pipeline code", health.data?.backend_importable ? "importable" : "import failed"],
             ["Error", health.data?.backend_error || health.data?.database_error || null],
           ]} />
-        </Panel>
+        </Card>
 
-        <Panel title="Scoring" hint="Thresholds the pipeline scores against.">
+        <Card title="Scoring" hint="Thresholds the pipeline scores against.">
           <AsyncState loading={loading} error={error}>
             <KV rows={[
               ["Email verifier", scoring.email_verifier],
@@ -88,17 +88,17 @@ export default function Settings({ apiKey, health }) {
               ["Content model", <span className="mono">{scoring.content_model}</span>],
             ]} />
           </AsyncState>
-        </Panel>
+        </Card>
       </div>
 
-      <Panel title="Machine endpoints" hint="Called by Instantly and schedulers, not from this console." wide>
+      <Card title="Machine endpoints" hint="Called by Instantly and schedulers, not from this console.">
         <ul className="plain">
           <li><span className="method">POST</span><code>/api/instantly/reply-webhook</code> — header <code>X-Webhook-Secret</code></li>
           <li><span className="method">POST</span><code>/api/lead-source/run-scheduled</code> — header <code>X-Job-Secret</code></li>
           <li><span className="method">POST</span><code>/api/v1/drain</code> — bearer key or <code>CRON_SECRET</code></li>
           <li><span className="method">GET</span><code>/health</code> — public</li>
         </ul>
-      </Panel>
+      </Card>
     </>
   );
 }

@@ -1,35 +1,33 @@
 import Head from "next/head";
 import { useCallback, useEffect, useState } from "react";
 
-import Content from "../components/Content";
 import LeadDetail from "../components/LeadDetail";
-import Leads from "../components/Leads";
-import Overview from "../components/Overview";
-import Processing from "../components/Processing";
-import Settings from "../components/Settings";
+import Sidebar from "../components/Sidebar";
+import ApolloAutopilot from "../components/pages/ApolloAutopilot";
+import BdrResearch from "../components/pages/BdrResearch";
+import ClientExpansion from "../components/pages/ClientExpansion";
+import Dashboard from "../components/pages/Dashboard";
+import Engagement from "../components/pages/Engagement";
+import Leads from "../components/pages/Leads";
+import Prompts from "../components/pages/Prompts";
+import RunPipeline from "../components/pages/RunPipeline";
+import Settings from "../components/pages/Settings";
+import SignalFeed from "../components/pages/SignalFeed";
 import { readStoredKey, useApi, writeStoredKey } from "../lib/api";
 
 /**
- * Operator console for the standalone GTM enrichment app.
+ * Cloudwork|PRO operator console.
  *
  * Statically prerendered: no getServerSideProps, no environment variables, no
  * database. Every panel fetches client-side and renders its own error state, so
- * the page loads even when the API is down.
+ * the shell loads even when the API is down.
  *
- * The INTERNAL_API_KEY is never in this bundle. The operator pastes it in and
+ * The INTERNAL_API_KEY is never in this bundle — the operator pastes it in and
  * it stays in sessionStorage for the tab.
  */
 
-const TABS = [
-  ["overview", "Overview"],
-  ["leads", "Leads"],
-  ["content", "Content"],
-  ["processing", "Processing"],
-  ["settings", "Settings"],
-];
-
 export default function Home() {
-  const [tab, setTab] = useState("overview");
+  const [page, setPage] = useState("dashboard");
   const [apiKey, setApiKey] = useState("");
   const [keyInput, setKeyInput] = useState("");
   const [openLeadId, setOpenLeadId] = useState(null);
@@ -43,8 +41,8 @@ export default function Home() {
     setReady(true);
   }, []);
 
-  // Public endpoint: works with no key, so the shell always has something true
-  // to show even before the operator authenticates.
+  // Public endpoint: works without a key, so the shell always has something
+  // true to show before the operator authenticates.
   const health = useApi("/health", null);
 
   const saveKey = useCallback(() => {
@@ -70,92 +68,94 @@ export default function Home() {
       linkedin_url: lead.linkedin_url,
     });
     setOpenLeadId(null);
-    setTab("processing");
+    setPage("pipeline");
   }, []);
 
   const healthTone =
     health.loading ? "warn" : health.data?.status === "ok" ? "ok" : "err";
+  const healthLabel =
+    health.loading ? "checking API…"
+      : health.data?.status === "ok" ? "API ok"
+        : health.data?.status === "degraded" ? "API degraded"
+          : "API unavailable";
+
+  const shared = { apiKey, onOpenLead: openLead };
 
   return (
     <>
       <Head>
-        <title>OSP GTM Enrichment — Operator Console</title>
+        <title>Cloudwork|PRO — Sales Enablement</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <meta name="robots" content="noindex" />
       </Head>
 
-      <div className="shell">
-        <header className="topbar">
-          <div className="brand">
-            <h1>OSP GTM Enrichment</h1>
-            <span className="marker">REAL STANDALONE VERCEL UI LOADED</span>
+      <div className="layout">
+        <Sidebar
+          current={page}
+          onNavigate={setPage}
+          apiKey={apiKey}
+          onForgetKey={forgetKey}
+        />
+
+        <div className="content">
+          <div className="topline">
+            <span className="marker">
+              <span className="dot" />
+              REAL STANDALONE VERCEL UI LOADED
+            </span>
+            <span className="pill">
+              <span className={`dot ${healthTone}`} />
+              {healthLabel}
+            </span>
           </div>
-          <span className={`pill ${healthTone}`}>
-            <span className={`dot ${healthTone}`} />
-            {health.loading
-              ? "checking API…"
-              : health.data?.status === "ok"
-                ? "API ok"
-                : health.data?.status === "degraded"
-                  ? "API degraded"
-                  : "API unavailable"}
-          </span>
-        </header>
 
-        <nav className="tabs">
-          {TABS.map(([id, label]) => (
-            <button
-              key={id}
-              type="button"
-              className={tab === id ? "tab active" : "tab"}
-              onClick={() => setTab(id)}
-            >
-              {label}
-            </button>
-          ))}
-        </nav>
-
-        {ready && !apiKey && (
-          <section className="card span keygate">
-            <h2>Enter the internal API key</h2>
-            <p className="hint">
-              Lead data requires <code>INTERNAL_API_KEY</code>. It is not stored
-              in this deployment — it stays in this browser tab and is sent
-              directly to the same-origin API. Health status works without it.
-            </p>
-            <div className="row">
-              <div className="grow">
-                <input
-                  type="password"
-                  value={keyInput}
-                  placeholder="paste the internal API key"
-                  autoComplete="off"
-                  onChange={(e) => setKeyInput(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && saveKey()}
-                />
+          {ready && !apiKey && (
+            <div className="card" style={{ marginBottom: "1.75rem" }}>
+              <h3>Enter the internal API key</h3>
+              <p className="hint">
+                Lead data requires <code>INTERNAL_API_KEY</code>. It is not stored
+                in this deployment — it stays in this browser tab and is sent
+                directly to the same-origin API. Health status works without it.
+              </p>
+              <div className="row">
+                <div className="grow">
+                  <input
+                    type="password"
+                    value={keyInput}
+                    placeholder="paste the internal API key"
+                    autoComplete="off"
+                    onChange={(e) => setKeyInput(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && saveKey()}
+                  />
+                </div>
+                <button type="button" onClick={saveKey} disabled={!keyInput.trim()}>
+                  Unlock
+                </button>
               </div>
-              <button type="button" onClick={saveKey} disabled={!keyInput.trim()}>
-                Unlock
-              </button>
             </div>
-          </section>
-        )}
+          )}
 
-        <main>
-          {tab === "overview" && (
-            <Overview apiKey={apiKey} health={health} onOpenLead={openLead} />
-          )}
-          {tab === "leads" && <Leads apiKey={apiKey} onOpenLead={openLead} />}
-          {tab === "content" && <Content apiKey={apiKey} onOpenLead={openLead} />}
-          {tab === "processing" && (
-            <Processing
-              apiKey={apiKey}
-              prefillLead={prefillLead}
-              onPrefillConsumed={() => setPrefillLead(null)}
-            />
-          )}
-          {tab === "settings" && <Settings apiKey={apiKey} health={health} />}
-        </main>
+          <main>
+            {page === "dashboard" && (
+              <Dashboard {...shared} health={health} onNavigate={setPage} />
+            )}
+            {page === "signals" && <SignalFeed {...shared} />}
+            {page === "expansion" && <ClientExpansion {...shared} />}
+            {page === "leads" && <Leads {...shared} />}
+            {page === "pipeline" && (
+              <RunPipeline
+                apiKey={apiKey}
+                prefillLead={prefillLead}
+                onPrefillConsumed={() => setPrefillLead(null)}
+              />
+            )}
+            {page === "apollo" && <ApolloAutopilot />}
+            {page === "settings" && <Settings apiKey={apiKey} health={health} />}
+            {page === "engagement" && <Engagement {...shared} />}
+            {page === "prompts" && <Prompts apiKey={apiKey} />}
+            {page === "research" && <BdrResearch {...shared} />}
+          </main>
+        </div>
 
         {openLeadId !== null && (
           <LeadDetail
@@ -165,18 +165,6 @@ export default function Home() {
             onAction={reprocess}
           />
         )}
-
-        <footer className="foot">
-          <span className="muted">
-            API endpoints stay available under <code>/api</code> —{" "}
-            <code>/health</code> and <code>/api/info</code> are public.
-          </span>
-          {apiKey && (
-            <button type="button" className="linkish" onClick={forgetKey}>
-              Forget API key
-            </button>
-          )}
-        </footer>
       </div>
     </>
   );

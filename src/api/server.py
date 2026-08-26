@@ -258,6 +258,10 @@ def _iso(value) -> str | None:
 # introducing a second set of SQL. None of them return a secret value.
 # ---------------------------------------------------------------------------
 
+def _full_name(lead) -> str:
+    return f"{lead.first_name or ''} {lead.last_name or ''}".strip()
+
+
 def _default_ws(workspace_id: int | None, workspace_slug: str | None) -> int | None:
     """Resolve the workspace to read, falling back to the default one."""
     if workspace_id is not None:
@@ -406,7 +410,7 @@ async def list_generated_content(
             {
                 "id": content.id,
                 "lead_id": content.lead_id,
-                "lead_name": f"{lead.first_name or ''} {lead.last_name or ''}".strip(),
+                "lead_name": _full_name(lead),
                 "company": lead.company,
                 "kind": content.kind,
                 "subject": content.subject,
@@ -461,3 +465,266 @@ async def settings_status() -> dict:
             "content_model": settings.content_model,
         },
     }
+
+
+@app.get(
+    "/api/v1/signals",
+    summary="Buying-intent signals discovered for leads",
+    dependencies=[Depends(require_api_key)],
+)
+async def list_signals(
+    workspace_id: int | None = None,
+    workspace_slug: str | None = None,
+    limit: int = 50,
+) -> dict:
+    from sqlalchemy import select as _select
+
+    from src.db import session_scope
+    from src.models import Lead, LeadSignal
+
+    ws = _default_ws(workspace_id, workspace_slug)
+    limit = max(1, min(200, limit))
+    with session_scope() as session:
+        query = (
+            _select(LeadSignal, Lead)
+            .join(Lead, Lead.id == LeadSignal.lead_id)
+            .order_by(LeadSignal.id.desc())
+            .limit(limit)
+        )
+        if ws is not None:
+            query = query.where(LeadSignal.workspace_id == ws)
+        signals = [
+            {
+                "id": signal.id,
+                "lead_id": signal.lead_id,
+                "lead_name": _full_name(lead),
+                "company": lead.company,
+                "signal_type": signal.signal_type,
+                "found": bool(signal.signal_found),
+                "strength": signal.signal_strength,
+                "summary": signal.summary,
+                "why_it_matters": signal.why_it_matters,
+                "roles": list(signal.relevant_roles or []),
+                "recency": signal.recency_estimate,
+                "uplift": signal.tier_uplift_recommendation,
+                "applied_uplift": bool(signal.applied_uplift),
+                "base_tier": signal.base_tier,
+                "status": signal.status,
+                "error": signal.error,
+                "source_urls": list(signal.source_urls or [])[:5],
+                "updated_at": _iso(signal.updated_at),
+            }
+            for signal, lead in session.execute(query).all()
+        ]
+    return {"signals": signals, "total": len(signals)}
+
+
+@app.get(
+    "/api/v1/engagement",
+    summary="Delivery and reply activity",
+    dependencies=[Depends(require_api_key)],
+)
+async def engagement_overview(
+    workspace_id: int | None = None,
+    workspace_slug: str | None = None,
+    limit: int = 25,
+) -> dict:
+    from sqlalchemy import select as _select
+
+    from src.db import session_scope
+    from src.lib.db_queries import kpi_counts, latest_instantly_snapshot
+    from src.models import Engagement, GeneratedContent, Lead, ReplyThread
+
+    ws = _default_ws(workspace_id, workspace_slug)
+    limit = max(1, min(100, limit))
+    with session_scope() as session:
+        events_q = (
+            _select(Engagement, GeneratedContent, Lead)
+            .join(GeneratedContent, GeneratedContent.id == Engagement.content_id)
+            .join(Lead, Lead.id == GeneratedContent.lead_id)
+            .order_by(Engagement.id.desc())
+            .limit(limit)
+        )
+        if ws is not None:
+            events_q = events_q.where(Engagement.workspace_id == ws)
+        events = [
+            {
+                "lead_id": lead.id,
+                "lead_name": _full_name(lead),
+                "company": lead.company,
+                "subject": content.subject,
+                "sent": bool(row.sent),
+                "opened": bool(row.opened),
+                "clicked": bool(row.clicked),
+                "replied": bool(row.replied),
+                "bounced": bool(row.bounced),
+                "reply_sentiment": row.reply_sentiment,
+                "synced_at": _iso(row.synced_at),
+            }
+            for row, content, lead in session.execute(events_q).all()
+        ]
+
+        replies_q = _select(ReplyThread).order_by(ReplyThread.id.desc()).limit(limit)
+        if ws is not None:
+            replies_q = replies_q.where(ReplyThread.workspace_id == ws)
+        replies = [
+            {
+                "id": thread.id,
+                "lead_id": thread.lead_id,
+                "prospect_name": thread.prospect_name,
+                "company": thread.company_name,
+                "classification": thread.classification,
+                "recommended_action": thread.recommended_action,
+                "status": thread.status,
+                "reply_text": (thread.inbound_reply_text or "")[:600],
+                "received_at": _iso(thread.reply_received_at),
+            }
+            for thread in session.execute(replies_q).scalars().all()
+        ]
+
+    return {
+        "counts": kpi_counts(ws),
+        "campaign": latest_instantly_snapshot(ws),
+        "events": events,
+        "replies": replies,
+    }
+
+
+@app.get(
+    "/api/v1/prompts",
+    summary="Prompt overrides, recommendations and winning examples",
+    dependencies=[Depends(require_api_key)],
+)
+async def prompts_overview(
+    workspace_id: int | None = None,
+    workspace_slug: str | None = None,
+) -> dict:
+    from sqlalchemy import select as _select
+
+    from src.db import session_scope
+    from src.models import PromptConfig, PromptRecommendation, WinningExample
+
+    ws = _default_ws(workspace_id, workspace_slug)
+    with session_scope() as session:
+        def scoped(query, model):
+            return query if ws is None else query.where(model.workspace_id == ws)
+
+        configs = [
+            {
+                "id": row.id,
+                "channel": row.channel,
+                "is_active": bool(row.is_active),
+                "prompt_version": row.prompt_version,
+                "updated_by": row.updated_by,
+                "updated_at": _iso(row.updated_at),
+                "preview": (row.content or "")[:400],
+                "length": len(row.content or ""),
+            }
+            for row in session.execute(
+                scoped(_select(PromptConfig).order_by(PromptConfig.channel), PromptConfig)
+            ).scalars().all()
+        ]
+
+        recommendations = [
+            {
+                "id": row.id,
+                "channel": row.channel,
+                "bottleneck": row.bottleneck,
+                "diagnosis": row.diagnosis,
+                "recommended_change": row.recommended_change,
+                "expected_impact": row.expected_impact,
+                "risk_level": row.risk_level,
+                "status": row.status,
+                "loop_status": row.loop_status,
+                "confidence": row.confidence,
+                "low_confidence": bool(row.low_confidence),
+                "sample_size": row.sample_size,
+                "created_at": _iso(row.created_at),
+            }
+            for row in session.execute(
+                scoped(
+                    _select(PromptRecommendation)
+                    .order_by(PromptRecommendation.id.desc())
+                    .limit(20),
+                    PromptRecommendation,
+                )
+            ).scalars().all()
+        ]
+
+        winners = [
+            {
+                "id": row.id,
+                "content_type": row.content_type,
+                "subject": row.subject,
+                "body": (row.body or "")[:400],
+                "reply_rate": row.reply_rate,
+                "manually_flagged": bool(row.manually_flagged),
+                "promoted_at": _iso(row.promoted_at),
+            }
+            for row in session.execute(
+                scoped(
+                    _select(WinningExample).order_by(WinningExample.id.desc()).limit(20),
+                    WinningExample,
+                )
+            ).scalars().all()
+        ]
+
+    return {"configs": configs, "recommendations": recommendations, "winners": winners}
+
+
+@app.get(
+    "/api/v1/research",
+    summary="Enrichment and research outputs per lead",
+    dependencies=[Depends(require_api_key)],
+)
+async def research_overview(
+    workspace_id: int | None = None,
+    workspace_slug: str | None = None,
+    limit: int = 25,
+) -> dict:
+    from sqlalchemy import select as _select
+
+    from src.db import session_scope
+    from src.models import Enrichment, Lead
+
+    ws = _default_ws(workspace_id, workspace_slug)
+    limit = max(1, min(100, limit))
+    with session_scope() as session:
+        query = (
+            _select(Enrichment, Lead)
+            .join(Lead, Lead.id == Enrichment.lead_id)
+            .order_by(Enrichment.id.desc())
+            .limit(limit)
+        )
+        if ws is not None:
+            query = query.where(Enrichment.workspace_id == ws)
+        items = []
+        for enrichment, lead in session.execute(query).all():
+            news = enrichment.company_news if isinstance(enrichment.company_news, dict) else {}
+            buyers = enrichment.buyer_accounts if isinstance(enrichment.buyer_accounts, dict) else {}
+            raw_news = news.get("results") or news.get("items") or []
+            raw_segments = buyers.get("segments") or []
+            items.append({
+                "lead_id": lead.id,
+                "lead_name": _full_name(lead),
+                "company": lead.company,
+                "company_domain": lead.company_domain,
+                "enriched_at": _iso(enrichment.enriched_at),
+                "has_profile": bool(enrichment.linkedin_profile),
+                "has_company": bool(enrichment.company_details),
+                "has_company_news": bool(news),
+                "has_industry_news": bool(enrichment.industry_news),
+                "has_buyer_research": bool(buyers),
+                "source_status": enrichment.source_status or {},
+                "news_headlines": [
+                    item.get("title")
+                    for item in raw_news[:3]
+                    if isinstance(item, dict) and item.get("title")
+                ],
+                "buyer_segments": [
+                    seg.get("name") or seg.get("segment")
+                    for seg in raw_segments[:4]
+                    if isinstance(seg, dict)
+                ],
+            })
+    return {"research": items, "total": len(items)}

@@ -67,6 +67,10 @@ CONSOLE_ROUTES = [
     "/api/v1/runs",
     "/api/v1/generated-content",
     "/api/v1/settings/status",
+    "/api/v1/signals",
+    "/api/v1/engagement",
+    "/api/v1/prompts",
+    "/api/v1/research",
 ]
 
 
@@ -195,3 +199,71 @@ def test_settings_status_exposes_scoring_config(client):
     assert body["scoring"]["email_verifier"] in {
         "instantly", "neverbounce", "millionverifier",
     }
+
+
+# ---------------------------------------------------------------------------
+# Console pages: signals, engagement, prompts, research
+#
+# Each must return its documented shape on an empty database rather than
+# erroring, because the UI renders an empty state from exactly these keys.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ("path", "keys"),
+    [
+        ("/api/v1/signals", ("signals", "total")),
+        ("/api/v1/engagement", ("counts", "events", "replies")),
+        ("/api/v1/prompts", ("configs", "recommendations", "winners")),
+        ("/api/v1/research", ("research", "total")),
+    ],
+)
+def test_console_pages_return_their_shape_when_empty(client, seeded, path, keys):
+    response = client.get(path, headers=AUTH)
+    assert response.status_code == 200
+    body = response.json()
+    for key in keys:
+        assert key in body, f"{path} is missing {key!r}"
+
+
+def test_signals_feed_returns_a_captured_signal(client, seeded):
+    from src.models import LeadSignal
+
+    with session_scope() as session:
+        session.add(LeadSignal(
+            lead_id=seeded["alice"], workspace_id=seeded["ws"],
+            signal_type="hiring", signal_found=True, signal_strength="high",
+            summary="Hiring 3 ops roles", why_it_matters="Scaling the team",
+            status="completed",
+        ))
+
+    body = client.get("/api/v1/signals", headers=AUTH).json()
+    assert body["total"] == 1
+    signal = body["signals"][0]
+    assert signal["lead_name"] == "Alice Adams"
+    assert signal["strength"] == "high"
+    assert signal["found"] is True
+
+
+def test_research_reports_enrichment_coverage(client, seeded):
+    from src.models import Enrichment
+
+    with session_scope() as session:
+        session.add(Enrichment(
+            lead_id=seeded["alice"], workspace_id=seeded["ws"],
+            linkedin_profile={"headline": "VP Marketing"},
+            company_details={"name": "Acme"},
+        ))
+
+    body = client.get("/api/v1/research", headers=AUTH).json()
+    assert body["total"] == 1
+    item = body["research"][0]
+    assert item["has_profile"] is True
+    assert item["has_company"] is True
+    assert item["has_buyer_research"] is False
+
+
+def test_engagement_counts_come_from_the_pipeline(client, seeded):
+    body = client.get("/api/v1/engagement", headers=AUTH).json()
+    assert body["counts"]["leads_total"] == 2
+    assert body["events"] == []
+    assert body["replies"] == []

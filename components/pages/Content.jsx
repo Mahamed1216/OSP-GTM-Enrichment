@@ -1,7 +1,7 @@
 import { useState } from "react";
 
-import { formatDate, useApi } from "../lib/api";
-import { AsyncState, Panel, RunStatus } from "./common";
+import { formatDate, useApi } from "../../lib/api";
+import { AsyncState, Card, PageHead, RunStatus } from "../common";
 
 const KINDS = [
   ["email", "Email"],
@@ -9,7 +9,7 @@ const KINDS = [
   ["linkedin_msg", "LinkedIn DM"],
 ];
 
-export default function Content({ apiKey, onOpenLead }) {
+export default function Content({ apiKey, onOpenLead, embedded = false }) {
   const [kind, setKind] = useState("email");
   const { data, loading, error, reload } = useApi(
     `/api/v1/generated-content?kind=${kind}&limit=50`,
@@ -19,11 +19,14 @@ export default function Content({ apiKey, onOpenLead }) {
   const items = data?.content || [];
 
   return (
-    <Panel
+    <>
+      {!embedded && (
+        <PageHead title="Generated content" note="Outbound copy produced by the pipeline." />
+      )}
+      <Card
       title="Generated content"
       hint="Outbound copy produced by the pipeline. Nothing here has been sent unless it shows a delivery status."
       actions={<button type="button" className="ghost" onClick={reload}>Refresh</button>}
-      wide
     >
       <div className="filters">
         <div>
@@ -79,6 +82,7 @@ export default function Content({ apiKey, onOpenLead }) {
           ))}
         </div>
       </AsyncState>
-    </Panel>
+    </Card>
+    </>
   );
 }

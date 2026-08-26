@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 
-import { callApi, formatDate, useApi } from "../lib/api";
-import { AsyncState, Panel, RunStatus } from "./common";
+import { callApi, formatDate, useApi } from "../../lib/api";
+import { AsyncState, Card, PageHead, RunStatus } from "../common";
 
 const SAMPLE = `[
   {
@@ -77,10 +77,10 @@ export default function Processing({ apiKey, prefillLead, onPrefillConsumed }) {
 
   return (
     <>
-      <Panel
+      <PageHead title="Run Pipeline" note="Submit leads for processing, drain the queue, and inspect run history." />
+      <Card
         title="Process leads"
         hint="Runs enrichment, scoring and content generation. Never pushes to Instantly and never sends email."
-        wide
       >
         <form onSubmit={submit}>
           <div className="filters">
@@ -121,13 +121,12 @@ export default function Processing({ apiKey, prefillLead, onPrefillConsumed }) {
         {result && (
           <pre className="out">{JSON.stringify(result, null, 2)}</pre>
         )}
-      </Panel>
+      </Card>
 
-      <Panel
+      <Card
         title="Run status"
         hint="Async runs stay queued until drained. Drain processes up to 3 at a time."
         actions={<button type="button" className="ghost" onClick={drain}>Drain queued</button>}
-        wide
       >
         <div className="filters">
           <div className="grow">
@@ -183,7 +182,7 @@ export default function Processing({ apiKey, prefillLead, onPrefillConsumed }) {
             </table>
           </div>
         </AsyncState>
-      </Panel>
+      </Card>
     </>
   );
 }

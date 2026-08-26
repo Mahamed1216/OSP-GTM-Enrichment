@@ -17,6 +17,10 @@ _VERCEL_JSON = _ROOT / "vercel.json"
 _NEXT_CONFIG = _ROOT / "next.config.js"
 _PAGES = _ROOT / "pages"
 
+# Build marker rendered in the console header — also asserted by
+# scripts/check_deployment.py against a live deployment.
+MARKER = "REAL STANDALONE VERCEL UI LOADED"
+
 # Sources that would swallow "/" and hand it to the API.
 _CATCH_ALL_SOURCES = {"/(.*)", "/:path*", "/(.*)/", "/", "/:path*/", "/(.+)?"}
 
@@ -95,7 +99,9 @@ def test_a_nextjs_homepage_exists():
         "no pages/index.* found. Without a homepage route Next.js serves "
         "nothing at / and requests fall through to the API."
     )
-    assert "OSP GTM Enrichment" in found[0].read_text(encoding="utf-8")
+    source = found[0].read_text(encoding="utf-8")
+    assert "Cloudwork" in source, "the homepage must render the Cloudwork|PRO console"
+    assert MARKER in source, "the build marker must stay in the header while testing"
 
 
 def test_homepage_does_not_use_server_side_rendering():
@@ -124,3 +130,40 @@ def test_package_json_builds_nextjs():
     assert package["scripts"]["start"] == "next start"
     for dependency in ("next", "react", "react-dom"):
         assert dependency in package["dependencies"], f"{dependency} missing"
+
+
+# ---------------------------------------------------------------------------
+# Console shell
+# ---------------------------------------------------------------------------
+
+_SIDEBAR = _ROOT / "components" / "Sidebar.jsx"
+
+_NAV_LABELS = [
+    "Dashboard", "Signal Feed", "Client Expansion", "Leads", "Run Pipeline",
+    "Apollo Autopilot", "Settings", "Engagement", "Prompts", "BDR Research",
+]
+
+
+@pytest.mark.parametrize("label", _NAV_LABELS)
+def test_sidebar_lists_every_nav_item(label):
+    assert label in _SIDEBAR.read_text(encoding="utf-8"), (
+        f"{label!r} is missing from the sidebar navigation"
+    )
+
+
+def test_sidebar_carries_the_brand():
+    source = _SIDEBAR.read_text(encoding="utf-8")
+    assert "Cloudwork" in source
+    assert "Sales Enablement" in source
+
+
+def test_every_nav_id_has_a_page_in_the_shell():
+    """A nav item that routes nowhere would render a blank main area."""
+    sidebar = _SIDEBAR.read_text(encoding="utf-8")
+    shell = (_PAGES / "index.jsx").read_text(encoding="utf-8")
+    ids = re.findall(r'\["([a-z]+)", "', sidebar)
+    assert len(ids) == len(_NAV_LABELS), f"expected {len(_NAV_LABELS)} nav ids, got {ids}"
+    for nav_id in ids:
+        assert f'page === "{nav_id}"' in shell, (
+            f"sidebar item {nav_id!r} has no matching page in pages/index.jsx"
+        )

@@ -73,7 +73,7 @@ def main() -> int:
                 "be OFF (not set to an empty value, and Output Directory must not be "
                 "'public')."
             )
-        elif "OSP GTM Enrichment" not in home.body:
+        elif "Cloudwork" not in home.body:
             failures.append("/ is HTML but does not look like the operator console")
         elif MARKER not in home.body:
             failures.append(
