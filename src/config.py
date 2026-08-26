@@ -7,7 +7,21 @@ Tier = Literal["A", "B", "C", "D"]
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
+    # env_ignore_empty: an env var set to "" is treated as unset, so the field
+    # default applies. Hosting dashboards (Vercel among them) save an
+    # optional-but-blank variable as an empty string rather than omitting it,
+    # and every non-str field then fails validation — `TIER_A_MIN=""` is not a
+    # valid int, `SEND_MIN_TIER=""` is not a valid tier. Because Settings() is
+    # instantiated at import time, that took down the whole backend.
+    #
+    # This is deliberately global rather than per-field: it protects the bool
+    # and Path fields too, and any field added later.
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",
+        case_sensitive=False,
+        env_ignore_empty=True,
+    )
 
     # Anthropic
     anthropic_api_key: str = ""
