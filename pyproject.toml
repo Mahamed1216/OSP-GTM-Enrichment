@@ -1,9 +1,20 @@
-[project]
-name = "sdr-enablement"
-version = "0.1.0"
-description = "Outbound SDR enablement pipeline: enrich -> score -> generate -> deliver -> learn"
-requires-python = ">=3.11"
-readme = "README.md"
+# Tooling config only — deliberately NOT a PEP 621 [project] definition.
+#
+# This repo is a set of applications run from source (Streamlit UI, FastAPI
+# services, CLI scripts); nothing ever pip-installs it as a package. It used to
+# carry a [project] table with name/version/requires-python and no
+# `dependencies` key, which is a trap for any installer that prefers PEP 621
+# metadata over requirements.txt: it reads the table, finds no dependencies, and
+# installs nothing. That is the exact shape of the Vercel failure where the
+# Python function deployed and ran but had no third-party packages at all.
+#
+# Dependencies live in:
+#   requirements.txt        runtime + tests (local dev, CI, Docker)
+#   requirements-ui.txt     Streamlit UI only
+#   api/requirements.txt    the Vercel serverless function
+#
+# Do not reintroduce [project] without also declaring `dependencies` and a
+# [build-system].
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
