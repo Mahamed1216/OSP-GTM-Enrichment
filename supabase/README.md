@@ -120,6 +120,7 @@ Other failures `/health` will name for you:
 | `backend_error` contains | Meaning |
 | --- | --- |
 | `ModuleNotFoundError: No module named 'src'` | the function bundle is missing the pipeline code — check `includeFiles` in `vercel.json` |
+| `ModuleNotFoundError: No module named 'fastapi'` | Vercel installed no Python packages — `api/requirements.txt` must exist next to the entrypoint |
 | `Can't load plugin: sqlalchemy.dialects:postgres` | a `postgres://` URL reached an older code path; make sure this commit is deployed |
 | `password authentication failed` | wrong password, or special characters not URL-encoded |
 | `Connection refused` / timeout | using the direct `5432` URI instead of the pooler |

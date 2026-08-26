@@ -17,7 +17,7 @@ API paths to the Python function:
 
 | Path | Served by |
 | --- | --- |
-| `/` and any other UI route | Next.js (`pages/index.jsx`) |
+| `/` and any other UI route | Next.js (`pages/index.jsx`) — the function never answers `/` |
 | `/health` | `api/index.py` |
 | `/api/*` | `api/index.py` |
 
@@ -59,10 +59,22 @@ lazily, and converts every failure into JSON that names the cause:
 `backend_error` / `database_error` when not. It is the first thing to check on a
 misbehaving deployment.
 
-`vercel.json`'s `includeFiles` is what puts `src/`, `app/` and `data/` in the
-function bundle. Vercel traces imports statically and cannot see the runtime
-`sys.path` insert, so without it the function would deploy and then fail with
-`ModuleNotFoundError: No module named 'src'`.
+### The function's two bundle requirements
+
+Both of these have already broken this deployment once each, and both fail the
+same way: the build succeeds, then the function dies on its first import.
+
+1. **`vercel.json`'s `includeFiles`** puts `src/`, `app/` and `data/` in the
+   bundle. Vercel traces imports statically and cannot see the runtime
+   `sys.path` insert, so without it: `ModuleNotFoundError: No module named 'src'`.
+2. **`api/requirements.txt`** — dependencies must sit *next to the entrypoint*.
+   With Next.js as the framework preset, the root `requirements.txt` is not
+   picked up for this function, and it deploys with no third-party packages at
+   all: `ModuleNotFoundError: No module named 'fastapi'`.
+
+The root `requirements.txt` remains the input for local dev, CI and tests.
+`tests/test_vercel_requirements.py` walks the function's real import graph and
+fails if the two files drift or if the backend grows an undeclared import.
 
 ## How the console authenticates
 
@@ -90,8 +102,8 @@ the key. If you want the console behind a login as well, use Vercel's
 
 Leave all four build overrides **off**. Vercel builds the Next.js app from
 `package.json` and, separately, builds `api/index.py` into a Python function
-using the root `requirements.txt`. `vercel.json` only configures that function —
-its `maxDuration` and `includeFiles`.
+using **`api/requirements.txt`** — not the root one. `vercel.json` only
+configures that function: its `maxDuration` and `includeFiles`.
 
 ## Required environment variables
 

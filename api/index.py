@@ -3,6 +3,7 @@
 Serves ``/health`` and ``/api/*``. The UI at ``/`` is Next.js and never reaches
 this file — see next.config.js.
 
+    /                   -> NOT handled here; the Next.js UI owns the homepage
     /health             -> answered here; reports backend + database status
     /api/info           -> answered here; booleans only, never a secret
     /api/instantly/*    -> src.webhook.server:app  (Instantly reply webhook)
@@ -42,7 +43,10 @@ if str(_ROOT) not in sys.path:
 
 SERVICE = "osp-gtm-enrichment"
 
-_INFO_PATHS = ("/", "/api/info")
+# "/" is NOT listed: the operator UI owns the homepage. If a request for "/"
+# ever reaches this function, the Next.js deployment is broken and a 404 here is
+# the honest signal — answering JSON at "/" would hide it.
+_INFO_PATHS = ("/api/info",)
 _HEALTH_PATH = "/health"
 _DRAIN_PATH = "/api/v1/drain"
 _WEBHOOK_PREFIXES = ("/api/instantly", "/api/lead-source")
