@@ -239,6 +239,23 @@ bake them into the image or commit `.env`.
 
 ---
 
+## Vercel deployment (API + webhook only)
+
+`vercel.json` + `api/index.py` deploy the FastAPI surface — the internal API,
+the Instantly reply webhook and the lead-source scheduler endpoint — as a single
+Python serverless function. The Streamlit operator UI is **not** deployable on
+Vercel (it needs a long-lived stateful process); keep it on Streamlit Cloud
+against the same `DATABASE_URL`.
+
+Settings, env vars and the serverless caveats (60s cap, draining async runs) are
+in [`docs/vercel_deployment.md`](docs/vercel_deployment.md).
+
+```bash
+uvicorn api.index:app --port 8000   # same entrypoint Vercel runs
+```
+
+---
+
 ## AWS ECS/ECR Deployment (GitHub Actions)
 
 CI/CD is wired up in

@@ -1,0 +1,35 @@
+# Keeps the serverless bundle small and keeps everything that is not part of
+# the API out of the deployment. NOTE: the function imports src/ and
+# app/lib/config.py, so neither may be ignored here.
+.env
+.env.local
+.git
+.github/
+.claude/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# Not used by the serverless function
+tests/
+docs/
+scripts/
+aws/
+memory/
+logs/
+app/pages/
+app/PHASE*.md
+*.db
+*.sqlite
+*.sqlite3
+.streamlit/
+Dockerfile
+.dockerignore
+docker-compose.yml
+requirements-ui.txt
+run_webhook.py
+README.md

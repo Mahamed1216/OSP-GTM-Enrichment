@@ -1,8 +1,10 @@
+import os
 from contextlib import contextmanager
 from typing import Iterator
 
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from src.config import settings
 
@@ -11,7 +13,20 @@ class Base(DeclarativeBase):
     pass
 
 
-engine = create_engine(settings.database_url, echo=False, future=True)
+def _engine_kwargs() -> dict:
+    """Serverless-safe engine options.
+
+    On Vercel every request can land on a fresh, short-lived instance, so a
+    per-instance connection pool just leaks Postgres connections. Use NullPool
+    (connect/close per checkout) plus pre-ping there. Long-lived processes
+    (Streamlit, the CLI, the worker) keep SQLAlchemy's default pool.
+    """
+    if os.environ.get("VERCEL"):
+        return {"poolclass": NullPool, "pool_pre_ping": True}
+    return {}
+
+
+engine = create_engine(settings.database_url, echo=False, future=True, **_engine_kwargs())
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 # Process-level flag — True once init_db() has completed for this Python process.
