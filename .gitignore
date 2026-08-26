@@ -16,3 +16,8 @@ dist/
 build/
 .idea/
 .vscode/
+
+# Next.js / Vercel
+node_modules/
+.next/
+.vercel/

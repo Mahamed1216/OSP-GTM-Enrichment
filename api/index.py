@@ -11,6 +11,9 @@ already has, so their routes, middleware and auth are reused unchanged:
                            for ``python -m src.api.worker``, which has no
                            long-lived process to run in here)
 
+``/`` and every other path belong to the Next.js operator console (``pages/``);
+Next.js rewrites only /health and /api/* to this function — see next.config.js.
+
 The Streamlit UI in ``app/`` is deliberately NOT served here: Streamlit needs a
 long-lived, stateful websocket server and cannot run on Vercel. Keep it on
 Streamlit Cloud (or any container host) pointed at the same DATABASE_URL.
@@ -45,20 +48,24 @@ from src.webhook.server import app as _webhook_app  # noqa: E402
 
 _WEBHOOK_PREFIXES = ("/api/instantly", "/api/lead-source")
 _DRAIN_PATH = "/api/v1/drain"
+# "/" is served by the Next.js UI in production; /api/info is how that UI reads
+# the same service summary. Booleans only — never a secret value.
+_INFO_PATHS = ("/", "/api/info")
 
 
 # ---------------------------------------------------------------------------
 # Adapter-only routes
 # ---------------------------------------------------------------------------
 
-async def _root(scope, receive, send) -> None:
-    """Service info. Only reachable when public/index.html is absent."""
+async def _info(scope, receive, send) -> None:
+    """Service summary for the operator console (and local `uvicorn` runs)."""
     await JSONResponse({
         "service": "osp-gtm-enrichment",
         "status": "ok",
         "database_configured": bool(os.environ.get("DATABASE_URL")),
         "endpoints": {
             "health": "GET /health",
+            "info": "GET /api/info",
             "process": "POST /api/v1/leads/process",
             "run_status": "GET /api/v1/runs/{run_id}",
             "drain_queued": "POST /api/v1/drain",
@@ -116,8 +123,8 @@ async def _dispatch(scope, receive, send) -> None:
         await _drain(scope, receive, send)
     elif path.startswith(_WEBHOOK_PREFIXES):
         await _webhook_app(scope, receive, send)
-    elif path == "/":
-        await _root(scope, receive, send)
+    elif path in _INFO_PATHS:
+        await _info(scope, receive, send)
     else:
         await _api_app(scope, receive, send)
 

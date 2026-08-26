@@ -239,19 +239,25 @@ bake them into the image or commit `.env`.
 
 ---
 
-## Vercel deployment (API + webhook only)
+## Vercel deployment (operator console + API)
 
-`vercel.json` + `api/index.py` deploy the FastAPI surface — the internal API,
-the Instantly reply webhook and the lead-source scheduler endpoint — as a single
-Python serverless function. The Streamlit operator UI is **not** deployable on
-Vercel (it needs a long-lived stateful process); keep it on Streamlit Cloud
-against the same `DATABASE_URL`.
+Vercel serves two things: a small **Next.js operator console** (`pages/`) at
+`/`, and the existing FastAPI surface — internal API, Instantly reply webhook,
+lead-source scheduler — as a single **Python serverless function**
+(`api/index.py`) at `/health` and `/api/*`. `next.config.js` routes between them.
+
+The console holds no secrets: `/api/v1/*` needs the internal API key, which the
+operator pastes in and which stays in their browser tab.
+
+The Streamlit operator UI is **not** deployable on Vercel (it needs a long-lived
+stateful process); keep it on Streamlit Cloud against the same `DATABASE_URL`.
 
 Settings, env vars and the serverless caveats (60s cap, draining async runs) are
 in [`docs/vercel_deployment.md`](docs/vercel_deployment.md).
 
 ```bash
-uvicorn api.index:app --port 8000   # same entrypoint Vercel runs
+uvicorn api.index:app --port 8000   # terminal 1: the API
+npm run dev                         # terminal 2: the console, proxying to it
 ```
 
 ---

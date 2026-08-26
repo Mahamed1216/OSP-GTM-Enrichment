@@ -1,38 +1,75 @@
-# Deploying the API + webhook on Vercel
+# Deploying on Vercel
 
-Vercel hosts the **FastAPI surface** of this repo as one Python serverless
-function. It does **not** host the Streamlit operator UI (`app/`) — Streamlit
-needs a long-lived, stateful websocket process, which serverless cannot
-provide. Keep the UI on Streamlit Cloud (or any container host) pointed at the
-same `DATABASE_URL`.
+Vercel hosts two things from this repo:
 
-## What gets deployed
+1. **The operator console** — a small Next.js app (`pages/`) served at `/`.
+2. **The API** — the existing FastAPI code, as one Python serverless function
+   (`api/index.py`) serving `/health` and `/api/*`.
+
+It does **not** host the Streamlit operator UI (`app/`). Streamlit needs a
+long-lived, stateful websocket process, which serverless cannot provide. Keep it
+on Streamlit Cloud (or any container host) pointed at the same `DATABASE_URL`.
+
+## Routing
+
+`next.config.js` owns the routing. Next.js serves the UI; two rewrites hand the
+API paths to the Python function:
+
+| Path | Served by |
+| --- | --- |
+| `/` and any other UI route | Next.js (`pages/index.jsx`) |
+| `/health` | `api/index.py` |
+| `/api/*` | `api/index.py` |
+
+In development those two rewrites point at `http://127.0.0.1:8000` instead, so a
+local `uvicorn` process backs the dev server. Override the origin with
+`PY_API_ORIGIN` if you run it on another port.
+
+## API surface (unchanged)
 
 | Route | Backed by | Auth |
 | --- | --- | --- |
 | `GET /health` | `src/api/server.py` | public |
+| `GET /api/info` | `api/index.py` | public (booleans only) |
 | `POST /api/v1/leads/process` | `src/api/server.py` | `Authorization: Bearer $INTERNAL_API_KEY` |
-| `GET /api/v1/runs/{run_id}` | `src/api/server.py` | `Authorization: Bearer $INTERNAL_API_KEY` |
-| `GET /api/v1/leads/{id}/processed` | `src/api/server.py` | `Authorization: Bearer $INTERNAL_API_KEY` |
-| `POST /api/v1/drain` | `api/index.py` → `src/api/worker.py` | Bearer `$INTERNAL_API_KEY` or `$CRON_SECRET` |
+| `GET /api/v1/runs/{run_id}` | `src/api/server.py` | bearer `$INTERNAL_API_KEY` |
+| `GET /api/v1/leads/{id}/processed` | `src/api/server.py` | bearer `$INTERNAL_API_KEY` |
+| `POST /api/v1/drain` | `api/index.py` → `src/api/worker.py` | bearer `$INTERNAL_API_KEY` or `$CRON_SECRET` |
 | `POST /api/instantly/reply-webhook` | `src/webhook/server.py` | `X-Webhook-Secret` |
 | `POST /api/lead-source/run-scheduled` | `src/webhook/server.py` | `X-Job-Secret` |
 
-`api/index.py` is the only function. It puts the repo root on `sys.path` and
-dispatches by path prefix to the two existing FastAPI apps, so their routes,
-middleware (webhook body-size + rate-limit guards) and auth are unchanged.
+`api/index.py` puts the repo root on `sys.path` and dispatches by path prefix to
+the two existing FastAPI apps, so their routes, middleware (webhook body-size +
+rate-limit guards) and auth are unchanged.
+
+## How the console authenticates
+
+`/api/v1/*` requires the internal API key. The console does **not** ship the key
+in its bundle, and there is no unauthenticated server-side proxy that would
+expose lead processing to the internet. The operator pastes the key into the
+Access card; it is held in `sessionStorage` (that browser tab only) and sent
+straight to the same-origin API.
+
+That means the Vercel URL itself is public but can do nothing privileged without
+the key. If you want the console behind a login as well, use Vercel's
+[Deployment Protection](https://vercel.com/docs/deployment-protection).
 
 ## Vercel project settings
 
 | Setting | Value |
 | --- | --- |
-| Framework preset | **Other** |
+| Framework preset | **Next.js** (auto-detected from `package.json`) |
 | Root directory | `./` (repo root) |
-| Build command | *(empty — override off)* |
-| Output directory | `public` (already set in `vercel.json`) |
-| Install command | *(empty — Vercel installs `requirements.txt` automatically)* |
-| Node.js version | irrelevant (no JS build) |
+| Build command | *default* — `next build` |
+| Output directory | *default* — `.next` |
+| Install command | *default* — `npm install` |
+| Node.js version | 22.x (Vercel default) |
 | Python version | 3.12 (Vercel default; repo requires >= 3.11) |
+
+Leave all four build overrides **off**. Vercel builds the Next.js app from
+`package.json` and, separately, builds `api/index.py` into a Python function
+using the root `requirements.txt`. `vercel.json` now only sets the function's
+`maxDuration`.
 
 ## Required environment variables
 
@@ -51,17 +88,21 @@ Preview). `.env` is never uploaded (`.vercelignore`).
 | `INSTANTLY_API_KEY` | only if the pipeline needs Instantly reads |
 | `CRON_SECRET` | optional; lets a Vercel Cron call `/api/v1/drain` |
 
-The schema is **not** created by the function on every cold start. Initialize
-it once from anywhere with the same `DATABASE_URL`: `python scripts/init_db.py`.
+Nothing here is exposed to the browser — no variable is prefixed
+`NEXT_PUBLIC_`, so none is inlined into the client bundle.
+
+The schema is **not** created by the function on every cold start. Initialize it
+once from anywhere with the same `DATABASE_URL`: `python scripts/init_db.py`.
 
 ## Serverless caveats
 
-* **Function duration.** `vercel.json` sets `maxDuration: 60` (the Hobby cap).
-  A `run_mode: "sync"` request that enriches + scores + generates for a batch
-  will exceed that. Send small batches, or use `run_mode: "async"` and drain.
+* **Function duration.** `vercel.json` sets `maxDuration: 60` (the Hobby cap). A
+  `run_mode: "sync"` request that enriches + scores + generates for a batch will
+  exceed that. Send small batches, or use `run_mode: "async"` and drain.
 * **Async runs need a drainer.** `python -m src.api.worker` has no long-lived
-  process here. Call `POST /api/v1/drain?batch=3` externally, or add a Vercel
-  Cron (set `CRON_SECRET` first):
+  process here. Use the console's **Drain queued** button, call
+  `POST /api/v1/drain?batch=3` externally, or add a Vercel Cron (set
+  `CRON_SECRET` first):
 
   ```json
   "crons": [{ "path": "/api/v1/drain?batch=3", "schedule": "*/15 * * * *" }]
@@ -75,8 +116,23 @@ it once from anywhere with the same `DATABASE_URL`: `python scripts/init_db.py`.
 
 ## Verify locally
 
+The UI build on its own:
+
 ```bash
+npm install
+npm run build
+```
+
+The whole thing, UI + API, the way it behaves in production:
+
+```bash
+# terminal 1 — the API
 pip install -r requirements.txt
 uvicorn api.index:app --port 8000
-curl http://localhost:8000/health
+
+# terminal 2 — the UI (proxies /health and /api/* to :8000)
+npm run dev
 ```
+
+Then open <http://localhost:3000>. `curl localhost:3000/health` should return
+the API's JSON, not an HTML page.
