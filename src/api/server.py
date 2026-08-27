@@ -479,7 +479,13 @@ async def settings_status() -> dict:
     def configured(name: str) -> bool:
         return bool((os.environ.get(name) or "").strip())
 
+    from src.db_url import describe_database_url
+
     return {
+        # Redacted connection summary: host and port are public DNS facts, the
+        # username is reduced to a shape, and the password never leaves the
+        # server. This is behind auth because the host carries the project ref.
+        "database": describe_database_url(os.environ.get("DATABASE_URL")),
         "env": {
             name: configured(name)
             for name in (

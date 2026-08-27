@@ -74,6 +74,7 @@ export default function Settings({ authed, health }) {
   }, [settings.data]);
 
   const env = status.data?.env || {};
+  const db = status.data?.database || {};
   const scoring = status.data?.scoring || {};
   const workspace = settings.data?.workspace || {};
   const instantly = settings.data?.instantly || {};
@@ -359,6 +360,31 @@ export default function Settings({ authed, health }) {
       )}
 
       {/* --------------------------------------------------- read-only -- */}
+      <Section
+        title="Database connection"
+        note="What the running app is actually connected to. Host and port only — no credentials."
+      >
+        <Card>
+          <AsyncState loading={status.loading} error={status.error}>
+            <KV rows={[
+              ["Configured", db.database_configured
+                ? <span className="pill-sm ok">yes</span>
+                : <span className="pill-sm err">no</span>],
+              ["Scheme", db.database_scheme],
+              ["Host", <span className="mono">{db.database_host}</span>],
+              ["Port", db.database_port],
+              ["Uses pooler", db.database_uses_pooler
+                ? <span className="pill-sm ok">yes</span>
+                : <span className="pill-sm warn">no</span>],
+              ["User shape", <span className="mono">{db.database_user_shape}</span>],
+            ]} />
+            {db.database_warning && (
+              <p className="state err">{db.database_warning}</p>
+            )}
+          </AsyncState>
+        </Card>
+      </Section>
+
       <Section title="Configuration" note="Presence only — no value is ever sent to the browser.">
         <Card>
           <AsyncState loading={status.loading} error={status.error}>

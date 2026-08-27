@@ -48,6 +48,21 @@ def _engine_kwargs() -> dict:
 engine = create_engine(
     _normalized_url(settings.database_url), echo=False, future=True, **_engine_kwargs()
 )
+
+# Log where we are actually connecting, host and port only. This is the one
+# place that can prove whether the deployment picked up the DATABASE_URL you
+# set — never log the URL itself, it carries the password.
+try:
+    import logging as _logging
+
+    from src.db_url import connection_summary as _connection_summary
+
+    _logging.getLogger(__name__).info(
+        "database_engine_created",
+        extra={"target": _connection_summary(settings.database_url)},
+    )
+except Exception:  # pragma: no cover - logging must never break startup
+    pass
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 # Process-level flag — True once init_db() has completed for this Python process.

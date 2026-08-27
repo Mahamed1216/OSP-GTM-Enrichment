@@ -160,6 +160,26 @@ async def _health(scope, receive, send) -> None:
     await _send_json(send, 200 if healthy else 503, payload)
 
 
+def _database_facts() -> dict:
+    """Non-identifying connection facts: scheme, port, pooler yes/no.
+
+    The host and username shape are deliberately NOT here — /api/info is
+    public, and the host carries the Supabase project ref. The full summary
+    lives behind auth on /api/v1/settings/status.
+    """
+    try:
+        from src.db_url import describe_database_url
+        info = describe_database_url(_database_url())
+        return {
+            "database_scheme": info["database_scheme"],
+            "database_port": info["database_port"],
+            "database_uses_pooler": info["database_uses_pooler"],
+            "database_warning": info["database_warning"],
+        }
+    except Exception:
+        return {}
+
+
 async def _info(scope, receive, send) -> None:
     backend = _backend()
     await _send_json(send, 200, {
@@ -168,6 +188,7 @@ async def _info(scope, receive, send) -> None:
         "backend_importable": backend["error"] is None,
         "backend_error": None if backend["error"] is None else backend["error"]["error"],
         "database_configured": bool(_database_url()),
+        **_database_facts(),
         "endpoints": {
             "health": "GET /health",
             "info": "GET /api/info",

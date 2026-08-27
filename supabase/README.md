@@ -121,6 +121,42 @@ than failing deep inside a query. Work through:
 4. Check `GET /api/info` — `database_configured` tells you whether the function
    can see the variable at all.
 
+### Checking which database the deployed app is actually using
+
+The app reads `DATABASE_URL` and passes it to SQLAlchemy unchanged apart from a
+`postgres://` -> `postgresql://` scheme fix. It never rewrites the host or the
+port. To confirm what a running deployment is connected to:
+
+```bash
+curl https://<your-app>.vercel.app/api/info
+```
+
+That returns `database_scheme`, `database_port` and `database_uses_pooler` —
+public, non-identifying facts. Signed in, **Settings -> Database connection**
+shows the host and the username *shape* as well. Neither ever includes the
+password or the raw URL. The Vercel runtime log also carries one
+`database_engine_created` line with `host=`, `port=` and `uses_pooler=`.
+
+Two tells that the value is not the Transaction Pooler URL:
+
+* `database_host` starts with `db.` — that is the **direct** host. The pooler
+  host looks like `aws-0-<region>.pooler.supabase.com`.
+* `database_user_shape` is `postgres` — the pooler always uses
+  `postgres.<project-ref>`. A plain `postgres` user means a direct URI.
+
+If those disagree with what you set in Vercel, the deployment is not reading
+the value you think it is. Check, in this order:
+
+1. The variable exists under the **Production** environment (not only Preview
+   or Development).
+2. There is no second definition for the same key — a Production override, or a
+   value attached to a specific branch, wins over the general one.
+3. Nothing else defines `DATABASE_URL` — an Integration (the Supabase
+   integration adds its own) or a `.env` committed by mistake.
+4. A **redeploy happened after** the variable changed. Environment variables
+   are read at runtime by the function, but the running deployment keeps the
+   values it was built and started with.
+
 Other failures `/health` will name for you:
 
 | `backend_error` contains | Meaning |
