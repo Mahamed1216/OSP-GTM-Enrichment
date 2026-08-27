@@ -9,9 +9,9 @@ import { AsyncState, Card, Metric, PageHead, Section, TierChip } from "../common
  * companies with more than one lead (an account, not a contact), and replied
  * leads worth re-engaging. Everything else is an explicit empty state.
  */
-export default function ClientExpansion({ apiKey, onOpenLead }) {
-  const leads = useApi("/api/v1/leads?limit=200", apiKey, { skip: !apiKey });
-  const engagement = useApi("/api/v1/engagement?limit=50", apiKey, { skip: !apiKey });
+export default function ClientExpansion({ authed, onOpenLead }) {
+  const leads = useApi("/api/v1/leads?limit=200", { skip: !authed });
+  const engagement = useApi("/api/v1/engagement?limit=50", { skip: !authed });
 
   const rows = leads.data?.leads || [];
   const replies = engagement.data?.replies || [];

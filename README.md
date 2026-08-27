@@ -1,4 +1,4 @@
-# OSP GTM Enrichment
+# SignalOS
 
 Outbound GTM pipeline: **enrich → score → generate → deliver → learn**, with an
 operator console on top.
@@ -39,7 +39,7 @@ pip install -r requirements.txt
 npm install
 
 # 2. Configure
-cp .env.example .env    # then fill in DATABASE_URL and INTERNAL_API_KEY
+cp .env.example .env    # then fill in DATABASE_URL and ADMIN_PASSWORD
 
 # 3. Create the schema (once)
 #    Either paste supabase/schema.sql into the Supabase SQL editor, or:
@@ -59,17 +59,24 @@ console behaves exactly as it does in production.
 environment variables, no database. Every panel fetches client-side and renders
 its own error state, so the page loads even when the API is down.
 
-| Tab | What it shows |
+| Page | What it shows |
 | --- | --- |
-| Overview | API and database status, pipeline counts, leads by tier, recent runs, failed jobs, latest generated emails |
-| Leads | Filterable table (search, tier, delivery state, enriched) with a per-lead detail drawer |
-| Content | Generated emails / call scripts / LinkedIn DMs with safety and delivery state |
-| Processing | Submit leads, drain the async queue, inspect run status and history |
-| Settings | Which environment variables are configured (presence only), scoring thresholds, machine endpoints |
+| Dashboard | API and database status, pipeline counts, leads by tier, Apollo status, daily calls, recent runs / failures / emails / replies |
+| Signal Feed | Buying-intent signals with strength, uplift and sources |
+| Client Expansion | Multi-contact accounts and replies worth re-engaging |
+| Leads | Filterable table with a per-lead detail drawer |
+| Run Pipeline | Lead selection, action presets, submit, drain, run history |
+| Apollo Autopilot | Status page for future automated sourcing (not connected) |
+| Settings | Editable company / ICP / persona / signals, integrations, env presence |
+| Engagement | Delivery counts, campaign snapshot, replies, generated content |
+| Prompts | Section-by-section prompt editor with compiled preview |
+| BDR Research | Enrichment coverage, headlines, buyer segments |
 
-`/api/v1/*` requires the internal API key. It is **not** built into the bundle
-and there is no unauthenticated server-side proxy — the operator pastes the key
-into the console, where it stays in `sessionStorage` for that browser tab.
+The console is password-protected: sign in with `ADMIN_PASSWORD` and the server
+issues an HttpOnly session cookie. No credential ever reaches the browser —
+nothing in the bundle, nothing in `localStorage` or `sessionStorage`.
+`INTERNAL_API_KEY` stays server-side as a bearer token for backend-to-backend
+callers (cron, scripts) and is never entered in a browser.
 
 ## API
 
@@ -77,15 +84,16 @@ into the console, where it stays in `sessionStorage` for that browser tab.
 | --- | --- |
 | `GET /health` | public |
 | `GET /api/info` | public (booleans only) |
-| `GET /api/v1/dashboard/summary` | bearer `INTERNAL_API_KEY` |
-| `GET /api/v1/leads` | bearer |
-| `GET /api/v1/leads/{id}` | bearer |
-| `GET /api/v1/leads/{id}/processed` | bearer |
-| `POST /api/v1/leads/process` | bearer |
-| `GET /api/v1/runs` · `GET /api/v1/runs/{run_id}` | bearer |
-| `POST /api/v1/drain` | bearer, or `CRON_SECRET` |
-| `GET /api/v1/generated-content` | bearer |
-| `GET /api/v1/settings/status` | bearer |
+| `POST /api/auth/login` · `/logout` · `GET /api/auth/me` | public; login checks `ADMIN_PASSWORD` |
+| `GET /api/v1/dashboard/summary` | admin session, or bearer `INTERNAL_API_KEY` |
+| `GET /api/v1/leads` | admin session or bearer |
+| `GET /api/v1/leads/{id}` | admin session or bearer |
+| `GET /api/v1/leads/{id}/processed` | admin session or bearer |
+| `POST /api/v1/leads/process` | admin session or bearer |
+| `GET /api/v1/runs` · `GET /api/v1/runs/{run_id}` | admin session or bearer |
+| `POST /api/v1/drain` | admin session, bearer, or `CRON_SECRET` |
+| `GET /api/v1/generated-content` | admin session or bearer |
+| `GET /api/v1/settings/status` | admin session or bearer |
 | `POST /api/instantly/reply-webhook` | `X-Webhook-Secret` |
 | `POST /api/lead-source/run-scheduled` | `X-Job-Secret` |
 

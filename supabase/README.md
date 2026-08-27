@@ -52,7 +52,9 @@ rewrites that prefix to `postgresql://`, because `postgres` is not a SQLAlchemy
 | Variable | Required | Why |
 | --- | --- | --- |
 | `DATABASE_URL` | **yes** | the pooler URI from step 3 |
-| `INTERNAL_API_KEY` | **yes** | bearer auth for `/api/v1/*`; any long random string |
+| `ADMIN_PASSWORD` | **yes** | the password the operator console signs in with |
+| `ADMIN_SESSION_SECRET` | optional | signs session cookies; derived from the password when unset |
+| `INTERNAL_API_KEY` | optional | internal only — bearer auth for backend-to-backend callers |
 | `ANTHROPIC_API_KEY` | for processing | scoring + content generation |
 | `TAVILY_API_KEY` | for processing | buyer research / hiring signals |
 | `APIFY_API_TOKEN` | for processing | LinkedIn enrichment |

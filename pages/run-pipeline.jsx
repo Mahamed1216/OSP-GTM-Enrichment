@@ -2,8 +2,8 @@ import Shell, { useConsole } from "../components/Shell";
 import RunPipeline from "../components/pages/RunPipeline";
 
 function Body() {
-  const { apiKey } = useConsole();
-  return <RunPipeline apiKey={apiKey} />;
+  const { authed } = useConsole();
+  return <RunPipeline authed={authed} />;
 }
 
 export default function RunPipelineRoute() {

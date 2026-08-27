@@ -2,8 +2,8 @@ import Shell, { useConsole } from "../components/Shell";
 import BdrResearch from "../components/pages/BdrResearch";
 
 function Body() {
-  const { apiKey, openLead } = useConsole();
-  return <BdrResearch apiKey={apiKey} onOpenLead={openLead} />;
+  const { authed, openLead } = useConsole();
+  return <BdrResearch authed={authed} onOpenLead={openLead} />;
 }
 
 export default function BdrResearchRoute() {

@@ -17,10 +17,19 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from src.api import run_store
+from src.api.auth import (
+    COOKIE_NAME,
+    AuthNotConfigured,
+    admin_password,
+    cookie_kwargs,
+    issue_token,
+    password_matches,
+    verify_token,
+)
 from src.api.processing import build_processed_payload, normalize_options, process_run
 
 log = logging.getLogger(__name__)
@@ -66,20 +75,46 @@ def _bearer_token(authorization: str | None) -> str | None:
     return None
 
 
-async def require_api_key(authorization: str | None = Header(default=None)) -> None:
-    """FastAPI dependency: enforce a valid bearer key. Never logs the key."""
+def _internal_key_ok(authorization: str | None) -> bool:
+    """Backend-to-backend auth: Authorization: Bearer <INTERNAL_API_KEY>."""
     expected = _expected_api_key()
-    if not expected:
-        log.error("internal_api_key_not_configured")
+    provided = _bearer_token(authorization)
+    if not expected or not provided:
+        return False
+    return hmac.compare_digest(provided, expected)
+
+
+async def require_admin(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> None:
+    """Allow an admin console session, or an internal bearer key.
+
+    The console signs in with ADMIN_PASSWORD and carries an HttpOnly cookie —
+    the browser never handles INTERNAL_API_KEY. The bearer path stays for
+    backend-to-backend callers (cron, scripts, other services).
+    """
+    if verify_token(request.cookies.get(COOKIE_NAME)):
+        return
+    if _internal_key_ok(authorization):
+        return
+
+    if not admin_password() and not _expected_api_key():
+        log.error("admin_auth_not_configured")
         raise HTTPException(
             status_code=500,
-            detail="INTERNAL_API_KEY is not configured on this server.",
+            detail=(
+                "Neither ADMIN_PASSWORD nor INTERNAL_API_KEY is configured on "
+                "this server."
+            ),
         )
-    provided = _bearer_token(authorization)
-    if not provided or not hmac.compare_digest(provided, expected):
-        # Log presence only — never the value.
-        log.warning("api_auth_failed", extra={"token_present": bool(provided)})
-        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+    # Log presence only — never a credential value.
+    log.warning("api_auth_failed", extra={"bearer_present": bool(authorization)})
+    raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+
+# Kept so existing internal callers and tests that import it keep working.
+require_api_key = require_admin
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +480,8 @@ async def settings_status() -> dict:
             name: configured(name)
             for name in (
                 "DATABASE_URL",
+                "ADMIN_PASSWORD",
+                "ADMIN_SESSION_SECRET",
                 "INTERNAL_API_KEY",
                 "ANTHROPIC_API_KEY",
                 "APIFY_API_TOKEN",
@@ -959,3 +996,53 @@ async def save_instantly_settings(req: InstantlySaveRequest) -> dict:
             raise HTTPException(status_code=404, detail="workspace_not_found")
         workspace.instantly_campaign_id = (req.campaign_id or "").strip() or None
     return {"saved": True, "workspace_id": ws, "campaign_id": req.campaign_id}
+
+
+# ---------------------------------------------------------------------------
+# Admin session (console login)
+#
+# The console signs in with ADMIN_PASSWORD and receives an HttpOnly cookie.
+# ADMIN_PASSWORD is never returned, and INTERNAL_API_KEY never reaches the
+# browser at all.
+# ---------------------------------------------------------------------------
+
+class LoginRequest(BaseModel):
+    password: str = ""
+
+
+@app.post("/api/auth/login", summary="Sign in with the admin password")
+async def auth_login(req: LoginRequest, response: Response) -> dict:
+    if not admin_password():
+        log.error("admin_password_not_configured")
+        raise HTTPException(
+            status_code=500,
+            detail="ADMIN_PASSWORD is not configured on this server.",
+        )
+    if not password_matches(req.password or ""):
+        log.warning("admin_login_failed")
+        raise HTTPException(status_code=401, detail="Incorrect password.")
+
+    try:
+        token = issue_token()
+    except AuthNotConfigured as exc:  # pragma: no cover - guarded above
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    response.set_cookie(value=token, **cookie_kwargs())
+    log.info("admin_login_ok")
+    return {"authenticated": True}
+
+
+@app.post("/api/auth/logout", summary="Clear the admin session")
+async def auth_logout(response: Response) -> dict:
+    # Overwrite with an immediately-expiring cookie so it is dropped even where
+    # delete_cookie's attributes would not match.
+    response.set_cookie(value="", **{**cookie_kwargs(), "max_age": 0})
+    return {"authenticated": False}
+
+
+@app.get("/api/auth/me", summary="Is this browser signed in?")
+async def auth_me(request: Request) -> dict:
+    return {
+        "authenticated": verify_token(request.cookies.get(COOKIE_NAME)),
+        "login_configured": bool(admin_password()),
+    }

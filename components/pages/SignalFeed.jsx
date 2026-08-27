@@ -1,11 +1,10 @@
 import { formatDate, useApi } from "../../lib/api";
 import { AsyncState, Card, PageHead, Strength, Tier } from "../common";
 
-export default function SignalFeed({ apiKey, onOpenLead }) {
+export default function SignalFeed({ authed, onOpenLead }) {
   const { data, loading, error, reload } = useApi(
     "/api/v1/signals?limit=100",
-    apiKey,
-    { skip: !apiKey },
+    { skip: !authed },
   );
   const signals = data?.signals || [];
 

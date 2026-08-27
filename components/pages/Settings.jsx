@@ -3,11 +3,13 @@ import { useEffect, useState } from "react";
 import { callApi, useApi } from "../../lib/api";
 import { AsyncState, Card, KV, PageHead, Section, Tier } from "../common";
 
-const REQUIRED_ENV = ["DATABASE_URL", "INTERNAL_API_KEY"];
+const REQUIRED_ENV = ["DATABASE_URL", "ADMIN_PASSWORD"];
 
 const ENV_PURPOSE = {
   DATABASE_URL: "Supabase Postgres connection (pooler URI)",
-  INTERNAL_API_KEY: "bearer auth for /api/v1/*",
+  ADMIN_PASSWORD: "the password this console signs in with",
+  ADMIN_SESSION_SECRET: "signs session cookies (optional; derived from the password if unset)",
+  INTERNAL_API_KEY: "internal only — bearer auth for backend-to-backend callers",
   ANTHROPIC_API_KEY: "scoring + content generation",
   APIFY_API_TOKEN: "LinkedIn enrichment",
   TAVILY_API_KEY: "buyer research and hiring signals",
@@ -51,9 +53,9 @@ function TextField({ id, label, value, onChange, placeholder }) {
   );
 }
 
-export default function Settings({ apiKey, health }) {
-  const status = useApi("/api/v1/settings/status", apiKey, { skip: !apiKey });
-  const settings = useApi("/api/v1/settings", apiKey, { skip: !apiKey });
+export default function Settings({ authed, health }) {
+  const status = useApi("/api/v1/settings/status", { skip: !authed });
+  const settings = useApi("/api/v1/settings", { skip: !authed });
 
   const [config, setConfig] = useState(null);
   const [dirty, setDirty] = useState(false);
@@ -93,7 +95,6 @@ export default function Settings({ apiKey, health }) {
     setSaved(null);
     const response = await callApi("/api/v1/settings", {
       method: "POST",
-      apiKey,
       body: { config },
     });
     setSaving(false);
@@ -110,7 +111,6 @@ export default function Settings({ apiKey, health }) {
     setInstantlySaved(null);
     const response = await callApi("/api/v1/settings/instantly", {
       method: "POST",
-      apiKey,
       body: { campaign_id: campaignId },
     });
     setInstantlySaved(
@@ -207,10 +207,10 @@ export default function Settings({ apiKey, health }) {
       </p>
 
       {/* ------------------------------------------------- editable form -- */}
-      {!apiKey ? (
+      {!authed ? (
         <div className="empty">
-          <strong>API key required</strong>
-          Enter <code>INTERNAL_API_KEY</code> above to load and edit settings.
+          <strong>Sign in required</strong>
+          Log in with the admin password above to load and edit settings.
         </div>
       ) : (
         <AsyncState loading={settings.loading} error={settings.error}>

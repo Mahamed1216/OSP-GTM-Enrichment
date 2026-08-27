@@ -2,11 +2,10 @@ import { formatDate, useApi } from "../../lib/api";
 import { AsyncState, Bool, Card, KV, Metric, PageHead, Section } from "../common";
 import Content from "./Content";
 
-export default function Engagement({ apiKey, onOpenLead }) {
+export default function Engagement({ authed, onOpenLead }) {
   const { data, loading, error, reload } = useApi(
     "/api/v1/engagement?limit=50",
-    apiKey,
-    { skip: !apiKey },
+    { skip: !authed },
   );
 
   const counts = data?.counts || {};
@@ -129,7 +128,7 @@ export default function Engagement({ apiKey, onOpenLead }) {
         title="Outbound content"
         note="What the pipeline generated, with safety and delivery state."
       >
-        <Content apiKey={apiKey} onOpenLead={onOpenLead} embedded />
+        <Content authed={authed} onOpenLead={onOpenLead} embedded />
       </Section>
     </>
   );

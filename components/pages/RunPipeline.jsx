@@ -40,7 +40,7 @@ const SELECTIONS = [
   ["statuses", "Selected statuses"],
 ];
 
-export default function RunPipeline({ apiKey }) {
+export default function RunPipeline({ authed }) {
   const [selection, setSelection] = useState("unprocessed");
   const [rows, setRows] = useState("");
   const [tiers, setTiers] = useState(["A", "B"]);
@@ -55,8 +55,8 @@ export default function RunPipeline({ apiKey }) {
   const [runResult, setRunResult] = useState(null);
   const [openPanel, setOpenPanel] = useState("select");
 
-  const counts = useApi("/api/v1/leads?limit=1", apiKey, { skip: !apiKey });
-  const runs = useApi("/api/v1/runs?limit=25", apiKey, { skip: !apiKey });
+  const counts = useApi("/api/v1/leads?limit=1", { skip: !authed });
+  const runs = useApi("/api/v1/runs?limit=25", { skip: !authed });
   const total = counts.data?.total ?? 0;
 
   // A lead handed over from the detail drawer becomes the payload.
@@ -107,8 +107,8 @@ export default function RunPipeline({ apiKey }) {
 
   async function run(event) {
     event.preventDefault();
-    if (!apiKey) {
-      setResult({ error: "Enter INTERNAL_API_KEY above to run the pipeline." });
+    if (!authed) {
+      setResult({ error: "Log in with the admin password above to run the pipeline." });
       return;
     }
     let leads;
@@ -140,7 +140,7 @@ export default function RunPipeline({ apiKey }) {
     };
     if (workspace.trim()) body.workspace_slug = workspace.trim();
 
-    const response = await callApi("/api/v1/leads/process", { method: "POST", body, apiKey });
+    const response = await callApi("/api/v1/leads/process", { method: "POST", body });
     setBusy(false);
     setResult(response.ok ? response.data : { error: response.error });
     if (response.ok && response.data?.run_id) {
@@ -150,22 +150,22 @@ export default function RunPipeline({ apiKey }) {
   }
 
   async function drain() {
-    if (!apiKey) {
-      setRunResult({ error: "Enter INTERNAL_API_KEY above to drain the queue." });
+    if (!authed) {
+      setRunResult({ error: "Log in with the admin password to drain the queue." });
       return;
     }
     setRunResult({ loading: true });
-    const response = await callApi("/api/v1/drain?batch=3", { method: "POST", apiKey });
+    const response = await callApi("/api/v1/drain?batch=3", { method: "POST" });
     setRunResult(response.ok ? response.data : { error: response.error });
     runs.reload();
   }
 
   async function checkRun(id) {
     const target = (id || runId).trim();
-    if (!target || !apiKey) return;
+    if (!target || !authed) return;
     setRunId(target);
     setRunResult({ loading: true });
-    const response = await callApi(`/api/v1/runs/${encodeURIComponent(target)}`, { apiKey });
+    const response = await callApi(`/api/v1/runs/${encodeURIComponent(target)}`);
     setRunResult(response.ok ? response.data : { error: response.error });
   }
 
@@ -192,10 +192,10 @@ export default function RunPipeline({ apiKey }) {
         note="Enrich, score and generate for the leads you select. Nothing is sent from here."
       />
 
-      {!apiKey && (
+      {!authed && (
         <div className="empty" style={{ marginBottom: "1.25rem" }}>
-          <strong>API key required</strong>
-          Enter <code>INTERNAL_API_KEY</code> above to run the pipeline or drain the queue.
+          <strong>Sign in required</strong>
+          Log in with the admin password above to run the pipeline or drain the queue.
         </div>
       )}
 
@@ -372,10 +372,10 @@ export default function RunPipeline({ apiKey }) {
               onChange={(e) => setLeadsJson(e.target.value)}
             />
             <div className="row">
-              <button type="submit" disabled={busy || !apiKey}>
+              <button type="submit" disabled={busy || !authed}>
                 {busy ? "Running…" : "Run pipeline"}
               </button>
-              <button type="button" className="ghost" onClick={drain} disabled={!apiKey}>
+              <button type="button" className="ghost" onClick={drain} disabled={!authed}>
                 Drain queued
               </button>
             </div>
@@ -398,7 +398,7 @@ export default function RunPipeline({ apiKey }) {
             </div>
             <div>
               <label>&nbsp;</label>
-              <button type="button" onClick={() => checkRun()} disabled={!apiKey}>Check</button>
+              <button type="button" onClick={() => checkRun()} disabled={!authed}>Check</button>
             </div>
           </div>
           {runResult && (

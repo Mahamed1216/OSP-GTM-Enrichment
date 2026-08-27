@@ -5,7 +5,7 @@ import { AsyncState, Bool, Card, PageHead, Tier } from "../common";
 
 const PAGE = 25;
 
-export default function Leads({ apiKey, onOpenLead }) {
+export default function Leads({ authed, onOpenLead }) {
   const [search, setSearch] = useState("");
   const [debounced, setDebounced] = useState("");
   const [tier, setTier] = useState("");
@@ -34,7 +34,7 @@ export default function Leads({ apiKey, onOpenLead }) {
     return `/api/v1/leads?${params.toString()}`;
   }, [debounced, tier, enrichedOnly, sentFilter, offset]);
 
-  const { data, loading, error, reload } = useApi(path, apiKey, { skip: !apiKey });
+  const { data, loading, error, reload } = useApi(path, { skip: !authed });
   const rows = data?.leads || [];
   const total = data?.total ?? 0;
 

@@ -4,6 +4,7 @@ Serves ``/health`` and ``/api/*``. The UI at ``/`` is Next.js and never reaches
 this file — see next.config.js.
 
     /                   -> NOT handled here; the Next.js UI owns the homepage
+    /api/auth/*         -> src.api.server:app      (admin console login)
     /health             -> answered here; reports backend + database status
     /api/info           -> answered here; booleans only, never a secret
     /api/instantly/*    -> src.webhook.server:app  (Instantly reply webhook)
@@ -179,8 +180,37 @@ async def _info(scope, receive, send) -> None:
     })
 
 
+def _cookie(scope, name: str) -> str | None:
+    """One cookie value from the raw Cookie header."""
+    header = _header(scope, "cookie") or ""
+    for part in header.split(";"):
+        key, _, value = part.strip().partition("=")
+        if key == name:
+            return value
+    return None
+
+
+def _admin_session(scope) -> bool:
+    """True when the request carries a valid console session cookie.
+
+    Imported lazily and guarded: this module must keep answering even when the
+    backend cannot be imported at all.
+    """
+    try:
+        from src.api.auth import COOKIE_NAME, verify_token
+    except Exception:
+        return False
+    return verify_token(_cookie(scope, COOKIE_NAME))
+
+
 def _authorized(scope) -> bool:
-    """Bearer INTERNAL_API_KEY, or CRON_SECRET when called by a Vercel Cron."""
+    """An admin console session, a bearer INTERNAL_API_KEY, or CRON_SECRET.
+
+    The console signs in with ADMIN_PASSWORD and reaches this through the
+    cookie; cron and scripts keep using a bearer token.
+    """
+    if _admin_session(scope):
+        return True
     parts = (_header(scope, "authorization") or "").split(" ", 1)
     token = parts[1].strip() if len(parts) == 2 and parts[0].lower() == "bearer" else ""
     if not token:

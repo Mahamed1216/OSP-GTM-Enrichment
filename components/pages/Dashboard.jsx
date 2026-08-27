@@ -7,17 +7,16 @@ import { AsyncState, Card, Metric, RunStatus, Section, TierChip } from "../commo
 const TIERS = ["A", "B", "C", "D"];
 const CALL_TABS = [["daily", "Daily"], ["weekly", "Weekly"], ["pipeline", "Pipeline"]];
 
-export default function Dashboard({ apiKey, health, onOpenLead }) {
+export default function Dashboard({ authed, health, onOpenLead }) {
   const [callTab, setCallTab] = useState("daily");
 
-  const summary = useApi("/api/v1/dashboard/summary", apiKey, { skip: !apiKey });
-  const content = useApi("/api/v1/generated-content?limit=5", apiKey, { skip: !apiKey });
-  const engagement = useApi("/api/v1/engagement?limit=5", apiKey, { skip: !apiKey });
+  const summary = useApi("/api/v1/dashboard/summary", { skip: !authed });
+  const content = useApi("/api/v1/generated-content?limit=5", { skip: !authed });
+  const engagement = useApi("/api/v1/engagement?limit=5", { skip: !authed });
   // Phone-ready leads: scored A/B and not yet sent.
   const calls = useApi(
     "/api/v1/leads?tier=A,B&not_sent_only=true&limit=8",
-    apiKey,
-    { skip: !apiKey },
+    { skip: !authed },
   );
 
   const counts = summary.data?.counts || {};

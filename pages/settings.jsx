@@ -2,8 +2,8 @@ import Shell, { useConsole } from "../components/Shell";
 import Settings from "../components/pages/Settings";
 
 function Body() {
-  const { apiKey, health } = useConsole();
-  return <Settings apiKey={apiKey} health={health} />;
+  const { authed, health } = useConsole();
+  return <Settings authed={authed} health={health} />;
 }
 
 export default function SettingsRoute() {

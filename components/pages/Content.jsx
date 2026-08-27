@@ -9,12 +9,11 @@ const KINDS = [
   ["linkedin_msg", "LinkedIn DM"],
 ];
 
-export default function Content({ apiKey, onOpenLead, embedded = false }) {
+export default function Content({ authed, onOpenLead, embedded = false }) {
   const [kind, setKind] = useState("email");
   const { data, loading, error, reload } = useApi(
     `/api/v1/generated-content?kind=${kind}&limit=50`,
-    apiKey,
-    { skip: !apiKey },
+    { skip: !authed },
   );
   const items = data?.content || [];
 

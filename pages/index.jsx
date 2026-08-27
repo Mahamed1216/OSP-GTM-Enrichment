@@ -13,8 +13,8 @@ import Dashboard from "../components/pages/Dashboard";
  */
 
 function Body() {
-  const { apiKey, openLead, health } = useConsole();
-  return <Dashboard apiKey={apiKey} onOpenLead={openLead} health={health} />;
+  const { authed, openLead, health } = useConsole();
+  return <Dashboard authed={authed} onOpenLead={openLead} health={health} />;
 }
 
 export default function Home() {

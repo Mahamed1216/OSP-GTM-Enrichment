@@ -89,15 +89,22 @@ fails if the files drift or if the backend grows an undeclared import.
 
 ## How the console authenticates
 
-`/api/v1/*` requires the internal API key. The console does **not** ship the key
-in its bundle, and there is no unauthenticated server-side proxy that would
-expose lead processing to the internet. The operator pastes the key into the
-Access card; it is held in `sessionStorage` (that browser tab only) and sent
-straight to the same-origin API.
+The console is a normal password-protected admin app. `POST /api/auth/login`
+compares the submitted password to `ADMIN_PASSWORD` in constant time and, on a
+match, sets a signed **HttpOnly, SameSite=Lax, Secure** session cookie. Every
+`/api/v1/*` route accepts that cookie.
 
-That means the Vercel URL itself is public but can do nothing privileged without
-the key. If you want the console behind a login as well, use Vercel's
-[Deployment Protection](https://vercel.com/docs/deployment-protection).
+No credential reaches the browser: nothing in the JS bundle, nothing in
+`localStorage` or `sessionStorage`, and the cookie is unreadable from
+JavaScript. `INTERNAL_API_KEY` remains a **server-side only** bearer token for
+backend-to-backend callers (a Vercel Cron draining runs, scripts, other
+services) and is never entered in a browser.
+
+Sessions are signed tokens rather than server state — the API is short-lived
+serverless functions with nowhere to keep a session table. The token carries
+only an expiry (12h); the signature makes it unforgeable. When
+`ADMIN_SESSION_SECRET` is unset the signing key derives from `ADMIN_PASSWORD`,
+so changing the password signs everyone out.
 
 ## Vercel project settings
 
@@ -124,9 +131,11 @@ Preview). `.env` is never uploaded (`.vercelignore`).
 
 | Variable | Why |
 | --- | --- |
+| `ADMIN_PASSWORD` | **Required.** The password the console signs in with. Without it nobody can sign in. |
+| `ADMIN_SESSION_SECRET` | Optional. Signs session cookies; derived from `ADMIN_PASSWORD` when unset. |
 | `DATABASE_URL` | **Required.** Postgres. The default `sqlite:///sdr.db` cannot work — the serverless filesystem is read-only. Use a pooled connection string (Supabase pooler on port 6543, pgBouncer, Neon pooler). Setting up a fresh database: [`supabase/README.md`](../supabase/README.md). |
 | `ANTHROPIC_API_KEY` | scoring + content generation |
-| `INTERNAL_API_KEY` | bearer auth for `/api/v1/*` |
+| `INTERNAL_API_KEY` | optional, internal only — bearer auth for backend-to-backend callers |
 | `INSTANTLY_WEBHOOK_SECRET` | Instantly reply webhook |
 | `LEAD_SOURCE_JOB_SECRET` | lead-source scheduler endpoint |
 | `TAVILY_API_KEY` | buyer research / hiring signals |

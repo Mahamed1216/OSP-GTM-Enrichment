@@ -16,7 +16,7 @@ export const NAV = [
   ["/bdr-research", "BDR Research", "⌕"],
 ];
 
-export default function Sidebar({ apiKey, onForgetKey }) {
+export default function Sidebar({ authed, onSignOut }) {
   const router = useRouter();
   // "/" renders the dashboard, so it highlights the same item as /dashboard.
   const path = router.pathname === "/" ? "/dashboard" : router.pathname;
@@ -48,12 +48,12 @@ export default function Sidebar({ apiKey, onForgetKey }) {
       </nav>
 
       <div className="sidebar-foot">
-        {apiKey ? (
-          <button type="button" className="linkish" onClick={onForgetKey}>
-            Forget API key
+        {authed ? (
+          <button type="button" className="linkish" onClick={onSignOut}>
+            Log out
           </button>
         ) : (
-          <span>API key not set</span>
+          <span>Not signed in</span>
         )}
       </div>
     </aside>

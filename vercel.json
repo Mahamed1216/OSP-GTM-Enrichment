@@ -7,10 +7,29 @@
     }
   },
   "rewrites": [
-    { "source": "/health", "destination": "/api/index" },
-    { "source": "/api/info", "destination": "/api/index" },
-    { "source": "/api/v1/:path*", "destination": "/api/index" },
-    { "source": "/api/instantly/:path*", "destination": "/api/index" },
-    { "source": "/api/lead-source/:path*", "destination": "/api/index" }
+    {
+      "source": "/health",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/api/auth/:path*",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/api/info",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/api/v1/:path*",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/api/instantly/:path*",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/api/lead-source/:path*",
+      "destination": "/api/index"
+    }
   ]
 }

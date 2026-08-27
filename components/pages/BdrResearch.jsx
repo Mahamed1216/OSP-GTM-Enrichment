@@ -1,11 +1,10 @@
 import { formatDate, useApi } from "../../lib/api";
 import { AsyncState, Bool, Card, Metric, PageHead, Section } from "../common";
 
-export default function BdrResearch({ apiKey, onOpenLead }) {
+export default function BdrResearch({ authed, onOpenLead }) {
   const { data, loading, error, reload } = useApi(
     "/api/v1/research?limit=50",
-    apiKey,
-    { skip: !apiKey },
+    { skip: !authed },
   );
   const items = data?.research || [];
 

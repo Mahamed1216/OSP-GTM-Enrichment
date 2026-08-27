@@ -2,11 +2,10 @@ import { formatDate, useApi } from "../lib/api";
 import { AsyncState, Bool, KV, RunStatus, Tier } from "./common";
 
 /** Slide-over detail for one lead: contact, signals, enrichment, score, content. */
-export default function LeadDetail({ leadId, apiKey, onClose, onAction }) {
+export default function LeadDetail({ leadId, authed, onClose, onAction }) {
   const { data, loading, error, reload } = useApi(
     leadId ? `/api/v1/leads/${leadId}` : null,
-    apiKey,
-    { skip: !leadId || !apiKey },
+    { skip: !leadId || !authed },
   );
 
   const lead = data?.lead || {};

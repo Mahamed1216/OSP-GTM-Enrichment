@@ -2,8 +2,8 @@ import Shell, { useConsole } from "../components/Shell";
 import ClientExpansion from "../components/pages/ClientExpansion";
 
 function Body() {
-  const { apiKey, openLead } = useConsole();
-  return <ClientExpansion apiKey={apiKey} onOpenLead={openLead} />;
+  const { authed, openLead } = useConsole();
+  return <ClientExpansion authed={authed} onOpenLead={openLead} />;
 }
 
 export default function ClientExpansionRoute() {

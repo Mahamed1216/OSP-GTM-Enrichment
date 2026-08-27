@@ -26,7 +26,7 @@ const CHANNELS = [
  * loader the generator reads, so the fingerprint and self-improvement loop stay
  * consistent.
  */
-export default function Prompts({ apiKey }) {
+export default function Prompts({ authed }) {
   const [channel, setChannel] = useState("email");
   const [sections, setSections] = useState([]);
   const [open, setOpen] = useState(() => new Set());
@@ -38,8 +38,7 @@ export default function Prompts({ apiKey }) {
 
   const { data, loading, error, reload } = useApi(
     `/api/v1/prompts/editor?channel=${channel}`,
-    apiKey,
-    { skip: !apiKey },
+    { skip: !authed },
   );
 
   // Load the fetched sections into editable state once per fetch.
@@ -85,7 +84,6 @@ export default function Prompts({ apiKey }) {
     setResult(null);
     const response = await callApi("/api/v1/prompts/editor", {
       method: "POST",
-      apiKey,
       body: { channel, sections },
     });
     setSaving(false);
@@ -126,10 +124,10 @@ export default function Prompts({ apiKey }) {
         </div>
       </div>
 
-      {!apiKey ? (
+      {!authed ? (
         <div className="empty">
-          <strong>API key required</strong>
-          Enter <code>INTERNAL_API_KEY</code> above to load and edit prompts.
+          <strong>Sign in required</strong>
+          Log in with the admin password above to load and edit prompts.
         </div>
       ) : (
         <AsyncState loading={loading} error={error}>
@@ -232,7 +230,7 @@ export default function Prompts({ apiKey }) {
         </AsyncState>
       )}
 
-      {apiKey && <SelfImprovement apiKey={apiKey} />}
+      {authed && <SelfImprovement authed={authed} />}
 
       {preview !== null && (
         <div className="drawer-backdrop" onClick={() => setPreview(null)}>
@@ -258,9 +256,9 @@ export default function Prompts({ apiKey }) {
 
 
 /** Recommendations and winning examples — read-only, from /api/v1/prompts. */
-function SelfImprovement({ apiKey }) {
+function SelfImprovement({ authed }) {
   const [open, setOpen] = useState(false);
-  const { data, loading, error } = useApi("/api/v1/prompts", apiKey, { skip: !apiKey || !open });
+  const { data, loading, error } = useApi("/api/v1/prompts", { skip: !authed || !open });
 
   const recommendations = data?.recommendations || [];
   const winners = data?.winners || [];
