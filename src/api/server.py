@@ -15,9 +15,13 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+import re
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from src.api import run_store
@@ -1046,3 +1050,93 @@ async def auth_me(request: Request) -> dict:
         "authenticated": verify_token(request.cookies.get(COOKIE_NAME)),
         "login_configured": bool(admin_password()),
     }
+
+
+# ---------------------------------------------------------------------------
+# Error handling
+#
+# Every API response must be JSON. Without these handlers an unhandled
+# exception reaches Starlette's ServerErrorMiddleware, which replies with
+# plain-text "Internal Server Error" — the console then shows
+# "Expected JSON, got 500 text/plain" on every panel and there is no way to see
+# what actually broke.
+# ---------------------------------------------------------------------------
+
+# Anything that looks like a connection string, so a DB error can never echo
+# credentials back to the browser.
+_CREDENTIAL_RE = re.compile(r"\b(\w+)://[^\s@/]+:[^\s@/]+@", re.IGNORECASE)
+
+
+def _safe_message(exc: Exception, limit: int = 300) -> str:
+    """Exception text with any embedded credentials redacted."""
+    text = f"{type(exc).__name__}: {exc}"
+    text = _CREDENTIAL_RE.sub(r"\1://***:***@", text)
+    return text[:limit]
+
+
+def _is_database_error(exc: Exception) -> bool:
+    try:
+        from sqlalchemy.exc import DBAPIError, OperationalError, SQLAlchemyError
+    except Exception:  # pragma: no cover - sqlalchemy is always installed
+        return False
+    return isinstance(exc, (OperationalError, DBAPIError, SQLAlchemyError))
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Turn any unhandled error into JSON the console can render."""
+    request_id = uuid.uuid4().hex[:12]
+    route = request.url.path
+    database = _is_database_error(exc)
+
+    log.error(
+        "api_unhandled_error",
+        extra={
+            "request_id": request_id,
+            "route": route,
+            "error": _safe_message(exc, limit=2000),
+            "database": database,
+        },
+    )
+
+    if database:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "database_unavailable",
+                "message": _safe_message(exc),
+                "hint": (
+                    "The API could not query the database. Check DATABASE_URL — "
+                    "use the Supabase pooler URI on port 6543, URL-encode special "
+                    "characters in the password, and make sure the schema from "
+                    "supabase/schema.sql has been applied."
+                ),
+                "route": route,
+                "request_id": request_id,
+            },
+        )
+
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "internal_server_error",
+            "message": _safe_message(exc),
+            "route": route,
+            "request_id": request_id,
+        },
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": "invalid_request",
+            "message": "The request body or query parameters are not valid.",
+            "detail": exc.errors(),
+            "route": request.url.path,
+        },
+    )

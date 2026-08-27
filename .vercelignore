@@ -19,6 +19,8 @@ node_modules/
 
 # Not used by the serverless function
 tests/
+*.test.js
+coverage/
 docs/
 supabase/
 scripts/

@@ -13,19 +13,6 @@ class Base(DeclarativeBase):
     pass
 
 
-def _engine_kwargs() -> dict:
-    """Serverless-safe engine options.
-
-    On Vercel every request can land on a fresh, short-lived instance, so a
-    per-instance connection pool just leaks Postgres connections. Use NullPool
-    (connect/close per checkout) plus pre-ping there. Long-lived processes
-    (the CLI, the worker) keep SQLAlchemy's default pool.
-    """
-    if os.environ.get("VERCEL"):
-        return {"poolclass": NullPool, "pool_pre_ping": True}
-    return {}
-
-
 def _normalized_url(raw: str) -> str:
     """Accept the connection strings hosts actually hand out.
 
@@ -38,6 +25,24 @@ def _normalized_url(raw: str) -> str:
     if url.startswith("postgres://"):
         return "postgresql://" + url[len("postgres://"):]
     return url
+
+
+def _engine_kwargs() -> dict:
+    """Serverless-safe engine options.
+
+    On Vercel every request can land on a fresh, short-lived instance, so a
+    per-instance connection pool just leaks Postgres connections. Use NullPool
+    (connect/close per checkout) plus pre-ping there. Long-lived processes
+    (the CLI, the worker) keep SQLAlchemy's default pool.
+    """
+    kwargs: dict = {}
+    if os.environ.get("VERCEL"):
+        kwargs.update({"poolclass": NullPool, "pool_pre_ping": True})
+    # Bound the connect attempt so an unreachable database fails fast with a
+    # readable error instead of consuming the whole function timeout.
+    if _normalized_url(settings.database_url).startswith("postgresql"):
+        kwargs["connect_args"] = {"connect_timeout": 10}
+    return kwargs
 
 
 engine = create_engine(
