@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { useState } from "react";
 
 import { formatDate, useApi } from "../../lib/api";
@@ -6,7 +7,7 @@ import { AsyncState, Card, Metric, RunStatus, Section, TierChip } from "../commo
 const TIERS = ["A", "B", "C", "D"];
 const CALL_TABS = [["daily", "Daily"], ["weekly", "Weekly"], ["pipeline", "Pipeline"]];
 
-export default function Dashboard({ apiKey, health, onOpenLead, onNavigate }) {
+export default function Dashboard({ apiKey, health, onOpenLead }) {
   const [callTab, setCallTab] = useState("daily");
 
   const summary = useApi("/api/v1/dashboard/summary", apiKey, { skip: !apiKey });
@@ -33,8 +34,8 @@ export default function Dashboard({ apiKey, health, onOpenLead, onNavigate }) {
       <div className="hero">
         <h1>Outbound that lands.</h1>
         <p>
-          Lead enrichment, scoring, and personalized outreach for CWP. Every
-          signal cited.
+          Lead enrichment, scoring, and personalized outreach. Every signal
+          cited.
         </p>
       </div>
 
@@ -69,9 +70,9 @@ export default function Dashboard({ apiKey, health, onOpenLead, onNavigate }) {
       <Section title="Apollo Autopilot (this week)">
         <Card
           actions={
-            <button type="button" className="ghost" onClick={() => onNavigate("apollo")}>
+            <Link href="/apollo-autopilot" className="btn-ghost">
               Open settings
-            </button>
+            </Link>
           }
         >
           <p className="state">

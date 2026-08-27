@@ -99,9 +99,10 @@ def test_a_nextjs_homepage_exists():
         "no pages/index.* found. Without a homepage route Next.js serves "
         "nothing at / and requests fall through to the API."
     )
-    source = found[0].read_text(encoding="utf-8")
-    assert "Cloudwork" in source, "the homepage must render the Cloudwork|PRO console"
-    assert MARKER in source, "the build marker must stay in the header while testing"
+    # The shell owns the brand and the marker; the route file mounts it.
+    shell = (_ROOT / "components" / "Shell.jsx").read_text(encoding="utf-8")
+    assert "SignalOS" in shell, "the console shell must carry the SignalOS brand"
+    assert MARKER in shell, "the build marker must stay in the header while testing"
 
 
 def test_homepage_does_not_use_server_side_rendering():
@@ -153,17 +154,57 @@ def test_sidebar_lists_every_nav_item(label):
 
 def test_sidebar_carries_the_brand():
     source = _SIDEBAR.read_text(encoding="utf-8")
-    assert "Cloudwork" in source
+    assert "Signal" in source and "OS" in source
     assert "Sales Enablement" in source
 
 
-def test_every_nav_id_has_a_page_in_the_shell():
-    """A nav item that routes nowhere would render a blank main area."""
-    sidebar = _SIDEBAR.read_text(encoding="utf-8")
-    shell = (_PAGES / "index.jsx").read_text(encoding="utf-8")
-    ids = re.findall(r'\["([a-z]+)", "', sidebar)
-    assert len(ids) == len(_NAV_LABELS), f"expected {len(_NAV_LABELS)} nav ids, got {ids}"
-    for nav_id in ids:
-        assert f'page === "{nav_id}"' in shell, (
-            f"sidebar item {nav_id!r} has no matching page in pages/index.jsx"
+# Branding that must not survive anywhere in the console.
+_RETIRED_BRANDS = ("Cloudwork", "CWP", "OSP GTM", "Trayo")
+
+
+def test_no_retired_branding_in_the_console():
+    offenders = []
+    for folder in ("components", "pages", "lib", "styles"):
+        for path in (_ROOT / folder).rglob("*"):
+            if path.suffix not in {".jsx", ".js", ".css"}:
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            for brand in _RETIRED_BRANDS:
+                if brand in text:
+                    offenders.append(f"{path.relative_to(_ROOT)}: {brand}")
+    assert not offenders, f"retired branding still in the UI: {offenders}"
+
+
+def _nav_hrefs() -> list[str]:
+    return re.findall(r'\["(/[a-z-]+)", "', _SIDEBAR.read_text(encoding="utf-8"))
+
+
+def test_every_nav_href_has_a_real_route_file():
+    """A sidebar link with no page file would 404 in production."""
+    hrefs = _nav_hrefs()
+    assert len(hrefs) == len(_NAV_LABELS), f"expected {len(_NAV_LABELS)} nav links, got {hrefs}"
+    for href in hrefs:
+        page = _PAGES / f"{href.lstrip('/')}.jsx"
+        assert page.is_file(), f"sidebar links to {href} but {page.name} does not exist"
+
+
+def test_every_route_file_is_statically_prerenderable():
+    """Any route that opts into SSR would stop being a static HTML page."""
+    for page in _PAGES.glob("*.jsx"):
+        source = page.read_text(encoding="utf-8")
+        for banned in ("getServerSideProps", "getInitialProps"):
+            assert not re.search(
+                rf"export\s+(async\s+)?(function|const)\s+{banned}", source
+            ), f"{page.name} exports {banned}"
+
+
+def test_homepage_and_dashboard_render_the_same_view():
+    """"/" must render the dashboard directly, never redirect."""
+    index = (_PAGES / "index.jsx").read_text(encoding="utf-8")
+    assert "Dashboard" in index, "/ does not render the Dashboard component"
+    # Match real redirect code, not a comment explaining there is none.
+    for pattern in (r"router\.(replace|push)\(", r"redirect\s*:", r"<Redirect"):
+        assert not re.search(pattern, index), (
+            "/ must render the dashboard, not redirect — a redirect would stop "
+            "it being a static HTML page."
         )

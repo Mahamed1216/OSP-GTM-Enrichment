@@ -24,6 +24,13 @@ TIMEOUT = 30
 # serving the current UI rather than an older build.
 MARKER = "REAL STANDALONE VERCEL UI LOADED"
 
+# Every sidebar destination must serve HTML, not fall through to the API.
+SIDEBAR_ROUTES = [
+    "/dashboard", "/signal-feed", "/client-expansion", "/leads",
+    "/run-pipeline", "/apollo-autopilot", "/settings", "/engagement",
+    "/prompts", "/bdr-research",
+]
+
 
 class Result(NamedTuple):
     path: str
@@ -73,15 +80,29 @@ def main() -> int:
                 "be OFF (not set to an empty value, and Output Directory must not be "
                 "'public')."
             )
-        elif "Cloudwork" not in home.body:
-            failures.append("/ is HTML but does not look like the operator console")
+        elif "SignalOS" not in home.body:
+            failures.append("/ is HTML but does not look like the SignalOS console")
         elif MARKER not in home.body:
             failures.append(
                 f"/ is the console but is missing the {MARKER!r} marker — an "
                 "older build is still deployed."
             )
 
-    # 2. The API must answer with JSON.
+    # 2. Every sidebar route must serve HTML.
+    for path in SIDEBAR_ROUTES:
+        page = fetch(base, path)
+        if page is None:
+            failures.append(f"{path} unreachable")
+            continue
+        is_html = "text/html" in page.content_type.lower()
+        print(f"  {path:20} {page.status}  {page.content_type.split(';')[0]}")
+        if page.status != 200 or not is_html:
+            failures.append(
+                f"{path} returned {page.status} {page.content_type or 'no content-type'} "
+                "instead of an HTML page"
+            )
+
+    # 3. The API must answer with JSON.
     for path in ("/health", "/api/info"):
         result = fetch(base, path)
         if result is None:
@@ -105,7 +126,7 @@ def main() -> int:
                     f"{payload.get('backend_error') or payload.get('database_error')}"
                 )
 
-    # 3. An unknown path must be handled by Next.js, never by FastAPI.
+    # 4. An unknown path must be handled by Next.js, never by FastAPI.
     stray = fetch(base, "/this-path-does-not-exist")
     if stray is not None:
         print(f"  {'/<random>':12} {stray.status}  {stray.content_type.split(';')[0]}")

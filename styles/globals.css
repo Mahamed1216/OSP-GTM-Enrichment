@@ -1,5 +1,5 @@
 /**
- * Cloudwork|PRO operator console — dark-only, desktop-first.
+ * SignalOS operator console — dark-only, desktop-first.
  *
  * This design commits to a single dark theme rather than flipping a light one:
  * the surfaces, the tier palette and the accent were all chosen against the
@@ -90,11 +90,7 @@ body {
   font-size: 1.18rem; font-weight: 700; letter-spacing: -.01em;
   display: flex; align-items: center; gap: .1rem;
 }
-.brand-mark .bar { color: var(--accent); font-weight: 400; margin: 0 .12rem; }
-.brand-mark .pro {
-  font-size: .72rem; font-weight: 700; letter-spacing: .12em;
-  color: var(--accent); align-self: center;
-}
+.brand-mark .os { color: var(--accent); }
 .brand-sub {
   font-size: .74rem; color: var(--muted); letter-spacing: .08em;
   text-transform: uppercase; margin-top: .25rem;
@@ -105,6 +101,7 @@ body {
   flex: 1 1 auto; min-height: 0; overflow-y: auto;
 }
 .nav-item {
+  text-decoration: none;
   display: flex; align-items: center; gap: .7rem;
   width: 100%; text-align: left; flex: 0 0 auto;
   padding: .55rem .75rem; border-radius: 9px;
@@ -384,3 +381,76 @@ dl.kv dd { margin: 0; word-break: break-word; }
   font-size: .73rem; text-transform: uppercase; letter-spacing: .07em;
   color: var(--muted); margin: 1.35rem 0 .5rem; font-weight: 600;
 }
+
+
+/* ======================================================= accordions ===== */
+
+.accordions { display: flex; flex-direction: column; gap: .65rem; margin-bottom: 1.5rem; }
+
+.accordion {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: var(--radius); overflow: hidden;
+}
+.accordion-head {
+  display: flex; align-items: center; gap: .65rem; width: 100%;
+  padding: .9rem 1.15rem; background: none; border: 0; border-radius: 0;
+  color: var(--text); font: inherit; font-size: .9rem; font-weight: 600;
+  text-align: left; cursor: pointer;
+}
+.accordion-head:hover { background: var(--card-2); filter: none; }
+.accordion-caret { color: var(--muted); font-size: .8rem; flex: 0 0 .9rem; }
+.accordion-title { flex: 1 1 auto; letter-spacing: .01em; }
+.accordion-size { font-size: .76rem; font-weight: 400; flex: 0 0 auto; }
+.accordion-body {
+  padding: 0 1.15rem 1.15rem; border-top: 1px solid var(--border-soft);
+  padding-top: 1rem;
+}
+.accordion-body textarea { min-height: 220px; }
+
+.meta-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 1rem; flex-wrap: wrap; margin-bottom: 1.1rem;
+  font-size: .83rem;
+}
+
+.save-bar {
+  display: flex; align-items: center; gap: .9rem; flex-wrap: wrap;
+  padding: 1rem 1.15rem; margin-bottom: 1.5rem;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: var(--radius); font-size: .85rem;
+}
+
+/* ============================================================ forms ===== */
+
+.two-col {
+  display: grid; gap: 1rem 1.25rem;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+}
+.field { display: flex; flex-direction: column; }
+.list-field { min-height: 120px; font-family: var(--mono); font-size: .8rem; }
+
+.radios, .checks { display: flex; flex-direction: column; gap: .45rem; }
+.checks { flex-direction: row; flex-wrap: wrap; gap: .75rem 1.5rem; }
+.radio, .check {
+  display: flex; align-items: center; gap: .5rem;
+  font-size: .87rem; color: var(--text-2); margin: 0; cursor: pointer;
+}
+.radio input, .check input { width: auto; margin: 0; accent-color: var(--accent); }
+.check input:disabled + span, .check input:disabled { cursor: not-allowed; }
+
+.dropzone {
+  border: 1px dashed var(--border); border-radius: 10px;
+  padding: 1.75rem 1.25rem; text-align: center; color: var(--muted);
+}
+.dropzone strong { display: block; color: var(--text-2); margin-bottom: .3rem; font-size: .92rem; }
+
+/* Link styled as a ghost button (next/link renders an anchor). */
+.btn-ghost {
+  display: inline-block; padding: .52rem 1rem; border-radius: 8px;
+  border: 1px solid var(--accent); background: transparent; color: var(--accent);
+  font-size: .88rem; font-weight: 600; text-decoration: none; white-space: nowrap;
+}
+.btn-ghost:hover { background: var(--accent-soft); }
+
+button.danger { border-color: var(--err); color: #f3706f; }
+button.danger:hover { background: rgba(229, 72, 77, .12); }

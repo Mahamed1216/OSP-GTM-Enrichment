@@ -1,133 +1,324 @@
-import { formatDate, useApi } from "../../lib/api";
+import { useCallback, useEffect, useState } from "react";
+
+import { callApi, formatDate, useApi } from "../../lib/api";
 import { AsyncState, Card, PageHead, RunStatus, Section } from "../common";
 
+// The loader reports where the effective prompt came from.
+const SOURCE_LABELS = {
+  database: "Database",
+  local_json: "Local JSON file (deprecated fallback)",
+  code_default: "Built-in default",
+  default: "Built-in default",
+};
+
+const CHANNELS = [
+  ["email", "Email"],
+  ["linkedin_msg", "LinkedIn DM"],
+  ["call_script", "Call script"],
+];
+
+/**
+ * Section editor for the generation prompt.
+ *
+ * Sections come from the prompt itself (headers in the live text), not a fixed
+ * list — a hardcoded list would drop a section the prompt has or invent empty
+ * ones it doesn't. Saving recombines the sections and writes through the same
+ * loader the generator reads, so the fingerprint and self-improvement loop stay
+ * consistent.
+ */
 export default function Prompts({ apiKey }) {
+  const [channel, setChannel] = useState("email");
+  const [sections, setSections] = useState([]);
+  const [open, setOpen] = useState(() => new Set());
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [result, setResult] = useState(null);
+  const [preview, setPreview] = useState(null);
+  const [adding, setAdding] = useState("");
+
   const { data, loading, error, reload } = useApi(
-    "/api/v1/prompts",
+    `/api/v1/prompts/editor?channel=${channel}`,
     apiKey,
     { skip: !apiKey },
   );
 
-  const configs = data?.configs || [];
-  const recommendations = data?.recommendations || [];
-  const winners = data?.winners || [];
+  // Load the fetched sections into editable state once per fetch.
+  useEffect(() => {
+    if (!data) return;
+    setSections(data.sections || []);
+    setDirty(false);
+    setResult(null);
+  }, [data]);
+
+  const meta = data?.metadata || {};
+  const available = data?.available_sections || [];
+
+  const toggle = useCallback((index) => {
+    setOpen((prev) => {
+      const next = new Set(prev);
+      if (next.has(index)) next.delete(index);
+      else next.add(index);
+      return next;
+    });
+  }, []);
+
+  function editBody(index, body) {
+    setSections((prev) => prev.map((s, i) => (i === index ? { ...s, body } : s)));
+    setDirty(true);
+  }
+
+  function addSection(title) {
+    if (!title) return;
+    setSections((prev) => [...prev, { title, body: "" }]);
+    setOpen((prev) => new Set(prev).add(sections.length));
+    setAdding("");
+    setDirty(true);
+  }
+
+  function removeSection(index) {
+    setSections((prev) => prev.filter((_, i) => i !== index));
+    setDirty(true);
+  }
+
+  async function save() {
+    setSaving(true);
+    setResult(null);
+    const response = await callApi("/api/v1/prompts/editor", {
+      method: "POST",
+      apiKey,
+      body: { channel, sections },
+    });
+    setSaving(false);
+    if (response.ok) {
+      setDirty(false);
+      setResult({ ok: true, message: `Saved — ${response.data.length} characters.` });
+      reload();
+    } else {
+      setResult({ ok: false, message: response.error });
+    }
+  }
+
+  const compiled =
+    sections
+      .map((s) => (s.title ? `# ${s.title}\n${s.body}` : s.body))
+      .filter((part) => part.trim())
+      .join("\n\n") + "\n";
 
   return (
     <>
       <PageHead
-        title="Prompts"
-        note="Prompt overrides, self-improvement recommendations, and the winning examples the generator draws from."
+        title="Prompts."
+        note="Edit the brain. Each section is editable; save recombines them into the full SignalOS prompt."
       />
 
-      <Section
-        title="Prompt overrides"
-        note="Per-channel overlays on the built-in system prompts."
-        actions={<button type="button" className="ghost" onClick={reload}>Refresh</button>}
-      >
-        <Card>
-          <AsyncState
-            loading={loading}
-            error={error}
-            empty={!loading && configs.length === 0}
-            emptyTitle="No overrides"
-            emptyText="The generator is using the built-in prompts for every channel."
-          >
-            <div className="content-list">
-              {configs.map((config) => (
-                <article key={config.id} className="content-card">
-                  <div className="content-meta">
-                    <span className="pill-sm">{config.channel || "all channels"}</span>
-                    {config.is_active
-                      ? <span className="pill-sm ok">active</span>
-                      : <span className="pill-sm">inactive</span>}
-                    {config.prompt_version && (
-                      <span className="muted">{config.prompt_version}</span>
-                    )}
-                    <span className="spacer" />
-                    <span className="muted">
-                      {config.length} chars · {formatDate(config.updated_at)}
-                      {config.updated_by ? ` · ${config.updated_by}` : ""}
-                    </span>
-                  </div>
-                  <pre className="content-body">{config.preview}</pre>
-                </article>
-              ))}
-            </div>
-          </AsyncState>
-        </Card>
-      </Section>
+      <div className="filters">
+        <div className="subtabs">
+          {CHANNELS.map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              className={channel === id ? "subtab active" : "subtab"}
+              onClick={() => setChannel(id)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
 
-      <Section
-        title="Recommendations"
-        note="Produced by the self-improvement loop. Every change is gated on human approval."
-      >
-        <Card>
-          <AsyncState
-            loading={loading}
-            error={error}
-            empty={!loading && recommendations.length === 0}
-            emptyTitle="No recommendations"
-            emptyText="The loop needs engagement data before it proposes a change."
-          >
-            <div className="content-list">
-              {recommendations.map((rec) => (
-                <article key={rec.id} className="content-card">
-                  <div className="content-meta">
-                    <span className="pill-sm">{rec.channel || "email"}</span>
-                    {rec.bottleneck && <span className="pill-sm">{rec.bottleneck}</span>}
-                    <RunStatus status={rec.status || rec.loop_status} />
-                    {rec.risk_level && (
-                      <span className={`pill-sm ${rec.risk_level === "high" ? "err" : ""}`}>
-                        risk: {rec.risk_level}
-                      </span>
-                    )}
-                    {rec.low_confidence && <span className="pill-sm warn">low confidence</span>}
-                    <span className="spacer" />
-                    <span className="muted">{formatDate(rec.created_at)}</span>
-                  </div>
-                  {rec.diagnosis && <p className="content-subject">{rec.diagnosis}</p>}
-                  {rec.recommended_change && <p className="rationale">{rec.recommended_change}</p>}
-                  <div className="content-foot">
-                    {rec.expected_impact && <span>expected: {rec.expected_impact}</span>}
-                    {rec.sample_size != null && <span>· n={rec.sample_size}</span>}
-                    {rec.confidence && <span>· {rec.confidence}</span>}
-                  </div>
-                </article>
-              ))}
-            </div>
-          </AsyncState>
-        </Card>
-      </Section>
+      {!apiKey ? (
+        <div className="empty">
+          <strong>API key required</strong>
+          Enter <code>INTERNAL_API_KEY</code> above to load and edit prompts.
+        </div>
+      ) : (
+        <AsyncState loading={loading} error={error}>
+          <div className="meta-row">
+            <span className="muted">
+              Loaded from: <strong>{SOURCE_LABELS[data?.source] || data?.source || "unknown"}</strong>
+              {meta.updated_at && (
+                <> · Last saved {formatDate(meta.updated_at)} by {meta.updated_by || "unknown"}</>
+              )}
+              {meta.prompt_fingerprint && (
+                <> · fingerprint <code>{meta.prompt_fingerprint}</code></>
+              )}
+            </span>
+            <button type="button" className="ghost" onClick={() => setPreview(compiled)}>
+              Preview compiled prompt
+            </button>
+          </div>
 
-      <Section title="Winning examples" note="High-performing copy the generator uses as few-shot examples.">
-        <Card>
-          <AsyncState
-            loading={loading}
-            error={error}
-            empty={!loading && winners.length === 0}
-            emptyTitle="No winners yet"
-            emptyText="Promote a high-performing email to seed the library."
-          >
-            <div className="content-list">
-              {winners.map((winner) => (
-                <article key={winner.id} className="content-card">
-                  <div className="content-meta">
-                    <span className="pill-sm">{winner.content_type || "email"}</span>
-                    {winner.manually_flagged && <span className="pill-sm ok">hand-picked</span>}
-                    {winner.reply_rate != null && (
-                      <span className="muted">reply rate {winner.reply_rate}</span>
-                    )}
-                    <span className="spacer" />
-                    <span className="muted">{formatDate(winner.promoted_at)}</span>
-                  </div>
-                  {winner.subject && <p className="content-subject">{winner.subject}</p>}
-                  <pre className="content-body">{winner.body}</pre>
-                </article>
+          {sections.length === 0 ? (
+            <div className="empty">
+              <strong>No prompt sections</strong>
+              This channel has no prompt text yet. Add a section below to start one.
+            </div>
+          ) : (
+            <div className="accordions">
+              {sections.map((section, index) => (
+                <div key={`${section.title}-${index}`} className="accordion">
+                  <button
+                    type="button"
+                    className="accordion-head"
+                    aria-expanded={open.has(index)}
+                    onClick={() => toggle(index)}
+                  >
+                    <span className="accordion-caret">{open.has(index) ? "▾" : "▸"}</span>
+                    <span className="accordion-title">{section.title || "(preamble)"}</span>
+                    <span className="muted accordion-size">{section.body.length} chars</span>
+                  </button>
+                  {open.has(index) && (
+                    <div className="accordion-body">
+                      <textarea
+                        value={section.body}
+                        spellCheck={false}
+                        onChange={(e) => editBody(index, e.target.value)}
+                      />
+                      <div className="row">
+                        <button
+                          type="button"
+                          className="ghost danger"
+                          onClick={() => removeSection(index)}
+                        >
+                          Remove section
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
               ))}
             </div>
-          </AsyncState>
-        </Card>
-      </Section>
+          )}
+
+          <Card title="Add a section" hint="Appended to the end of the prompt; reorder by editing the text.">
+            {available.length === 0 ? (
+              <p className="state muted">
+                Every suggested section is already present in this prompt.
+              </p>
+            ) : (
+              <div className="filters" style={{ marginBottom: 0 }}>
+                <div className="grow">
+                  <label htmlFor="add-section">Section</label>
+                  <select
+                    id="add-section"
+                    value={adding}
+                    onChange={(e) => setAdding(e.target.value)}
+                  >
+                    <option value="">Choose a section…</option>
+                    {available.map((title) => (
+                      <option key={title} value={title}>{title}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label>&nbsp;</label>
+                  <button type="button" onClick={() => addSection(adding)} disabled={!adding}>
+                    Add
+                  </button>
+                </div>
+              </div>
+            )}
+          </Card>
+
+          <div className="save-bar">
+            <button type="button" onClick={save} disabled={saving || !dirty}>
+              {saving ? "Saving…" : dirty ? "Save prompt" : "No changes"}
+            </button>
+            {dirty && <span className="muted">Unsaved changes.</span>}
+            {result && (
+              <span className={result.ok ? "ok-text" : "err"}>{result.message}</span>
+            )}
+          </div>
+        </AsyncState>
+      )}
+
+      {apiKey && <SelfImprovement apiKey={apiKey} />}
+
+      {preview !== null && (
+        <div className="drawer-backdrop" onClick={() => setPreview(null)}>
+          <aside className="drawer" onClick={(e) => e.stopPropagation()}>
+            <header className="drawer-head">
+              <div>
+                <h2>Compiled prompt</h2>
+                <p className="hint">
+                  {preview.length} characters — exactly what the generator receives.
+                </p>
+              </div>
+              <button type="button" className="ghost" onClick={() => setPreview(null)}>
+                Close
+              </button>
+            </header>
+            <pre className="content-body" style={{ maxHeight: "none" }}>{preview}</pre>
+          </aside>
+        </div>
+      )}
     </>
+  );
+}
+
+
+/** Recommendations and winning examples — read-only, from /api/v1/prompts. */
+function SelfImprovement({ apiKey }) {
+  const [open, setOpen] = useState(false);
+  const { data, loading, error } = useApi("/api/v1/prompts", apiKey, { skip: !apiKey || !open });
+
+  const recommendations = data?.recommendations || [];
+  const winners = data?.winners || [];
+
+  return (
+    <Section title="Self-improvement">
+      <Card
+        title="Recommendations and winning examples"
+        hint="Produced by the feedback loop. Every prompt change stays gated on human approval."
+        actions={
+          <button type="button" className="ghost" onClick={() => setOpen((v) => !v)}>
+            {open ? "Hide" : "Show"}
+          </button>
+        }
+      >
+        {!open ? (
+          <p className="state muted">Collapsed — expand to load.</p>
+        ) : (
+          <AsyncState loading={loading} error={error}>
+            <h4>Recommendations</h4>
+            {recommendations.length === 0 ? (
+              <p className="state muted">
+                None yet — the loop needs engagement data before it proposes a change.
+              </p>
+            ) : (
+              <ul className="plain">
+                {recommendations.map((rec) => (
+                  <li key={rec.id}>
+                    <RunStatus status={rec.status || rec.loop_status} />{" "}
+                    <strong>{rec.bottleneck || rec.channel}</strong>
+                    {rec.recommended_change && (
+                      <div className="muted">{rec.recommended_change}</div>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            <h4>Winning examples</h4>
+            {winners.length === 0 ? (
+              <p className="state muted">
+                None yet — promote a high-performing email to seed the library.
+              </p>
+            ) : (
+              <ul className="plain">
+                {winners.map((winner) => (
+                  <li key={winner.id}>
+                    <strong>{winner.subject || "(no subject)"}</strong>
+                    {winner.reply_rate != null && (
+                      <span className="muted"> · reply rate {winner.reply_rate}</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </AsyncState>
+        )}
+      </Card>
+    </Section>
   );
 }

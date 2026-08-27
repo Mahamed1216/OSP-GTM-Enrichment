@@ -1,41 +1,50 @@
-/** Fixed left sidebar: brand, vertical nav, active highlight. */
+import Link from "next/link";
+import { useRouter } from "next/router";
+
+/** Fixed left sidebar: SignalOS brand, vertical nav, active highlight. */
 
 export const NAV = [
-  ["dashboard", "Dashboard", "▦"],
-  ["signals", "Signal Feed", "◉"],
-  ["expansion", "Client Expansion", "↗"],
-  ["leads", "Leads", "☰"],
-  ["pipeline", "Run Pipeline", "▶"],
-  ["apollo", "Apollo Autopilot", "◎"],
-  ["settings", "Settings", "⚙"],
-  ["engagement", "Engagement", "✉"],
-  ["prompts", "Prompts", "✎"],
-  ["research", "BDR Research", "⌕"],
+  ["/dashboard", "Dashboard", "▦"],
+  ["/signal-feed", "Signal Feed", "◉"],
+  ["/client-expansion", "Client Expansion", "↗"],
+  ["/leads", "Leads", "☰"],
+  ["/run-pipeline", "Run Pipeline", "▶"],
+  ["/apollo-autopilot", "Apollo Autopilot", "◎"],
+  ["/settings", "Settings", "⚙"],
+  ["/engagement", "Engagement", "✉"],
+  ["/prompts", "Prompts", "✎"],
+  ["/bdr-research", "BDR Research", "⌕"],
 ];
 
-export default function Sidebar({ current, onNavigate, apiKey, onForgetKey }) {
+export default function Sidebar({ apiKey, onForgetKey }) {
+  const router = useRouter();
+  // "/" renders the dashboard, so it highlights the same item as /dashboard.
+  const path = router.pathname === "/" ? "/dashboard" : router.pathname;
+
   return (
     <aside className="sidebar">
       <div className="brand">
         <div className="brand-mark">
-          Cloudwork<span className="bar">|</span><span className="pro">PRO</span>
+          Signal<span className="os">OS</span>
         </div>
         <div className="brand-sub">Sales Enablement</div>
       </div>
 
       <nav className="nav">
-        {NAV.map(([id, label, icon]) => (
-          <button
-            key={id}
-            type="button"
-            className={current === id ? "nav-item active" : "nav-item"}
-            aria-current={current === id ? "page" : undefined}
-            onClick={() => onNavigate(id)}
-          >
-            <span className="nav-icon" aria-hidden="true">{icon}</span>
-            {label}
-          </button>
-        ))}
+        {NAV.map(([href, label, icon]) => {
+          const active = path === href;
+          return (
+            <Link
+              key={href}
+              href={href}
+              className={active ? "nav-item active" : "nav-item"}
+              aria-current={active ? "page" : undefined}
+            >
+              <span className="nav-icon" aria-hidden="true">{icon}</span>
+              {label}
+            </Link>
+          );
+        })}
       </nav>
 
       <div className="sidebar-foot">
